@@ -1,0 +1,138 @@
+$WW,1$$FG,5,1$ZealOS Virtual File System (VFS)$FG$$LK,"POSIX Compatibility Layer",A="FI:/Home/POSIX/README.DD"$
+
+$FG,2$Overview$FG$
+
+The VFS layer provides a unified interface for multiple filesystem types,
+enabling ZealOS to access various storage formats beyond the native RedSea
+filesystem.
+
+$FG,2$Components$FG$
+
+$ID,2$$FG,3$Core VFS ($LK,"VFS.HH",A="FI:/Home/POSIX/vfs/VFS.HH"$ / $LK,"VFS.ZC",A="FI:/Home/POSIX/vfs/VFS.ZC"$)$FG$
+  - Unified filesystem interface
+  - Inode caching
+  - Directory entry (dentry) caching
+  - Path resolution with symlink following
+  - Mount point management
+
+$FG,3$Symbolic Links ($LK,"Symlink.ZC",A="FI:/Home/POSIX/vfs/Symlink.ZC"$)$FG$
+  - Overlay symlink table for native filesystems
+  - Persistent symlink database (/Home/POSIX/etc/symlinks.db)
+  - POSIX-compatible API (symlink, readlink, lstat, realpath)
+
+$FG,3$Ext2/3/4 Driver ($LK,"ext4/Ext4.ZC",A="FI:/Home/POSIX/vfs/ext4/Ext4.ZC"$)$FG$
+  - Support for Ext2, Ext3, and Ext4 filesystems
+  - Extent-based and indirect block mapping
+  - 64-bit block addressing
+  - Read-only for safety
+  - BSD-2-Clause licensed (based on FreeBSD concepts)
+
+$FG,3$NTFS Driver ($LK,"ntfs/NTFS.ZC",A="FI:/Home/POSIX/vfs/ntfs/NTFS.ZC"$)$FG$
+  - Read-only access to NTFS volumes
+  - MFT record parsing
+  - Run list decoding
+  - UTF-16 to UTF-8 filename conversion
+  - MIT licensed (clean-room implementation)
+
+$FG,3$FUSE Interface ($LK,"fuse/FUSE.ZC",A="FI:/Home/POSIX/vfs/fuse/FUSE.ZC"$)$FG$
+  - FUSE-compatible API for user-space filesystems
+  - Implement filesystems in HolyC
+  - Full read/write support
+  - MIT licensed
+$ID,-2$
+
+$FG,2$Usage$FG$
+
+$ID,2$$FG,3$Loading All Filesystem Support$FG$
+  #include "/Home/POSIX/vfs/MakeAllFS.ZC"
+
+$FG,3$Mounting an Ext4 Filesystem$FG$
+  VFSMount("/dev/sda1", "/mnt/linux", "ext4", 0, NULL);
+
+$FG,3$Mounting an NTFS Volume$FG$
+  VFSMount("/dev/sdb1", "/mnt/windows", "ntfs", 0, NULL);
+
+$FG,3$Creating a FUSE Filesystem$FG$
+  See $LK,"Examples/HelloFS.ZC",A="FI:/Home/POSIX/vfs/fuse/Examples/HelloFS.ZC"$
+$ID,-2$
+
+$FG,2$Architecture$FG$
+
+$ID,2$
+  +-------------------+
+  |  User Application |
+  +-------------------+
+           |
+           v
+  +-------------------+
+  |    POSIX libc     |
+  |  (unistd.h, etc)  |
+  +-------------------+
+           |
+           v
+  +-------------------+
+  |       VFS         |
+  |  - Path resolution|
+  |  - Inode cache    |
+  |  - Mount points   |
+  +-------------------+
+           |
+     +-----+-----+-----+
+     |     |     |     |
+     v     v     v     v
+  +----+ +----+ +----+ +----+
+  |ext4| |ntfs| |fuse| |... |
+  +----+ +----+ +----+ +----+
+           |
+           v
+  +-------------------+
+  |   Block Device    |
+  +-------------------+
+$ID,-2$
+
+$FG,2$Filesystem Operations$FG$
+
+$ID,2$$FG,3$Superblock Operations$FG$
+  - mount    - Mount a filesystem
+  - unmount  - Unmount a filesystem
+  - sync     - Synchronize filesystem
+  - statfs   - Get filesystem statistics
+
+$FG,3$Inode Operations$FG$
+  - lookup   - Look up name in directory
+  - create   - Create file
+  - mkdir    - Create directory
+  - rmdir    - Remove directory
+  - unlink   - Remove file
+  - rename   - Rename file/directory
+  - link     - Create hard link
+  - symlink  - Create symbolic link
+  - readlink - Read symbolic link target
+  - getattr  - Get file attributes
+  - setattr  - Set file attributes
+  - truncate - Change file size
+
+$FG,3$File Operations$FG$
+  - open     - Open file
+  - close    - Close file
+  - read     - Read data
+  - write    - Write data
+  - readdir  - Read directory entries
+  - seek     - Change file position
+  - fsync    - Synchronize file
+  - ioctl    - Device control
+$ID,-2$
+
+$FG,2$Licenses$FG$
+
+$ID,2$- VFS Core: MIT
+- Symlink Support: MIT
+- Ext4 Driver: BSD-2-Clause (FreeBSD-derived)
+- NTFS Driver: MIT (clean-room)
+- FUSE Interface: MIT$ID,-2$
+
+$FG,2$See Also$FG$
+
+$ID,2$$LK,"POSIX Layer Overview",A="FI:/Home/POSIX/README.DD"$
+$LK,"POSIX libc",A="FI:/Home/POSIX/libc"$
+$LK,"Dynamic Linker",A="FI:/Home/POSIX/DynLink.ZC"$$ID,-2$

@@ -1,0 +1,606 @@
+// MkfsExt4.ZC - Create Ext2/3/4 Filesystems for ZealOS
+// Part of the POSIX compatibility layer
+//
+// This utility creates ext2, ext3, or ext4 filesystems on a device.
+// Based on public ext2/3/4 specifications.
+
+#include "FSTools.HH"
+
+// ============================================================================
+// UUID GENERATION
+// ============================================================================
+
+U0 GenerateUUID(U8 *uuid)
+{
+    // Generate pseudo-random UUID (version 4)
+    I64 i;
+    for (i = 0; i < 16; i++) {
+        uuid[i] = RandU32 & 0xFF;
+    }
+
+    // Set version (4) and variant (RFC 4122)
+    uuid[6] = (uuid[6] & 0x0F) | 0x40;  // Version 4
+    uuid[8] = (uuid[8] & 0x3F) | 0x80;  // Variant RFC 4122
+}
+
+U8 *FormatUUID(U8 *uuid)
+{
+    U8 *str = MAlloc(37);
+    snprintf(str, 37, "%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x",
+             uuid[0], uuid[1], uuid[2], uuid[3],
+             uuid[4], uuid[5],
+             uuid[6], uuid[7],
+             uuid[8], uuid[9],
+             uuid[10], uuid[11], uuid[12], uuid[13], uuid[14], uuid[15]);
+    return str;
+}
+
+// ============================================================================
+// DEVICE ACCESS
+// ============================================================================
+
+I64 GetDeviceSize(U8 *device)
+{
+    I64 fd = PosixOpen(device, O_RDONLY, 0);
+    if (fd < 0)
+        return -1;
+
+    // Seek to end to get size
+    I64 size = PosixLseek(fd, 0, SEEK_END);
+    PosixClose(fd);
+
+    return size;
+}
+
+I64 DeviceWrite(I64 fd, U64 offset, U0 *buf, I64 size)
+{
+    if (PosixLseek(fd, offset, SEEK_SET) < 0)
+        return -1;
+    return PosixWrite(fd, buf, size);
+}
+
+I64 DeviceRead(I64 fd, U64 offset, U0 *buf, I64 size)
+{
+    if (PosixLseek(fd, offset, SEEK_SET) < 0)
+        return -1;
+    return PosixRead(fd, buf, size);
+}
+
+// ============================================================================
+// DEFAULT OPTIONS
+// ============================================================================
+
+U0 MkfsExt4DefaultOpts(CMkfsExt4Opts *opts)
+{
+    MemSet(opts, 0, sizeof(CMkfsExt4Opts));
+
+    opts->block_size = 4096;        // 4KB blocks
+    opts->inode_size = 256;         // Modern default
+    opts->inode_ratio = 16384;      // One inode per 16KB
+    opts->reserved_percent = 5;     // 5% reserved for root
+    opts->has_journal = TRUE;       // ext3/4 default
+    opts->extent_tree = TRUE;       // ext4 default
+    opts->dir_index = TRUE;         // Enable htree
+    opts->sparse_super = TRUE;      // Save space
+}
+
+// ============================================================================
+// EXT4 FILESYSTEM CREATION
+// ============================================================================
+
+// Calculate number of block groups
+I64 CalcBlockGroups(U64 total_blocks, U32 blocks_per_group)
+{
+    return (total_blocks + blocks_per_group - 1) / blocks_per_group;
+}
+
+// Calculate inodes per group
+I64 CalcInodesPerGroup(U64 total_blocks, U32 block_size, U32 inode_ratio, I64 groups)
+{
+    U64 total_bytes = total_blocks * block_size;
+    U64 total_inodes = total_bytes / inode_ratio;
+    I64 inodes_per_group = (total_inodes + groups - 1) / groups;
+
+    // Round to block boundary
+    I64 inodes_per_block = block_size / 256;  // Assuming 256 byte inodes
+    inodes_per_group = ((inodes_per_group + inodes_per_block - 1) / inodes_per_block) * inodes_per_block;
+
+    // Minimum 16 inodes per group
+    if (inodes_per_group < 16)
+        inodes_per_group = 16;
+
+    return inodes_per_group;
+}
+
+// Check if block group has superblock backup
+Bool HasSuperblockBackup(I64 group, Bool sparse_super)
+{
+    if (group == 0)
+        return TRUE;
+
+    if (!sparse_super)
+        return TRUE;
+
+    // Sparse superblock: groups 0, 1, and powers of 3, 5, 7
+    if (group == 1)
+        return TRUE;
+
+    I64 n;
+    for (n = 3; n < group; n *= 3) {
+        if (n == group) return TRUE;
+    }
+    for (n = 5; n < group; n *= 5) {
+        if (n == group) return TRUE;
+    }
+    for (n = 7; n < group; n *= 7) {
+        if (n == group) return TRUE;
+    }
+
+    return FALSE;
+}
+
+I64 MkfsExt4(U8 *device, CMkfsExt4Opts *opts)
+{
+    CMkfsExt4Opts default_opts;
+    if (!opts) {
+        MkfsExt4DefaultOpts(&default_opts);
+        opts = &default_opts;
+    }
+
+    // Validate options
+    if (opts->block_size != 1024 && opts->block_size != 2048 && opts->block_size != 4096) {
+        "mkfs.ext4: Invalid block size %d (must be 1024, 2048, or 4096)\n", opts->block_size;
+        return -EINVAL;
+    }
+
+    // Get device size
+    I64 device_size = GetDeviceSize(device);
+    if (device_size < 0) {
+        "mkfs.ext4: Cannot determine device size for %s\n", device;
+        return -EIO;
+    }
+
+    U64 total_blocks = device_size / opts->block_size;
+    if (total_blocks < 64) {
+        "mkfs.ext4: Device too small (need at least %d bytes)\n", 64 * opts->block_size;
+        return -EINVAL;
+    }
+
+    "Creating ext4 filesystem on %s\n", device;
+    "  Block size: %d\n", opts->block_size;
+    "  Total blocks: %lld\n", total_blocks;
+
+    // Open device for writing
+    I64 fd = PosixOpen(device, O_RDWR, 0);
+    if (fd < 0) {
+        "mkfs.ext4: Cannot open %s for writing\n", device;
+        return -EACCES;
+    }
+
+    // Calculate filesystem parameters
+    U32 blocks_per_group = opts->block_size * 8;  // Bits in block bitmap
+    I64 num_groups = CalcBlockGroups(total_blocks, blocks_per_group);
+    I64 inodes_per_group = CalcInodesPerGroup(total_blocks, opts->block_size, opts->inode_ratio, num_groups);
+    U64 total_inodes = num_groups * inodes_per_group;
+
+    "  Block groups: %d\n", num_groups;
+    "  Inodes per group: %d\n", inodes_per_group;
+    "  Total inodes: %lld\n", total_inodes;
+
+    // Generate UUID
+    U8 uuid[16];
+    if (opts->uuid) {
+        MemCpy(uuid, opts->uuid, 16);
+    } else {
+        GenerateUUID(uuid);
+    }
+
+    U8 *uuid_str = FormatUUID(uuid);
+    "  UUID: %s\n", uuid_str;
+    Free(uuid_str);
+
+    // Allocate superblock
+    CExt2Superblock *sb = MAlloc(sizeof(CExt2Superblock));
+    MemSet(sb, 0, sizeof(CExt2Superblock));
+
+    // Fill superblock
+    sb->s_inodes_count = total_inodes;
+    sb->s_blocks_count = total_blocks & 0xFFFFFFFF;
+    sb->s_blocks_count_hi = (total_blocks >> 32) & 0xFFFFFFFF;
+    sb->s_r_blocks_count = (total_blocks * opts->reserved_percent) / 100;
+    sb->s_free_blocks_count = total_blocks - num_groups * 2;  // Rough estimate
+    sb->s_free_inodes_count = total_inodes - EXT2_FIRST_INO;
+    sb->s_first_data_block = (opts->block_size == 1024) ? 1 : 0;
+
+    // Block size encoding: 1024 << s_log_block_size
+    if (opts->block_size == 1024) sb->s_log_block_size = 0;
+    else if (opts->block_size == 2048) sb->s_log_block_size = 1;
+    else sb->s_log_block_size = 2;
+
+    sb->s_log_frag_size = sb->s_log_block_size;
+    sb->s_blocks_per_group = blocks_per_group;
+    sb->s_frags_per_group = blocks_per_group;
+    sb->s_inodes_per_group = inodes_per_group;
+
+    sb->s_mtime = time(NULL);
+    sb->s_wtime = time(NULL);
+    sb->s_mnt_count = 0;
+    sb->s_max_mnt_count = 20;
+    sb->s_magic = EXT2_SUPER_MAGIC;
+    sb->s_state = EXT2_VALID_FS;
+    sb->s_errors = 1;  // Continue on errors
+    sb->s_minor_rev_level = 0;
+    sb->s_lastcheck = time(NULL);
+    sb->s_checkinterval = 180 * 24 * 60 * 60;  // 180 days
+    sb->s_creator_os = 0;  // Linux
+    sb->s_rev_level = EXT2_DYNAMIC_REV;
+    sb->s_def_resuid = 0;
+    sb->s_def_resgid = 0;
+
+    // Dynamic revision fields
+    sb->s_first_ino = EXT2_FIRST_INO;
+    sb->s_inode_size = opts->inode_size;
+    sb->s_block_group_nr = 0;
+
+    // Feature flags
+    sb->s_feature_compat = 0;
+    sb->s_feature_incompat = EXT2_FEATURE_INCOMPAT_FILETYPE;
+    sb->s_feature_ro_compat = EXT2_FEATURE_RO_COMPAT_SPARSE_SUPER |
+                              EXT2_FEATURE_RO_COMPAT_LARGE_FILE;
+
+    if (opts->has_journal) {
+        sb->s_feature_compat |= EXT3_FEATURE_COMPAT_HAS_JOURNAL;
+    }
+
+    if (opts->extent_tree) {
+        sb->s_feature_incompat |= EXT4_FEATURE_INCOMPAT_EXTENTS;
+    }
+
+    if (opts->dir_index) {
+        sb->s_feature_compat |= EXT2_FEATURE_COMPAT_DIR_INDEX;
+    }
+
+    if (total_blocks > 0xFFFFFFFF) {
+        sb->s_feature_incompat |= EXT4_FEATURE_INCOMPAT_64BIT;
+        sb->s_desc_size = 64;
+    } else {
+        sb->s_desc_size = 32;
+    }
+
+    MemCpy(sb->s_uuid, uuid, 16);
+
+    if (opts->label) {
+        I64 len = StrLen(opts->label);
+        if (len > 16) len = 16;
+        MemCpy(sb->s_volume_name, opts->label, len);
+    }
+
+    // Allocate group descriptors
+    I64 gd_size = (sb->s_desc_size >= 64) ? 64 : 32;
+    U8 *gd_buf = MAlloc(num_groups * gd_size);
+    MemSet(gd_buf, 0, num_groups * gd_size);
+
+    // Initialize each block group
+    I64 group;
+    U64 current_block = sb->s_first_data_block;
+
+    "Initializing block groups...\n";
+
+    for (group = 0; group < num_groups; group++) {
+        U64 group_start = sb->s_first_data_block + group * blocks_per_group;
+        U64 overhead = 0;
+
+        // Superblock backup?
+        Bool has_sb = HasSuperblockBackup(group, opts->sparse_super);
+        if (has_sb) {
+            overhead += 1;  // Superblock
+            overhead += (num_groups * gd_size + opts->block_size - 1) / opts->block_size;  // GDT
+        }
+
+        // Block bitmap (1 block)
+        U64 block_bitmap = group_start + overhead;
+        overhead++;
+
+        // Inode bitmap (1 block)
+        U64 inode_bitmap = group_start + overhead;
+        overhead++;
+
+        // Inode table
+        U64 inode_table = group_start + overhead;
+        I64 inode_table_blocks = (inodes_per_group * opts->inode_size + opts->block_size - 1) / opts->block_size;
+        overhead += inode_table_blocks;
+
+        // Fill group descriptor
+        if (gd_size >= 64) {
+            CExt4GroupDesc *gd = gd_buf + group * gd_size;
+            gd->bg_block_bitmap = block_bitmap & 0xFFFFFFFF;
+            gd->bg_block_bitmap_hi = (block_bitmap >> 32) & 0xFFFFFFFF;
+            gd->bg_inode_bitmap = inode_bitmap & 0xFFFFFFFF;
+            gd->bg_inode_bitmap_hi = (inode_bitmap >> 32) & 0xFFFFFFFF;
+            gd->bg_inode_table = inode_table & 0xFFFFFFFF;
+            gd->bg_inode_table_hi = (inode_table >> 32) & 0xFFFFFFFF;
+
+            I64 free_blocks = blocks_per_group - overhead;
+            if (group == num_groups - 1) {
+                // Last group may be smaller
+                free_blocks = total_blocks - group_start - overhead;
+            }
+            gd->bg_free_blocks_count = free_blocks & 0xFFFF;
+            gd->bg_free_blocks_count_hi = (free_blocks >> 16) & 0xFFFF;
+            gd->bg_free_inodes_count = inodes_per_group;
+            gd->bg_used_dirs_count = (group == 0) ? 2 : 0;  // Root + lost+found
+        } else {
+            CExt2GroupDesc *gd = gd_buf + group * gd_size;
+            gd->bg_block_bitmap = block_bitmap;
+            gd->bg_inode_bitmap = inode_bitmap;
+            gd->bg_inode_table = inode_table;
+
+            I64 free_blocks = blocks_per_group - overhead;
+            if (group == num_groups - 1) {
+                free_blocks = total_blocks - group_start - overhead;
+            }
+            gd->bg_free_blocks_count = free_blocks;
+            gd->bg_free_inodes_count = inodes_per_group;
+            gd->bg_used_dirs_count = (group == 0) ? 2 : 0;
+        }
+
+        // Write block bitmap (all free except overhead)
+        U8 *bitmap = MAlloc(opts->block_size);
+        MemSet(bitmap, 0, opts->block_size);
+
+        // Mark overhead blocks as used
+        I64 i;
+        for (i = 0; i < overhead && i < blocks_per_group; i++) {
+            bitmap[i / 8] |= (1 << (i % 8));
+        }
+
+        // Mark blocks beyond group as used (last group)
+        if (group == num_groups - 1) {
+            I64 last_block = total_blocks - group_start;
+            for (i = last_block; i < blocks_per_group; i++) {
+                bitmap[i / 8] |= (1 << (i % 8));
+            }
+        }
+
+        DeviceWrite(fd, block_bitmap * opts->block_size, bitmap, opts->block_size);
+
+        // Write inode bitmap (first 10 reserved in group 0)
+        MemSet(bitmap, 0, opts->block_size);
+        if (group == 0) {
+            // Reserve first 11 inodes (0-10)
+            bitmap[0] = 0xFF;
+            bitmap[1] = 0x07;
+        }
+        DeviceWrite(fd, inode_bitmap * opts->block_size, bitmap, opts->block_size);
+
+        Free(bitmap);
+
+        // Zero inode table
+        U8 *zero_block = MAlloc(opts->block_size);
+        MemSet(zero_block, 0, opts->block_size);
+        for (i = 0; i < inode_table_blocks; i++) {
+            DeviceWrite(fd, (inode_table + i) * opts->block_size, zero_block, opts->block_size);
+        }
+        Free(zero_block);
+
+        if ((group % 100) == 0 || group == num_groups - 1) {
+            "  Group %d/%d initialized\r", group + 1, num_groups;
+        }
+    }
+    "\n";
+
+    // Write superblock and group descriptors to each backup location
+    "Writing superblock and group descriptors...\n";
+
+    I64 gdt_blocks = (num_groups * gd_size + opts->block_size - 1) / opts->block_size;
+
+    for (group = 0; group < num_groups; group++) {
+        if (!HasSuperblockBackup(group, opts->sparse_super))
+            continue;
+
+        U64 sb_block = sb->s_first_data_block + group * blocks_per_group;
+
+        sb->s_block_group_nr = group;
+
+        // Write superblock at offset 1024 (even if block 0)
+        U64 sb_offset;
+        if (opts->block_size == 1024) {
+            sb_offset = sb_block * opts->block_size;
+        } else {
+            sb_offset = sb_block * opts->block_size + 1024;
+        }
+
+        DeviceWrite(fd, sb_offset, sb, sizeof(CExt2Superblock));
+
+        // Write group descriptors after superblock
+        U64 gdt_offset = (sb_block + 1) * opts->block_size;
+        if (opts->block_size == 1024 && group == 0) {
+            gdt_offset = 2 * opts->block_size;  // Block 2
+        }
+
+        DeviceWrite(fd, gdt_offset, gd_buf, num_groups * gd_size);
+    }
+
+    // Create root directory inode
+    "Creating root directory...\n";
+
+    // Root inode (#2)
+    CExt2Inode root_inode;
+    MemSet(&root_inode, 0, sizeof(CExt2Inode));
+    root_inode.i_mode = EXT2_S_IFDIR | 0755;
+    root_inode.i_uid = 0;
+    root_inode.i_size = opts->block_size;
+    root_inode.i_atime = time(NULL);
+    root_inode.i_ctime = time(NULL);
+    root_inode.i_mtime = time(NULL);
+    root_inode.i_gid = 0;
+    root_inode.i_links_count = 3;  // ., .., lost+found
+    root_inode.i_blocks = opts->block_size / 512;
+    root_inode.i_flags = 0;
+
+    // Allocate first data block for root directory
+    // Group 0 inode table starts at block after GDT
+    U64 group0_inode_table;
+    if (gd_size >= 64) {
+        CExt4GroupDesc *gd0 = gd_buf;
+        group0_inode_table = gd0->bg_inode_table | (gd0->bg_inode_table_hi(U64) << 32);
+    } else {
+        CExt2GroupDesc *gd0 = gd_buf;
+        group0_inode_table = gd0->bg_inode_table;
+    }
+
+    I64 inode_table_blocks = (inodes_per_group * opts->inode_size + opts->block_size - 1) / opts->block_size;
+    U64 first_data_block = group0_inode_table + inode_table_blocks;
+
+    root_inode.i_block[0] = first_data_block;
+
+    // Write root inode (inode 2, 0-indexed = 1)
+    U64 root_inode_offset = group0_inode_table * opts->block_size + opts->inode_size;
+    DeviceWrite(fd, root_inode_offset, &root_inode, opts->inode_size);
+
+    // Create root directory data block
+    U8 *root_dir = MAlloc(opts->block_size);
+    MemSet(root_dir, 0, opts->block_size);
+
+    // Entry for "."
+    CExt2DirEntry2 *de = root_dir;
+    de->inode = EXT2_ROOT_INO;
+    de->rec_len = 12;
+    de->name_len = 1;
+    de->file_type = EXT2_FT_DIR;
+    de->name[0] = '.';
+
+    // Entry for ".."
+    de = root_dir + 12;
+    de->inode = EXT2_ROOT_INO;
+    de->rec_len = 12;
+    de->name_len = 2;
+    de->file_type = EXT2_FT_DIR;
+    de->name[0] = '.';
+    de->name[1] = '.';
+
+    // Entry for "lost+found"
+    de = root_dir + 24;
+    de->inode = EXT2_FIRST_INO;  // Inode 11
+    de->rec_len = opts->block_size - 24;  // Rest of block
+    de->name_len = 10;
+    de->file_type = EXT2_FT_DIR;
+    MemCpy(de->name, "lost+found", 10);
+
+    DeviceWrite(fd, first_data_block * opts->block_size, root_dir, opts->block_size);
+    Free(root_dir);
+
+    // Create lost+found directory inode (#11)
+    CExt2Inode lf_inode;
+    MemSet(&lf_inode, 0, sizeof(CExt2Inode));
+    lf_inode.i_mode = EXT2_S_IFDIR | 0700;
+    lf_inode.i_uid = 0;
+    lf_inode.i_size = opts->block_size;
+    lf_inode.i_atime = time(NULL);
+    lf_inode.i_ctime = time(NULL);
+    lf_inode.i_mtime = time(NULL);
+    lf_inode.i_gid = 0;
+    lf_inode.i_links_count = 2;
+    lf_inode.i_blocks = opts->block_size / 512;
+    lf_inode.i_block[0] = first_data_block + 1;
+
+    // Write lost+found inode (inode 11, 0-indexed = 10)
+    U64 lf_inode_offset = group0_inode_table * opts->block_size + 10 * opts->inode_size;
+    DeviceWrite(fd, lf_inode_offset, &lf_inode, opts->inode_size);
+
+    // Create lost+found directory data
+    U8 *lf_dir = MAlloc(opts->block_size);
+    MemSet(lf_dir, 0, opts->block_size);
+
+    de = lf_dir;
+    de->inode = EXT2_FIRST_INO;
+    de->rec_len = 12;
+    de->name_len = 1;
+    de->file_type = EXT2_FT_DIR;
+    de->name[0] = '.';
+
+    de = lf_dir + 12;
+    de->inode = EXT2_ROOT_INO;
+    de->rec_len = opts->block_size - 12;
+    de->name_len = 2;
+    de->file_type = EXT2_FT_DIR;
+    de->name[0] = '.';
+    de->name[1] = '.';
+
+    DeviceWrite(fd, (first_data_block + 1) * opts->block_size, lf_dir, opts->block_size);
+    Free(lf_dir);
+
+    // Update free block count
+    sb->s_free_blocks_count -= 2;  // Root dir + lost+found
+
+    // Rewrite primary superblock
+    sb->s_block_group_nr = 0;
+    U64 sb_offset = (opts->block_size == 1024) ? 1024 : 1024;
+    DeviceWrite(fd, sb_offset, sb, sizeof(CExt2Superblock));
+
+    // Clean up
+    Free(sb);
+    Free(gd_buf);
+    PosixClose(fd);
+
+    "\nFilesystem created successfully!\n";
+    "  %lld blocks (%lld bytes)\n", total_blocks, total_blocks * opts->block_size;
+    "  %lld inodes\n", total_inodes;
+
+    return 0;
+}
+
+I64 MkfsExt3(U8 *device, CMkfsExt4Opts *opts)
+{
+    CMkfsExt4Opts ext3_opts;
+    if (!opts) {
+        MkfsExt4DefaultOpts(&ext3_opts);
+        opts = &ext3_opts;
+    }
+
+    opts->extent_tree = FALSE;  // No extents for ext3
+    opts->has_journal = TRUE;
+
+    return MkfsExt4(device, opts);
+}
+
+I64 MkfsExt2(U8 *device, CMkfsExt4Opts *opts)
+{
+    CMkfsExt4Opts ext2_opts;
+    if (!opts) {
+        MkfsExt4DefaultOpts(&ext2_opts);
+        opts = &ext2_opts;
+    }
+
+    opts->extent_tree = FALSE;
+    opts->has_journal = FALSE;  // No journal for ext2
+
+    return MkfsExt4(device, opts);
+}
+
+// ============================================================================
+// COMMAND LINE INTERFACE
+// ============================================================================
+
+U0 MkfsExt4Help()
+{
+    "Usage: MkfsExt4(device, opts)\n";
+    "       MkfsExt4Cmd(device, [options...])\n";
+    "\n";
+    "Create an ext4 filesystem on the specified device.\n";
+    "\n";
+    "Options (for MkfsExt4Cmd):\n";
+    "  -b <size>    Block size (1024, 2048, 4096) [4096]\n";
+    "  -I <size>    Inode size (128, 256, 512) [256]\n";
+    "  -i <ratio>   Bytes per inode [16384]\n";
+    "  -m <percent> Reserved blocks percentage [5]\n";
+    "  -L <label>   Volume label\n";
+    "  -U <uuid>    Volume UUID\n";
+    "  -O <feature> Enable feature (extent, dir_index, has_journal)\n";
+    "  -O ^<feat>   Disable feature\n";
+    "\n";
+    "Examples:\n";
+    "  MkfsExt4(\"/dev/sda1\", NULL);  // Use defaults\n";
+    "  MkfsExt2(\"/dev/sda2\", NULL);  // Create ext2\n";
+    "  MkfsExt3(\"/dev/sda3\", NULL);  // Create ext3\n";
+}

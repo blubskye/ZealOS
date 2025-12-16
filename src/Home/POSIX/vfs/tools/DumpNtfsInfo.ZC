@@ -1,0 +1,550 @@
+// DumpNtfsInfo.ZC - Dump NTFS Volume Information for ZealOS
+// Part of the POSIX compatibility layer
+//
+// Similar to Linux's ntfsinfo utility.
+// Displays boot sector and MFT information.
+//
+// MIT License - Clean-room implementation based on public NTFS documentation.
+
+#include "FSTools.HH"
+
+// ============================================================================
+// NTFS CONSTANTS (same as NTFS.HH)
+// ============================================================================
+
+#define NTFS_SIGNATURE      0x202020205346544E  // "NTFS    "
+
+// Well-known MFT entries
+#define NTFS_MFT_RECORD_MFT         0   // $MFT
+#define NTFS_MFT_RECORD_MFTMIRR     1   // $MFTMirr
+#define NTFS_MFT_RECORD_LOGFILE     2   // $LogFile
+#define NTFS_MFT_RECORD_VOLUME      3   // $Volume
+#define NTFS_MFT_RECORD_ATTRDEF     4   // $AttrDef
+#define NTFS_MFT_RECORD_ROOT        5   // Root directory
+#define NTFS_MFT_RECORD_BITMAP      6   // $Bitmap
+#define NTFS_MFT_RECORD_BOOT        7   // $Boot
+#define NTFS_MFT_RECORD_BADCLUS     8   // $BadClus
+#define NTFS_MFT_RECORD_SECURE      9   // $Secure
+#define NTFS_MFT_RECORD_UPCASE      10  // $UpCase
+#define NTFS_MFT_RECORD_EXTEND      11  // $Extend
+
+// Attribute types
+#define NTFS_ATTR_STANDARD_INFORMATION  0x10
+#define NTFS_ATTR_ATTRIBUTE_LIST        0x20
+#define NTFS_ATTR_FILE_NAME             0x30
+#define NTFS_ATTR_OBJECT_ID             0x40
+#define NTFS_ATTR_SECURITY_DESCRIPTOR   0x50
+#define NTFS_ATTR_VOLUME_NAME           0x60
+#define NTFS_ATTR_VOLUME_INFORMATION    0x70
+#define NTFS_ATTR_DATA                  0x80
+#define NTFS_ATTR_INDEX_ROOT            0x90
+#define NTFS_ATTR_INDEX_ALLOCATION      0xA0
+#define NTFS_ATTR_BITMAP                0xB0
+#define NTFS_ATTR_REPARSE_POINT         0xC0
+#define NTFS_ATTR_EA_INFORMATION        0xD0
+#define NTFS_ATTR_EA                    0xE0
+#define NTFS_ATTR_LOGGED_UTILITY_STREAM 0x100
+#define NTFS_ATTR_END                   0xFFFFFFFF
+
+// ============================================================================
+// NTFS STRUCTURES (simplified from NTFS.HH)
+// ============================================================================
+
+class CDumpNtfsBootSector {
+    U8      jmp_boot[3];
+    U8      oem_id[8];          // "NTFS    "
+    U16     bytes_per_sector;
+    U8      sectors_per_cluster;
+    U16     reserved_sectors;
+    U8      zero1[3];
+    U16     unused1;
+    U8      media_type;
+    U16     zero2;
+    U16     sectors_per_track;
+    U16     num_heads;
+    U32     hidden_sectors;
+    U32     unused2;
+    U32     unused3;
+    U64     total_sectors;
+    U64     mft_lcn;            // MFT start cluster
+    U64     mftmirr_lcn;        // MFT mirror start cluster
+    I8      clusters_per_mft;   // Clusters per MFT record (negative = 2^|value|)
+    U8      unused4[3];
+    I8      clusters_per_idx;   // Clusters per index block
+    U8      unused5[3];
+    U64     volume_serial;
+    U32     checksum;
+};
+
+class CDumpNtfsMftRecordHeader {
+    U32     signature;          // "FILE"
+    U16     update_seq_offset;
+    U16     update_seq_count;
+    U64     lsn;
+    U16     sequence_number;
+    U16     link_count;
+    U16     attrs_offset;
+    U16     flags;
+    U32     bytes_used;
+    U32     bytes_allocated;
+    U64     base_mft_record;
+    U16     next_attr_id;
+};
+
+class CDumpNtfsAttrHeader {
+    U32     type;
+    U32     length;
+    U8      non_resident;
+    U8      name_length;
+    U16     name_offset;
+    U16     flags;
+    U16     instance;
+};
+
+// Volume information attribute
+class CDumpNtfsVolumeInfo {
+    U8      reserved[8];
+    U8      major_version;
+    U8      minor_version;
+    U16     flags;
+};
+
+// ============================================================================
+// HELPER FUNCTIONS
+// ============================================================================
+
+static U8 *GetNtfsVersion(U8 major, U8 minor)
+{
+    static U8 ver[32];
+
+    if (major == 1 && minor == 2)
+        snprintf(ver, 32, "%d.%d (NT 4.0)", major, minor);
+    else if (major == 3 && minor == 0)
+        snprintf(ver, 32, "%d.%d (Windows 2000)", major, minor);
+    else if (major == 3 && minor == 1)
+        snprintf(ver, 32, "%d.%d (Windows XP/2003/Vista/7/8/10)", major, minor);
+    else
+        snprintf(ver, 32, "%d.%d", major, minor);
+
+    return ver;
+}
+
+static U8 *GetAttrTypeName(U32 type)
+{
+    switch (type) {
+        case NTFS_ATTR_STANDARD_INFORMATION:  return "$STANDARD_INFORMATION";
+        case NTFS_ATTR_ATTRIBUTE_LIST:        return "$ATTRIBUTE_LIST";
+        case NTFS_ATTR_FILE_NAME:             return "$FILE_NAME";
+        case NTFS_ATTR_OBJECT_ID:             return "$OBJECT_ID";
+        case NTFS_ATTR_SECURITY_DESCRIPTOR:   return "$SECURITY_DESCRIPTOR";
+        case NTFS_ATTR_VOLUME_NAME:           return "$VOLUME_NAME";
+        case NTFS_ATTR_VOLUME_INFORMATION:    return "$VOLUME_INFORMATION";
+        case NTFS_ATTR_DATA:                  return "$DATA";
+        case NTFS_ATTR_INDEX_ROOT:            return "$INDEX_ROOT";
+        case NTFS_ATTR_INDEX_ALLOCATION:      return "$INDEX_ALLOCATION";
+        case NTFS_ATTR_BITMAP:                return "$BITMAP";
+        case NTFS_ATTR_REPARSE_POINT:         return "$REPARSE_POINT";
+        case NTFS_ATTR_EA_INFORMATION:        return "$EA_INFORMATION";
+        case NTFS_ATTR_EA:                    return "$EA";
+        case NTFS_ATTR_LOGGED_UTILITY_STREAM: return "$LOGGED_UTILITY_STREAM";
+        case NTFS_ATTR_END:                   return "$END";
+        default:                              return "Unknown";
+    }
+}
+
+static U8 *GetMftRecordName(I64 record)
+{
+    switch (record) {
+        case NTFS_MFT_RECORD_MFT:      return "$MFT";
+        case NTFS_MFT_RECORD_MFTMIRR:  return "$MFTMirr";
+        case NTFS_MFT_RECORD_LOGFILE:  return "$LogFile";
+        case NTFS_MFT_RECORD_VOLUME:   return "$Volume";
+        case NTFS_MFT_RECORD_ATTRDEF:  return "$AttrDef";
+        case NTFS_MFT_RECORD_ROOT:     return "Root Directory";
+        case NTFS_MFT_RECORD_BITMAP:   return "$Bitmap";
+        case NTFS_MFT_RECORD_BOOT:     return "$Boot";
+        case NTFS_MFT_RECORD_BADCLUS:  return "$BadClus";
+        case NTFS_MFT_RECORD_SECURE:   return "$Secure";
+        case NTFS_MFT_RECORD_UPCASE:   return "$UpCase";
+        case NTFS_MFT_RECORD_EXTEND:   return "$Extend";
+        default:                       return "(user file)";
+    }
+}
+
+// ============================================================================
+// MAIN DUMP FUNCTION
+// ============================================================================
+
+I64 DumpNtfsInfo(U8 *device)
+{
+    "ntfsinfo: Reading %s\n\n", device;
+
+    // Open device
+    I64 fd = PosixOpen(device, O_RDONLY, 0);
+    if (fd < 0) {
+        "ntfsinfo: Cannot open %s\n", device;
+        return -EACCES;
+    }
+
+    // Read boot sector
+    U8 boot_buf[512];
+    if (DeviceRead(fd, 0, boot_buf, 512) < 0) {
+        "ntfsinfo: Cannot read boot sector\n";
+        PosixClose(fd);
+        return -EIO;
+    }
+
+    CDumpNtfsBootSector *bs = boot_buf;
+
+    // Verify NTFS signature
+    if (MemCmp(bs->oem_id, "NTFS    ", 8) != 0) {
+        "ntfsinfo: Not an NTFS filesystem\n";
+        PosixClose(fd);
+        return -EINVAL;
+    }
+
+    // Calculate sizes
+    U32 sector_size = bs->bytes_per_sector;
+    U32 cluster_size = sector_size * bs->sectors_per_cluster;
+    I64 mft_record_size;
+
+    if (bs->clusters_per_mft < 0) {
+        mft_record_size = 1 << (-bs->clusters_per_mft);
+    } else {
+        mft_record_size = bs->clusters_per_mft * cluster_size;
+    }
+
+    I64 index_block_size;
+    if (bs->clusters_per_idx < 0) {
+        index_block_size = 1 << (-bs->clusters_per_idx);
+    } else {
+        index_block_size = bs->clusters_per_idx * cluster_size;
+    }
+
+    U64 total_size = bs->total_sectors * sector_size;
+
+    // Print boot sector information
+    "NTFS Boot Sector Information\n";
+    "============================\n\n";
+
+    "OEM ID:                   NTFS\n";
+    "Bytes per sector:         %d\n", sector_size;
+    "Sectors per cluster:      %d\n", bs->sectors_per_cluster;
+    "Cluster size:             %d bytes\n", cluster_size;
+    "Media type:               0x%02X", bs->media_type;
+    if (bs->media_type == 0xF8)
+        " (fixed disk)\n";
+    else
+        "\n";
+
+    "\n";
+    "Total sectors:            %lld\n", bs->total_sectors;
+    "Total size:               %lld bytes (%.2f GB)\n",
+        total_size, total_size / (1024.0 * 1024.0 * 1024.0);
+
+    "\n";
+    "MFT start cluster:        %lld\n", bs->mft_lcn;
+    "MFT start offset:         %lld bytes\n", bs->mft_lcn * cluster_size;
+    "MFT mirror cluster:       %lld\n", bs->mftmirr_lcn;
+    "MFT record size:          %d bytes\n", mft_record_size;
+    "Index block size:         %d bytes\n", index_block_size;
+
+    "\n";
+    "Volume serial number:     %016llX\n", bs->volume_serial;
+
+    // Read MFT record for $Volume to get volume name and version
+    U64 mft_offset = bs->mft_lcn * cluster_size;
+
+    // Read $Volume record (record 3)
+    U64 volume_record_offset = mft_offset + 3 * mft_record_size;
+    U8 *mft_buf = MAlloc(mft_record_size);
+
+    "\n";
+    "MFT Information\n";
+    "===============\n\n";
+
+    if (DeviceRead(fd, volume_record_offset, mft_buf, mft_record_size) < 0) {
+        "ntfsinfo: Cannot read $Volume MFT record\n";
+    } else {
+        CDumpNtfsMftRecordHeader *mft = mft_buf;
+
+        // Verify FILE signature
+        if (mft->signature == 0x454C4946) {  // "FILE"
+            // Apply fixup
+            U16 *usa = mft_buf + mft->update_seq_offset;
+            U16 usn = usa[0];
+            I64 i;
+            for (i = 1; i < mft->update_seq_count; i++) {
+                U16 *fixup_loc = mft_buf + i * sector_size - 2;
+                if (*fixup_loc == usn) {
+                    *fixup_loc = usa[i];
+                }
+            }
+
+            // Parse attributes
+            U8 *attr_ptr = mft_buf + mft->attrs_offset;
+
+            while (attr_ptr < mft_buf + mft->bytes_used) {
+                CDumpNtfsAttrHeader *attr = attr_ptr;
+
+                if (attr->type == NTFS_ATTR_END || attr->length == 0)
+                    break;
+
+                if (attr->type == NTFS_ATTR_VOLUME_NAME && !attr->non_resident) {
+                    // Resident volume name
+                    U8 *resident = attr_ptr + sizeof(CDumpNtfsAttrHeader);
+                    U32 value_length = *(resident + 0)(U32*);
+                    U16 value_offset = *(resident + 4)(U16*);
+
+                    U16 *name_utf16 = attr_ptr + value_offset;
+                    I64 name_len = value_length / 2;
+
+                    "Volume name:              ";
+                    // Simple UTF-16 to ASCII (assumes ASCII-compatible name)
+                    for (i = 0; i < name_len; i++) {
+                        if (name_utf16[i] < 128)
+                            "%c", name_utf16[i];
+                    }
+                    "\n";
+                }
+
+                if (attr->type == NTFS_ATTR_VOLUME_INFORMATION && !attr->non_resident) {
+                    U8 *resident = attr_ptr + sizeof(CDumpNtfsAttrHeader);
+                    U16 value_offset = *(resident + 4)(U16*);
+
+                    CDumpNtfsVolumeInfo *vol_info = attr_ptr + value_offset;
+
+                    "NTFS version:             %s\n",
+                        GetNtfsVersion(vol_info->major_version, vol_info->minor_version);
+
+                    "Volume flags:             0x%04X", vol_info->flags;
+                    if (vol_info->flags & 0x0001)
+                        " DIRTY";
+                    if (vol_info->flags & 0x0002)
+                        " RESIZE_LOG_FILE";
+                    if (vol_info->flags & 0x0004)
+                        " UPGRADE_ON_MOUNT";
+                    if (vol_info->flags & 0x0008)
+                        " MOUNTED_ON_NT4";
+                    if (vol_info->flags & 0x0010)
+                        " DELETE_USN_UNDERWAY";
+                    if (vol_info->flags & 0x0020)
+                        " REPAIR_OBJECT_ID";
+                    if (vol_info->flags & 0x8000)
+                        " MODIFIED_BY_CHKDSK";
+                    "\n";
+                }
+
+                attr_ptr += attr->length;
+            }
+        }
+    }
+
+    // Read and display first few MFT records
+    "\n";
+    "System Files\n";
+    "============\n\n";
+
+    I64 record;
+    for (record = 0; record <= 11; record++) {
+        U64 record_offset = mft_offset + record * mft_record_size;
+
+        if (DeviceRead(fd, record_offset, mft_buf, mft_record_size) < 0)
+            continue;
+
+        CDumpNtfsMftRecordHeader *mft = mft_buf;
+
+        if (mft->signature != 0x454C4946)  // "FILE"
+            continue;
+
+        "MFT Record %2d: %s\n", record, GetMftRecordName(record);
+        "  Flags:       0x%04X", mft->flags;
+        if (mft->flags & 0x0001)
+            " IN_USE";
+        if (mft->flags & 0x0002)
+            " DIRECTORY";
+        "\n";
+        "  Link count:  %d\n", mft->link_count;
+        "  Attributes:\n";
+
+        // Apply fixup
+        U16 *usa = mft_buf + mft->update_seq_offset;
+        U16 usn = usa[0];
+        I64 i;
+        for (i = 1; i < mft->update_seq_count; i++) {
+            U16 *fixup_loc = mft_buf + i * sector_size - 2;
+            if (*fixup_loc == usn) {
+                *fixup_loc = usa[i];
+            }
+        }
+
+        // List attributes
+        U8 *attr_ptr = mft_buf + mft->attrs_offset;
+        while (attr_ptr < mft_buf + mft->bytes_used) {
+            CDumpNtfsAttrHeader *attr = attr_ptr;
+
+            if (attr->type == NTFS_ATTR_END || attr->length == 0)
+                break;
+
+            "    0x%02X %-24s %s\n",
+                attr->type,
+                GetAttrTypeName(attr->type),
+                attr->non_resident ? "(non-resident)" : "(resident)";
+
+            attr_ptr += attr->length;
+        }
+        "\n";
+    }
+
+    Free(mft_buf);
+    PosixClose(fd);
+
+    return 0;
+}
+
+// ============================================================================
+// FAT32 INFO DUMP
+// ============================================================================
+
+I64 DumpFat32Info(U8 *device)
+{
+    "fat32info: Reading %s\n\n", device;
+
+    // Open device
+    I64 fd = PosixOpen(device, O_RDONLY, 0);
+    if (fd < 0) {
+        "fat32info: Cannot open %s\n", device;
+        return -EACCES;
+    }
+
+    // Read boot sector
+    U8 boot_buf[512];
+    if (DeviceRead(fd, 0, boot_buf, 512) < 0) {
+        "fat32info: Cannot read boot sector\n";
+        PosixClose(fd);
+        return -EIO;
+    }
+
+    // Verify boot signature
+    if (boot_buf[510] != 0x55 || boot_buf[511] != 0xAA) {
+        "fat32info: Invalid boot signature\n";
+        PosixClose(fd);
+        return -EINVAL;
+    }
+
+    // Extract BPB values
+    U16 bytes_per_sector = *(boot_buf + 11)(U16*);
+    U8 sectors_per_cluster = boot_buf[13];
+    U16 reserved_sectors = *(boot_buf + 14)(U16*);
+    U8 num_fats = boot_buf[16];
+    U32 fat_size = *(boot_buf + 36)(U32*);
+    U32 root_cluster = *(boot_buf + 44)(U32*);
+    U16 fsinfo_sector = *(boot_buf + 48)(U16*);
+    U16 backup_boot = *(boot_buf + 50)(U16*);
+    U32 total_sectors = *(boot_buf + 32)(U32*);
+    U32 volume_id = *(boot_buf + 67)(U32*);
+
+    // Check if FAT32
+    U32 data_start = reserved_sectors + (num_fats * fat_size);
+    U64 data_sectors = total_sectors - data_start;
+    U64 total_clusters = data_sectors / sectors_per_cluster;
+
+    if (total_clusters < 65525) {
+        "fat32info: Not a FAT32 filesystem (cluster count: %lld)\n", total_clusters;
+        PosixClose(fd);
+        return -EINVAL;
+    }
+
+    // Print information
+    "FAT32 Boot Sector Information\n";
+    "=============================\n\n";
+
+    "OEM ID:                   ";
+    I64 i;
+    for (i = 0; i < 8; i++) {
+        "%c", boot_buf[3 + i];
+    }
+    "\n";
+
+    "\n";
+    "Bytes per sector:         %d\n", bytes_per_sector;
+    "Sectors per cluster:      %d\n", sectors_per_cluster;
+    "Cluster size:             %d bytes\n", bytes_per_sector * sectors_per_cluster;
+    "Reserved sectors:         %d\n", reserved_sectors;
+    "Number of FATs:           %d\n", num_fats;
+    "FAT size (sectors):       %d\n", fat_size;
+    "Root cluster:             %d\n", root_cluster;
+    "FSInfo sector:            %d\n", fsinfo_sector;
+    "Backup boot sector:       %d\n", backup_boot;
+
+    "\n";
+    "Total sectors:            %d\n", total_sectors;
+    "Total clusters:           %lld\n", total_clusters;
+    "Total size:               %lld bytes (%.2f GB)\n",
+        total_sectors(U64) * bytes_per_sector,
+        (total_sectors(U64) * bytes_per_sector) / (1024.0 * 1024.0 * 1024.0);
+
+    "\n";
+    "Volume ID:                %08X\n", volume_id;
+    "Volume label:             ";
+    for (i = 0; i < 11; i++) {
+        "%c", boot_buf[71 + i];
+    }
+    "\n";
+
+    "Filesystem type:          ";
+    for (i = 0; i < 8; i++) {
+        "%c", boot_buf[82 + i];
+    }
+    "\n";
+
+    // Read FSInfo sector
+    if (fsinfo_sector > 0 && fsinfo_sector < reserved_sectors) {
+        U8 fsinfo_buf[512];
+        if (DeviceRead(fd, fsinfo_sector * bytes_per_sector, fsinfo_buf, 512) == 512) {
+            U32 sig1 = *(fsinfo_buf)(U32*);
+            U32 sig2 = *(fsinfo_buf + 484)(U32*);
+
+            if (sig1 == 0x41615252 && sig2 == 0x61417272) {
+                U32 free_count = *(fsinfo_buf + 488)(U32*);
+                U32 next_free = *(fsinfo_buf + 492)(U32*);
+
+                "\n";
+                "FSInfo Information\n";
+                "==================\n\n";
+
+                if (free_count != 0xFFFFFFFF) {
+                    "Free clusters:            %d\n", free_count;
+                    "Free space:               %.2f GB\n",
+                        (free_count(U64) * bytes_per_sector * sectors_per_cluster) /
+                        (1024.0 * 1024.0 * 1024.0);
+                } else {
+                    "Free clusters:            (not computed)\n";
+                }
+
+                if (next_free != 0xFFFFFFFF) {
+                    "Next free cluster hint:   %d\n", next_free;
+                }
+            }
+        }
+    }
+
+    PosixClose(fd);
+    return 0;
+}
+
+// ============================================================================
+// COMMAND LINE INTERFACE
+// ============================================================================
+
+U0 DumpNtfsInfoHelp()
+{
+    "Usage: DumpNtfsInfo(device)\n";
+    "       DumpFat32Info(device)\n";
+    "\n";
+    "Display filesystem information.\n";
+    "\n";
+    "Examples:\n";
+    "  DumpNtfsInfo(\"/dev/sda1\");  // NTFS volume\n";
+    "  DumpFat32Info(\"/dev/sda2\"); // FAT32 volume\n";
+}

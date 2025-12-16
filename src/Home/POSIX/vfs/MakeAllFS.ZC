@@ -1,0 +1,49 @@
+// MakeAllFS.ZC - Load All Filesystem Support for ZealOS
+// Part of the POSIX compatibility layer
+//
+// This file loads the complete filesystem stack:
+// - VFS abstraction layer
+// - Symbolic link support
+// - Ext2/3/4 filesystem driver
+// - NTFS filesystem driver (read-only)
+// - FUSE user-space filesystem interface
+
+Cd(__DIR__);;
+
+"Loading ZealOS VFS and filesystem drivers...\n";
+
+// Core VFS layer
+#include "VFS.HH"
+#include "VFS.ZC"
+#include "Symlink.ZC"
+
+// Native filesystem drivers
+#include "ext4/Ext4.HH"
+#include "ext4/Ext4.ZC"
+
+#include "ntfs/NTFS.HH"
+#include "ntfs/NTFS.ZC"
+
+// User-space filesystem support
+#include "fuse/FUSE.HH"
+#include "fuse/FUSE.ZC"
+
+"\n";
+"===================================================\n";
+"ZealOS VFS and Filesystem Support Loaded\n";
+"===================================================\n";
+"Registered filesystems:\n";
+"  - ext2/ext3/ext4  (read/write*) [BSD-2-Clause]\n";
+"  - ntfs            (read-only)   [MIT]\n";
+"  - fuse            (user-space)  [MIT]\n";
+"\n";
+"* Write support not implemented for safety.\n";
+"  All mounted filesystems are currently read-only.\n";
+"\n";
+"VFS features:\n";
+"  - Inode caching\n";
+"  - Directory entry caching\n";
+"  - Symbolic link support (native + overlay)\n";
+"  - Path resolution with symlink following\n";
+"  - Mount point management\n";
+"===================================================\n";

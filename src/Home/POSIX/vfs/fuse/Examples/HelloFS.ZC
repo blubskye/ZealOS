@@ -1,0 +1,197 @@
+// HelloFS.ZC - Example FUSE Filesystem for ZealOS
+// Part of the POSIX compatibility layer
+//
+// This is a simple read-only filesystem that demonstrates
+// how to implement a FUSE filesystem in HolyC.
+//
+// The filesystem contains:
+// - /hello.txt  - A text file with a greeting
+// - /world.txt  - Another text file
+// - /subdir/    - A subdirectory
+// - /subdir/test.txt - A file in the subdirectory
+
+#include "../FUSE.HH"
+
+// ============================================================================
+// FILESYSTEM DATA
+// ============================================================================
+
+// File contents
+static U8 *hello_content = "Hello from ZealOS FUSE!\n";
+static U8 *world_content = "Welcome to the virtual filesystem world.\n";
+static U8 *test_content = "This file is in a subdirectory.\n";
+
+// ============================================================================
+// FILESYSTEM OPERATIONS
+// ============================================================================
+
+I64 HelloGetattr(U8 *path, CFuseStat *st)
+{
+    MemSet(st, 0, sizeof(CFuseStat));
+
+    st->st_uid = 0;
+    st->st_gid = 0;
+    st->st_atime = time(NULL);
+    st->st_mtime = time(NULL);
+    st->st_ctime = time(NULL);
+
+    if (StrCmp(path, "/") == 0) {
+        // Root directory
+        st->st_ino = 1;
+        st->st_mode = FUSE_S_IFDIR | 0755;
+        st->st_nlink = 3;  // ., .., subdir
+        return 0;
+    }
+
+    if (StrCmp(path, "/hello.txt") == 0) {
+        st->st_ino = 2;
+        st->st_mode = FUSE_S_IFREG | 0644;
+        st->st_nlink = 1;
+        st->st_size = StrLen(hello_content);
+        return 0;
+    }
+
+    if (StrCmp(path, "/world.txt") == 0) {
+        st->st_ino = 3;
+        st->st_mode = FUSE_S_IFREG | 0644;
+        st->st_nlink = 1;
+        st->st_size = StrLen(world_content);
+        return 0;
+    }
+
+    if (StrCmp(path, "/subdir") == 0) {
+        st->st_ino = 4;
+        st->st_mode = FUSE_S_IFDIR | 0755;
+        st->st_nlink = 2;
+        return 0;
+    }
+
+    if (StrCmp(path, "/subdir/test.txt") == 0) {
+        st->st_ino = 5;
+        st->st_mode = FUSE_S_IFREG | 0644;
+        st->st_nlink = 1;
+        st->st_size = StrLen(test_content);
+        return 0;
+    }
+
+    return -ENOENT;
+}
+
+I64 HelloReaddir(U8 *path, U0 *buf, FuseFillDir filler,
+                 I64 offset, CFuseFileInfo *fi)
+{
+    CFuseStat st;
+    MemSet(&st, 0, sizeof(CFuseStat));
+
+    if (StrCmp(path, "/") == 0) {
+        // Root directory contents
+        st.st_mode = FUSE_S_IFDIR | 0755;
+        filler(buf, ".", &st, 0);
+        filler(buf, "..", &st, 0);
+
+        st.st_mode = FUSE_S_IFREG | 0644;
+        st.st_size = StrLen(hello_content);
+        filler(buf, "hello.txt", &st, 0);
+
+        st.st_size = StrLen(world_content);
+        filler(buf, "world.txt", &st, 0);
+
+        st.st_mode = FUSE_S_IFDIR | 0755;
+        st.st_size = 0;
+        filler(buf, "subdir", &st, 0);
+
+        return 0;
+    }
+
+    if (StrCmp(path, "/subdir") == 0) {
+        st.st_mode = FUSE_S_IFDIR | 0755;
+        filler(buf, ".", &st, 0);
+        filler(buf, "..", &st, 0);
+
+        st.st_mode = FUSE_S_IFREG | 0644;
+        st.st_size = StrLen(test_content);
+        filler(buf, "test.txt", &st, 0);
+
+        return 0;
+    }
+
+    return -ENOENT;
+}
+
+I64 HelloOpen(U8 *path, CFuseFileInfo *fi)
+{
+    // Check if file exists
+    if (StrCmp(path, "/hello.txt") == 0 ||
+        StrCmp(path, "/world.txt") == 0 ||
+        StrCmp(path, "/subdir/test.txt") == 0) {
+        return 0;
+    }
+
+    return -ENOENT;
+}
+
+I64 HelloRead(U8 *path, U0 *buf, I64 size, I64 offset, CFuseFileInfo *fi)
+{
+    U8 *content = NULL;
+    I64 len;
+
+    if (StrCmp(path, "/hello.txt") == 0) {
+        content = hello_content;
+    } else if (StrCmp(path, "/world.txt") == 0) {
+        content = world_content;
+    } else if (StrCmp(path, "/subdir/test.txt") == 0) {
+        content = test_content;
+    }
+
+    if (!content)
+        return -ENOENT;
+
+    len = StrLen(content);
+
+    if (offset >= len)
+        return 0;
+
+    if (offset + size > len)
+        size = len - offset;
+
+    MemCpy(buf, content + offset, size);
+    return size;
+}
+
+// ============================================================================
+// MAIN ENTRY POINT
+// ============================================================================
+
+CFuseOps hello_ops = {
+    .getattr = &HelloGetattr,
+    .readdir = &HelloReaddir,
+    .open = &HelloOpen,
+    .read = &HelloRead,
+};
+
+U0 HelloFSMount(U8 *mount_point)
+{
+    if (!mount_point)
+        mount_point = "/mnt/hello";
+
+    CFuseFS *fuse = FuseNew(&hello_ops, NULL);
+    if (!fuse) {
+        "HelloFS: Failed to create FUSE instance\n";
+        return;
+    }
+
+    I64 err = FuseMount(fuse, mount_point);
+    if (err < 0) {
+        "HelloFS: Mount failed: %d\n", err;
+        FuseFree(fuse);
+        return;
+    }
+
+    "HelloFS: Mounted at %s\n", mount_point;
+    "  /hello.txt       - Greeting message\n";
+    "  /world.txt       - Welcome message\n";
+    "  /subdir/test.txt - Subdirectory test\n";
+}
+
+// Example usage:
+// HelloFSMount("/mnt/hello");

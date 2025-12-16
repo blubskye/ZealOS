@@ -90,25 +90,14 @@ I64 rmdir(U8 *path)
     return PosixRmdir(path);
 }
 
-I64 link(U8 *oldpath, U8 *newpath)
-{
-    // ZealOS doesn't have hard links
-    errno = ENOSYS;
-    return -1;
-}
+// link, symlink, readlink are now implemented in vfs/Symlink.ZC
+// These declarations provide forward compatibility
 
-I64 symlink(U8 *target, U8 *linkpath)
-{
-    // ZealOS doesn't have symlinks
-    errno = ENOSYS;
-    return -1;
-}
-
-ssize_t readlink(U8 *path, U8 *buf, size_t bufsiz)
-{
-    errno = EINVAL;  // Not a symlink
-    return -1;
-}
+extern I64 link(U8 *oldpath, U8 *newpath);
+extern I64 symlink(U8 *target, U8 *linkpath);
+extern ssize_t readlink(U8 *path, U8 *buf, size_t bufsiz);
+extern I64 lstat(U8 *path, struct stat *buf);
+extern U8 *realpath(U8 *path, U8 *resolved_path);
 
 I64 chdir(U8 *path)
 {

@@ -1,0 +1,56 @@
+// MakeFSTools.ZC - Load All Filesystem Tools for ZealOS
+// Part of the POSIX compatibility layer
+//
+// This file loads all filesystem utilities:
+// - mkfs.*     - Filesystem creation
+// - fsck.*     - Filesystem checking/repair
+// - dump*info  - Filesystem information display
+
+Cd(__DIR__);;\
+
+"Loading ZealOS filesystem tools...\n";
+
+// Common header
+#include "FSTools.HH"
+
+// mkfs utilities
+#include "MkfsExt4.ZC"
+#include "MkfsFat32.ZC"
+
+// fsck utilities
+#include "FsckExt4.ZC"
+#include "FsckFat32.ZC"
+
+// Filesystem info utilities
+#include "DumpExt4Info.ZC"
+#include "DumpNtfsInfo.ZC"
+
+"\n";
+"===================================================\n";
+"ZealOS Filesystem Tools Loaded\n";
+"===================================================\n";
+"\n";
+"Formatting tools:\n";
+"  MkfsExt4(device, opts)  - Create ext4 filesystem\n";
+"  MkfsExt3(device, opts)  - Create ext3 filesystem\n";
+"  MkfsExt2(device, opts)  - Create ext2 filesystem\n";
+"  MkfsFat32(device, opts) - Create FAT32 filesystem\n";
+"\n";
+"Checking tools:\n";
+"  FsckExt4(device, flags) - Check/repair ext2/3/4\n";
+"  FsckFat32(device, flags)- Check FAT32\n";
+"\n";
+"Info tools:\n";
+"  DumpExt4Info(device)    - Display ext2/3/4 info\n";
+"  DumpNtfsInfo(device)    - Display NTFS info\n";
+"  DumpFat32Info(device)   - Display FAT32 info\n";
+"\n";
+"Flags for fsck:\n";
+"  FSCK_READONLY (0x0001)  - Read-only check\n";
+"  FSCK_VERBOSE  (0x0002)  - Verbose output\n";
+"  FSCK_FORCE    (0x0004)  - Force check\n";
+"\n";
+"For detailed help, call *Help() functions:\n";
+"  MkfsExt4Help();  FsckExt4Help();\n";
+"  MkfsFat32Help(); FsckFat32Help();\n";
+"===================================================\n";

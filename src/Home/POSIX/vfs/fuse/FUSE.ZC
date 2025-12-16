@@ -1,0 +1,763 @@
+// FUSE.ZC - FUSE-like User-Space Filesystem Implementation for ZealOS
+// Part of the POSIX compatibility layer
+//
+// This provides a FUSE-compatible API for implementing filesystems
+// in HolyC code. Filesystems implemented with this API integrate
+// seamlessly with the VFS layer.
+
+#include "FUSE.HH"
+
+// ============================================================================
+// GLOBAL STATE
+// ============================================================================
+
+// Currently mounted FUSE filesystems
+#define MAX_FUSE_MOUNTS     16
+static CFuseFS *g_fuse_mounts[MAX_FUSE_MOUNTS];
+static I64 g_fuse_count = 0;
+
+// Current context (thread-local in a real implementation)
+static CFuseContext g_fuse_context;
+
+// ============================================================================
+// CONTEXT MANAGEMENT
+// ============================================================================
+
+CFuseContext *FuseGetContext()
+{
+    return &g_fuse_context;
+}
+
+U0 FuseSetContext(CFuseFS *fuse)
+{
+    g_fuse_context.private_data = fuse ? fuse->private_data : NULL;
+    g_fuse_context.uid = PosixGetUid();
+    g_fuse_context.gid = PosixGetGid();
+    g_fuse_context.pid = PosixGetPid();
+}
+
+// ============================================================================
+// FUSE INSTANCE MANAGEMENT
+// ============================================================================
+
+CFuseFS *FuseNew(CFuseOps *ops, U0 *user_data)
+{
+    if (!ops)
+        return NULL;
+
+    CFuseFS *fuse = MAlloc(sizeof(CFuseFS));
+    if (!fuse)
+        return NULL;
+
+    MemSet(fuse, 0, sizeof(CFuseFS));
+    fuse->ops = ops;
+    fuse->private_data = user_data;
+    fuse->ref_count = 1;
+
+    return fuse;
+}
+
+U0 FuseFree(CFuseFS *fuse)
+{
+    if (!fuse)
+        return;
+
+    if (fuse->mounted)
+        FuseUnmount(fuse);
+
+    if (fuse->mount_point)
+        Free(fuse->mount_point);
+
+    Free(fuse);
+}
+
+// ============================================================================
+// PATH RESOLUTION HELPER
+// ============================================================================
+
+// Build full path from inode to root
+U8 *FuseBuildPath(CVFSInode *inode)
+{
+    if (!inode)
+        return StrNew("/");
+
+    // Walk up to root, collecting path components
+    U8 *components[64];
+    I64 count = 0;
+
+    CVFSInode *cur = inode;
+    while (cur && count < 64) {
+        if (cur->fs_private) {
+            components[count++] = cur->fs_private;  // Stored filename
+        }
+        cur = cur->parent;
+    }
+
+    // Build path
+    I64 total_len = 1;  // Leading /
+    I64 i;
+    for (i = count - 1; i >= 0; i--) {
+        total_len += StrLen(components[i]) + 1;
+    }
+
+    U8 *path = MAlloc(total_len + 1);
+    if (!path)
+        return StrNew("/");
+
+    U8 *p = path;
+    *p++ = '/';
+
+    for (i = count - 1; i >= 0; i--) {
+        I64 len = StrLen(components[i]);
+        MemCpy(p, components[i], len);
+        p += len;
+        if (i > 0)
+            *p++ = '/';
+    }
+    *p = 0;
+
+    return path;
+}
+
+// ============================================================================
+// VFS OPERATIONS BRIDGE
+// ============================================================================
+
+I64 FuseVFSMount(CVFSMount *mnt, U8 *device, U8 *options)
+{
+    // device contains pointer to CFuseFS in string form
+    // (passed via special mount syntax)
+    if (!mnt || !device)
+        return -EINVAL;
+
+    // Parse device string to get CFuseFS pointer
+    CFuseFS *fuse = NULL;
+    I64 i;
+    for (i = 0; i < g_fuse_count; i++) {
+        if (g_fuse_mounts[i] && StrCmp(g_fuse_mounts[i]->mount_point, mnt->mount_point) == 0) {
+            fuse = g_fuse_mounts[i];
+            break;
+        }
+    }
+
+    if (!fuse)
+        return -ENODEV;
+
+    // Call init if provided
+    FuseSetContext(fuse);
+    if (fuse->ops->init) {
+        fuse->private_data = fuse->ops->init();
+    }
+
+    // Create VFS superblock
+    CVFSSuperblock *vfs_sb = MAlloc(sizeof(CVFSSuperblock));
+    if (!vfs_sb)
+        return -ENOMEM;
+
+    MemSet(vfs_sb, 0, sizeof(CVFSSuperblock));
+    vfs_sb->fs_type = VFS_FS_FUSE;
+    vfs_sb->block_size = 4096;
+    vfs_sb->mount = mnt;
+    vfs_sb->fs_private = fuse;
+
+    fuse->vfs_sb = vfs_sb;
+    fuse->vfs_mount = mnt;
+
+    // Create root inode
+    CVFSInode *root = VFSInodeAlloc(vfs_sb);
+    if (!root) {
+        Free(vfs_sb);
+        return -ENOMEM;
+    }
+
+    // Get root attributes via getattr
+    if (fuse->ops->getattr) {
+        CFuseStat st;
+        MemSet(&st, 0, sizeof(CFuseStat));
+
+        if (fuse->ops->getattr("/", &st) == 0) {
+            root->ino = st.st_ino ? st.st_ino : 1;
+            root->mode = st.st_mode;
+            root->nlink = st.st_nlink;
+            root->uid = st.st_uid;
+            root->gid = st.st_gid;
+            root->size = st.st_size;
+            root->atime = st.st_atime;
+            root->mtime = st.st_mtime;
+            root->ctime = st.st_ctime;
+        } else {
+            // Default root directory
+            root->ino = 1;
+            root->mode = VFS_IFDIR | 0755;
+            root->nlink = 2;
+        }
+    } else {
+        root->ino = 1;
+        root->mode = VFS_IFDIR | 0755;
+        root->nlink = 2;
+    }
+
+    root->fs_private = StrNew("");  // Root path component
+
+    vfs_sb->root = root;
+    mnt->root = root;
+    mnt->sb = vfs_sb;
+
+    // Install VFS operations
+    static CVFSOps fuse_vfs_ops = {
+        .mount = &FuseVFSMount,
+        .unmount = &FuseVFSUnmount,
+        .lookup = &FuseVFSLookup,
+        .readlink = &FuseVFSReadlink,
+        .create = &FuseVFSCreate,
+        .mkdir = &FuseVFSMkdir,
+        .unlink = &FuseVFSUnlink,
+        .rmdir = &FuseVFSRmdir,
+        .symlink = &FuseVFSSymlink,
+        .truncate = &FuseVFSTruncate,
+        .open = &FuseVFSOpen,
+        .close = &FuseVFSClose,
+        .read = &FuseVFSRead,
+        .write = &FuseVFSWrite,
+        .readdir = &FuseVFSReaddir,
+    };
+
+    vfs_sb->ops = &fuse_vfs_ops;
+    fuse->mounted = TRUE;
+
+    return 0;
+}
+
+I64 FuseVFSUnmount(CVFSMount *mnt)
+{
+    if (!mnt || !mnt->sb)
+        return -EINVAL;
+
+    CVFSSuperblock *vfs_sb = mnt->sb;
+    CFuseFS *fuse = vfs_sb->fs_private;
+
+    if (fuse) {
+        FuseSetContext(fuse);
+
+        // Call destroy if provided
+        if (fuse->ops->destroy) {
+            fuse->ops->destroy(fuse->private_data);
+        }
+
+        fuse->mounted = FALSE;
+    }
+
+    if (vfs_sb->root) {
+        if (vfs_sb->root->fs_private)
+            Free(vfs_sb->root->fs_private);
+        VFSInodeFree(vfs_sb->root);
+    }
+
+    Free(vfs_sb);
+    return 0;
+}
+
+I64 FuseVFSLookup(CVFSInode *dir, U8 *name, CVFSInode **result)
+{
+    if (!dir || !name || !result)
+        return -EINVAL;
+
+    *result = NULL;
+
+    CFuseFS *fuse = dir->sb->fs_private;
+    if (!fuse || !fuse->ops->getattr)
+        return -EIO;
+
+    FuseSetContext(fuse);
+
+    // Build full path
+    U8 *dir_path = FuseBuildPath(dir);
+    U8 full_path[VFS_MAX_PATH];
+
+    if (StrCmp(dir_path, "/") == 0)
+        snprintf(full_path, VFS_MAX_PATH, "/%s", name);
+    else
+        snprintf(full_path, VFS_MAX_PATH, "%s/%s", dir_path, name);
+
+    Free(dir_path);
+
+    // Get attributes
+    CFuseStat st;
+    MemSet(&st, 0, sizeof(CFuseStat));
+
+    I64 err = fuse->ops->getattr(full_path, &st);
+    if (err < 0)
+        return err;
+
+    // Create inode
+    CVFSInode *inode = VFSInodeAlloc(dir->sb);
+    if (!inode)
+        return -ENOMEM;
+
+    inode->ino = st.st_ino ? st.st_ino : (dir->ino * 31 + StrHash(name));
+    inode->mode = st.st_mode;
+    inode->nlink = st.st_nlink;
+    inode->uid = st.st_uid;
+    inode->gid = st.st_gid;
+    inode->size = st.st_size;
+    inode->atime = st.st_atime;
+    inode->mtime = st.st_mtime;
+    inode->ctime = st.st_ctime;
+    inode->parent = dir;
+    inode->fs_private = StrNew(name);  // Store name for path building
+
+    VFSInodeInsertCache(inode);
+    *result = inode;
+
+    return 0;
+}
+
+I64 FuseVFSReadlink(CVFSInode *inode, U8 *buf, I64 size)
+{
+    if (!inode || !buf)
+        return -EINVAL;
+
+    CFuseFS *fuse = inode->sb->fs_private;
+    if (!fuse || !fuse->ops->readlink)
+        return -EIO;
+
+    FuseSetContext(fuse);
+
+    U8 *path = FuseBuildPath(inode);
+    I64 result = fuse->ops->readlink(path, buf, size);
+    Free(path);
+
+    return result;
+}
+
+I64 FuseVFSOpen(CVFSFile *file)
+{
+    if (!file || !file->inode)
+        return -EINVAL;
+
+    CFuseFS *fuse = file->inode->sb->fs_private;
+    if (!fuse)
+        return -EIO;
+
+    FuseSetContext(fuse);
+
+    if (fuse->ops->open) {
+        U8 *path = FuseBuildPath(file->inode);
+
+        CFuseFileInfo fi;
+        MemSet(&fi, 0, sizeof(CFuseFileInfo));
+        fi.flags = file->flags;
+
+        I64 result = fuse->ops->open(path, &fi);
+        Free(path);
+
+        if (result < 0)
+            return result;
+
+        // Store file handle
+        file->fs_private = fi.fh;
+    }
+
+    return 0;
+}
+
+I64 FuseVFSClose(CVFSFile *file)
+{
+    if (!file || !file->inode)
+        return -EINVAL;
+
+    CFuseFS *fuse = file->inode->sb->fs_private;
+    if (!fuse)
+        return -EIO;
+
+    FuseSetContext(fuse);
+
+    if (fuse->ops->release) {
+        U8 *path = FuseBuildPath(file->inode);
+
+        CFuseFileInfo fi;
+        MemSet(&fi, 0, sizeof(CFuseFileInfo));
+        fi.fh = file->fs_private;
+
+        I64 result = fuse->ops->release(path, &fi);
+        Free(path);
+
+        return result;
+    }
+
+    return 0;
+}
+
+I64 FuseVFSRead(CVFSFile *file, U0 *buf, I64 size, I64 offset)
+{
+    if (!file || !buf || !file->inode)
+        return -EINVAL;
+
+    CFuseFS *fuse = file->inode->sb->fs_private;
+    if (!fuse || !fuse->ops->read)
+        return -EIO;
+
+    FuseSetContext(fuse);
+
+    U8 *path = FuseBuildPath(file->inode);
+
+    CFuseFileInfo fi;
+    MemSet(&fi, 0, sizeof(CFuseFileInfo));
+    fi.fh = file->fs_private;
+
+    I64 result = fuse->ops->read(path, buf, size, offset, &fi);
+    Free(path);
+
+    return result;
+}
+
+I64 FuseVFSWrite(CVFSFile *file, U0 *buf, I64 size, I64 offset)
+{
+    if (!file || !buf || !file->inode)
+        return -EINVAL;
+
+    CFuseFS *fuse = file->inode->sb->fs_private;
+    if (!fuse || !fuse->ops->write)
+        return -EROFS;
+
+    FuseSetContext(fuse);
+
+    U8 *path = FuseBuildPath(file->inode);
+
+    CFuseFileInfo fi;
+    MemSet(&fi, 0, sizeof(CFuseFileInfo));
+    fi.fh = file->fs_private;
+
+    I64 result = fuse->ops->write(path, buf, size, offset, &fi);
+    Free(path);
+
+    return result;
+}
+
+// Directory entry accumulator for readdir
+class CFuseDirBuf {
+    CVFSDirent *entries;
+    I64 count;
+    I64 max_count;
+    I64 position;
+    I64 start_offset;
+};
+
+I64 FuseFillDirCallback(CFuseDirBuf *buf, U8 *name, CFuseStat *st, I64 off)
+{
+    if (!buf || !name)
+        return 1;  // Error
+
+    if (buf->count >= buf->max_count)
+        return 1;  // Buffer full
+
+    // Skip entries before start_offset
+    if (off > 0 && off <= buf->start_offset)
+        return 0;
+
+    CVFSDirent *dirent = &buf->entries[buf->count];
+
+    dirent->ino = st ? st->st_ino : 0;
+    dirent->off = buf->position + 1;
+    dirent->reclen = sizeof(CVFSDirent);
+
+    // Determine type
+    if (st) {
+        if (FUSE_S_ISDIR(st->st_mode))
+            dirent->type = DT_DIR;
+        else if (FUSE_S_ISLNK(st->st_mode))
+            dirent->type = DT_LNK;
+        else if (FUSE_S_ISREG(st->st_mode))
+            dirent->type = DT_REG;
+        else
+            dirent->type = DT_UNKNOWN;
+    } else {
+        dirent->type = DT_UNKNOWN;
+    }
+
+    I64 name_len = StrLen(name);
+    if (name_len > VFS_MAX_NAME)
+        name_len = VFS_MAX_NAME;
+    MemCpy(dirent->name, name, name_len);
+    dirent->name[name_len] = 0;
+
+    buf->count++;
+    buf->position++;
+
+    return 0;
+}
+
+I64 FuseVFSReaddir(CVFSFile *file, U0 *buf, I64 count)
+{
+    if (!file || !buf || !file->inode)
+        return -EINVAL;
+
+    CFuseFS *fuse = file->inode->sb->fs_private;
+    if (!fuse || !fuse->ops->readdir)
+        return -EIO;
+
+    FuseSetContext(fuse);
+
+    U8 *path = FuseBuildPath(file->inode);
+
+    CFuseFileInfo fi;
+    MemSet(&fi, 0, sizeof(CFuseFileInfo));
+    fi.fh = file->fs_private;
+
+    CFuseDirBuf dir_buf;
+    dir_buf.entries = buf;
+    dir_buf.count = 0;
+    dir_buf.max_count = count;
+    dir_buf.position = 0;
+    dir_buf.start_offset = file->dir_pos;
+
+    I64 result = fuse->ops->readdir(path, &dir_buf, &FuseFillDirCallback,
+                                     file->dir_pos, &fi);
+    Free(path);
+
+    if (result < 0)
+        return result;
+
+    file->dir_pos = dir_buf.position;
+    return dir_buf.count;
+}
+
+I64 FuseVFSCreate(CVFSInode *dir, U8 *name, U32 mode, CVFSInode **result)
+{
+    if (!dir || !name || !result)
+        return -EINVAL;
+
+    CFuseFS *fuse = dir->sb->fs_private;
+    if (!fuse)
+        return -EIO;
+
+    FuseSetContext(fuse);
+
+    // Build full path
+    U8 *dir_path = FuseBuildPath(dir);
+    U8 full_path[VFS_MAX_PATH];
+
+    if (StrCmp(dir_path, "/") == 0)
+        snprintf(full_path, VFS_MAX_PATH, "/%s", name);
+    else
+        snprintf(full_path, VFS_MAX_PATH, "%s/%s", dir_path, name);
+
+    Free(dir_path);
+
+    // Try create+open first
+    if (fuse->ops->create) {
+        CFuseFileInfo fi;
+        MemSet(&fi, 0, sizeof(CFuseFileInfo));
+
+        I64 err = fuse->ops->create(full_path, mode, &fi);
+        if (err < 0)
+            return err;
+
+        // Release immediately
+        if (fuse->ops->release)
+            fuse->ops->release(full_path, &fi);
+    } else if (fuse->ops->mknod) {
+        I64 err = fuse->ops->mknod(full_path, mode | FUSE_S_IFREG, 0);
+        if (err < 0)
+            return err;
+    } else {
+        return -EROFS;
+    }
+
+    // Look up the created file
+    return FuseVFSLookup(dir, name, result);
+}
+
+I64 FuseVFSMkdir(CVFSInode *dir, U8 *name, U32 mode, CVFSInode **result)
+{
+    if (!dir || !name)
+        return -EINVAL;
+
+    CFuseFS *fuse = dir->sb->fs_private;
+    if (!fuse || !fuse->ops->mkdir)
+        return -EROFS;
+
+    FuseSetContext(fuse);
+
+    U8 *dir_path = FuseBuildPath(dir);
+    U8 full_path[VFS_MAX_PATH];
+
+    if (StrCmp(dir_path, "/") == 0)
+        snprintf(full_path, VFS_MAX_PATH, "/%s", name);
+    else
+        snprintf(full_path, VFS_MAX_PATH, "%s/%s", dir_path, name);
+
+    Free(dir_path);
+
+    I64 err = fuse->ops->mkdir(full_path, mode);
+    if (err < 0)
+        return err;
+
+    if (result)
+        return FuseVFSLookup(dir, name, result);
+
+    return 0;
+}
+
+I64 FuseVFSUnlink(CVFSInode *dir, U8 *name)
+{
+    if (!dir || !name)
+        return -EINVAL;
+
+    CFuseFS *fuse = dir->sb->fs_private;
+    if (!fuse || !fuse->ops->unlink)
+        return -EROFS;
+
+    FuseSetContext(fuse);
+
+    U8 *dir_path = FuseBuildPath(dir);
+    U8 full_path[VFS_MAX_PATH];
+
+    if (StrCmp(dir_path, "/") == 0)
+        snprintf(full_path, VFS_MAX_PATH, "/%s", name);
+    else
+        snprintf(full_path, VFS_MAX_PATH, "%s/%s", dir_path, name);
+
+    Free(dir_path);
+
+    return fuse->ops->unlink(full_path);
+}
+
+I64 FuseVFSRmdir(CVFSInode *dir, U8 *name)
+{
+    if (!dir || !name)
+        return -EINVAL;
+
+    CFuseFS *fuse = dir->sb->fs_private;
+    if (!fuse || !fuse->ops->rmdir)
+        return -EROFS;
+
+    FuseSetContext(fuse);
+
+    U8 *dir_path = FuseBuildPath(dir);
+    U8 full_path[VFS_MAX_PATH];
+
+    if (StrCmp(dir_path, "/") == 0)
+        snprintf(full_path, VFS_MAX_PATH, "/%s", name);
+    else
+        snprintf(full_path, VFS_MAX_PATH, "%s/%s", dir_path, name);
+
+    Free(dir_path);
+
+    return fuse->ops->rmdir(full_path);
+}
+
+I64 FuseVFSSymlink(CVFSInode *dir, U8 *name, U8 *target)
+{
+    if (!dir || !name || !target)
+        return -EINVAL;
+
+    CFuseFS *fuse = dir->sb->fs_private;
+    if (!fuse || !fuse->ops->symlink)
+        return -EROFS;
+
+    FuseSetContext(fuse);
+
+    U8 *dir_path = FuseBuildPath(dir);
+    U8 full_path[VFS_MAX_PATH];
+
+    if (StrCmp(dir_path, "/") == 0)
+        snprintf(full_path, VFS_MAX_PATH, "/%s", name);
+    else
+        snprintf(full_path, VFS_MAX_PATH, "%s/%s", dir_path, name);
+
+    Free(dir_path);
+
+    return fuse->ops->symlink(target, full_path);
+}
+
+I64 FuseVFSTruncate(CVFSInode *inode, I64 size)
+{
+    if (!inode)
+        return -EINVAL;
+
+    CFuseFS *fuse = inode->sb->fs_private;
+    if (!fuse || !fuse->ops->truncate)
+        return -EROFS;
+
+    FuseSetContext(fuse);
+
+    U8 *path = FuseBuildPath(inode);
+    I64 result = fuse->ops->truncate(path, size);
+    Free(path);
+
+    return result;
+}
+
+// ============================================================================
+// PUBLIC API
+// ============================================================================
+
+I64 FuseMount(CFuseFS *fuse, U8 *mount_point)
+{
+    if (!fuse || !mount_point)
+        return -EINVAL;
+
+    if (g_fuse_count >= MAX_FUSE_MOUNTS)
+        return -EMFILE;
+
+    fuse->mount_point = StrNew(mount_point);
+
+    // Register in global list
+    g_fuse_mounts[g_fuse_count++] = fuse;
+
+    // Mount via VFS
+    I64 err = VFSMount(NULL, mount_point, "fuse", 0, NULL);
+    if (err < 0) {
+        g_fuse_count--;
+        Free(fuse->mount_point);
+        fuse->mount_point = NULL;
+        return err;
+    }
+
+    return 0;
+}
+
+I64 FuseUnmount(CFuseFS *fuse)
+{
+    if (!fuse || !fuse->mount_point)
+        return -EINVAL;
+
+    I64 err = VFSUnmount(fuse->mount_point);
+
+    // Remove from global list
+    I64 i;
+    for (i = 0; i < g_fuse_count; i++) {
+        if (g_fuse_mounts[i] == fuse) {
+            g_fuse_mounts[i] = g_fuse_mounts[--g_fuse_count];
+            break;
+        }
+    }
+
+    Free(fuse->mount_point);
+    fuse->mount_point = NULL;
+
+    return err;
+}
+
+// ============================================================================
+// REGISTRATION
+// ============================================================================
+
+static CVFSFilesystem fuse_filesystem = {
+    .name = "fuse",
+    .type = VFS_FS_FUSE,
+    .flags = 0,
+    .ops = NULL,
+    .probe = NULL,
+    .next = NULL
+};
+
+U0 FuseRegister()
+{
+    VFSRegisterFilesystem(&fuse_filesystem);
+    "FUSE user-space filesystem interface registered.\n";
+}
+
+// Auto-register
+FuseRegister();

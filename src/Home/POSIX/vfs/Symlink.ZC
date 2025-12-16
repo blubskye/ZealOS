@@ -1,0 +1,553 @@
+// Symlink.ZC - Symbolic Link Support for ZealOS
+// Part of the POSIX compatibility layer
+//
+// Provides POSIX-compatible symbolic link operations that work across
+// all filesystems, including native ZealOS filesystems that don't
+// natively support symlinks.
+//
+// This uses an overlay symlink table stored in memory and optionally
+// persisted to disk as /Home/POSIX/etc/symlinks.db
+
+#include "VFS.HH"
+
+// ============================================================================
+// SYMLINK DATABASE FILE FORMAT
+// ============================================================================
+// Simple text format:
+// path\ttarget\tmtime\n
+// ...
+
+#define SYMLINK_DB_PATH     "/Home/POSIX/etc/symlinks.db"
+#define SYMLINK_DB_MAGIC    "ZSYM"
+#define SYMLINK_DB_VERSION  1
+
+// ============================================================================
+// LOAD SYMLINK DATABASE
+// ============================================================================
+
+I64 SymlinkDBLoad()
+{
+    CVFS *vfs = VFSGet();
+
+    FILE *fp = fopen(SYMLINK_DB_PATH, "r");
+    if (!fp)
+        return 0;  // No database yet, that's OK
+
+    U8 line[VFS_MAX_PATH * 2 + 64];
+    I64 count = 0;
+
+    while (fgets(line, sizeof(line), fp)) {
+        // Remove newline
+        I64 len = StrLen(line);
+        if (len > 0 && line[len-1] == '\n')
+            line[--len] = 0;
+
+        // Skip empty lines and comments
+        if (len == 0 || line[0] == '#')
+            continue;
+
+        // Parse: path\ttarget\tmtime
+        U8 *path = line;
+        U8 *target = StrChr(path, '\t');
+        if (!target)
+            continue;
+        *target++ = 0;
+
+        U8 *mtime_str = StrChr(target, '\t');
+        U64 mtime = 0;
+        if (mtime_str) {
+            *mtime_str++ = 0;
+            mtime = strtoll(mtime_str, NULL, 10);
+        }
+
+        // Create symlink entry
+        VFSSymlinkCreate(path, target);
+        count++;
+    }
+
+    fclose(fp);
+
+    if (count > 0)
+        printf("SymlinkDB: Loaded %d symlinks from %s\n", count, SYMLINK_DB_PATH);
+
+    return count;
+}
+
+// ============================================================================
+// SAVE SYMLINK DATABASE
+// ============================================================================
+
+I64 SymlinkDBSave()
+{
+    CVFS *vfs = VFSGet();
+
+    FILE *fp = fopen(SYMLINK_DB_PATH, "w");
+    if (!fp) {
+        // Try to create directory
+        mkdir("/Home/POSIX/etc", 0755);
+        fp = fopen(SYMLINK_DB_PATH, "w");
+        if (!fp)
+            return -errno;
+    }
+
+    fprintf(fp, "# ZealOS Symlink Database\n");
+    fprintf(fp, "# Format: path\\ttarget\\tmtime\n");
+    fprintf(fp, "# DO NOT EDIT - managed by system\n\n");
+
+    I64 count = 0;
+
+    for (I64 i = 0; i < VFS_SYMLINK_TABLE_SIZE; i++) {
+        CVFSSymlink *sym = vfs->symlink_table[i];
+        while (sym) {
+            fprintf(fp, "%s\t%s\t%lld\n", sym->path, sym->target, sym->mtime);
+            count++;
+            sym = sym->next;
+        }
+    }
+
+    fclose(fp);
+    return count;
+}
+
+// ============================================================================
+// POSIX SYMLINK API
+// ============================================================================
+
+// Create a symbolic link
+I64 symlink(U8 *target, U8 *linkpath)
+{
+    if (!target || !linkpath) {
+        errno = EINVAL;
+        return -1;
+    }
+
+    // Normalize linkpath
+    U8 norm_path[VFS_MAX_PATH];
+    if (!VFSNormalizePath(linkpath, norm_path, VFS_MAX_PATH)) {
+        errno = ENAMETOOLONG;
+        return -1;
+    }
+
+    I64 err = VFSSymlink(target, norm_path);
+    if (err < 0) {
+        errno = -err;
+        return -1;
+    }
+
+    // Auto-save to database
+    SymlinkDBSave();
+
+    return 0;
+}
+
+// Create a symbolic link relative to directory fd
+I64 symlinkat(U8 *target, I64 dirfd, U8 *linkpath)
+{
+    // TODO: Handle dirfd properly
+    if (dirfd == AT_FDCWD || linkpath[0] == '/') {
+        return symlink(target, linkpath);
+    }
+
+    // Get directory path from fd
+    CPosixFD *pfd = PosixFDGet(posix_current, dirfd);
+    if (!pfd || pfd->type != FD_TYPE_DIR) {
+        errno = EBADF;
+        return -1;
+    }
+
+    U8 full_path[VFS_MAX_PATH];
+    snprintf(full_path, VFS_MAX_PATH, "%s/%s", pfd->dir_path, linkpath);
+
+    return symlink(target, full_path);
+}
+
+// Read a symbolic link
+ssize_t readlink(U8 *path, U8 *buf, size_t bufsiz)
+{
+    if (!path || !buf || bufsiz == 0) {
+        errno = EINVAL;
+        return -1;
+    }
+
+    // Normalize path
+    U8 norm_path[VFS_MAX_PATH];
+    if (!VFSNormalizePath(path, norm_path, VFS_MAX_PATH)) {
+        errno = ENAMETOOLONG;
+        return -1;
+    }
+
+    I64 result = VFSReadlink(norm_path, buf, bufsiz);
+    if (result < 0) {
+        errno = -result;
+        return -1;
+    }
+
+    return result;
+}
+
+// Read a symbolic link relative to directory fd
+ssize_t readlinkat(I64 dirfd, U8 *path, U8 *buf, size_t bufsiz)
+{
+    if (dirfd == AT_FDCWD || path[0] == '/') {
+        return readlink(path, buf, bufsiz);
+    }
+
+    CPosixFD *pfd = PosixFDGet(posix_current, dirfd);
+    if (!pfd || pfd->type != FD_TYPE_DIR) {
+        errno = EBADF;
+        return -1;
+    }
+
+    U8 full_path[VFS_MAX_PATH];
+    snprintf(full_path, VFS_MAX_PATH, "%s/%s", pfd->dir_path, path);
+
+    return readlink(full_path, buf, bufsiz);
+}
+
+// Create a hard link
+I64 link(U8 *oldpath, U8 *newpath)
+{
+    if (!oldpath || !newpath) {
+        errno = EINVAL;
+        return -1;
+    }
+
+    I64 err = VFSLink(oldpath, newpath);
+    if (err < 0) {
+        errno = -err;
+        return -1;
+    }
+
+    return 0;
+}
+
+// Create a hard link relative to directory fds
+I64 linkat(I64 olddirfd, U8 *oldpath, I64 newdirfd, U8 *newpath, I64 flags)
+{
+    U8 old_full[VFS_MAX_PATH];
+    U8 new_full[VFS_MAX_PATH];
+
+    // Resolve old path
+    if (olddirfd == AT_FDCWD || oldpath[0] == '/') {
+        StrCpy(old_full, oldpath);
+    } else {
+        CPosixFD *pfd = PosixFDGet(posix_current, olddirfd);
+        if (!pfd || pfd->type != FD_TYPE_DIR) {
+            errno = EBADF;
+            return -1;
+        }
+        snprintf(old_full, VFS_MAX_PATH, "%s/%s", pfd->dir_path, oldpath);
+    }
+
+    // Resolve new path
+    if (newdirfd == AT_FDCWD || newpath[0] == '/') {
+        StrCpy(new_full, newpath);
+    } else {
+        CPosixFD *pfd = PosixFDGet(posix_current, newdirfd);
+        if (!pfd || pfd->type != FD_TYPE_DIR) {
+            errno = EBADF;
+            return -1;
+        }
+        snprintf(new_full, VFS_MAX_PATH, "%s/%s", pfd->dir_path, newpath);
+    }
+
+    // Handle AT_SYMLINK_FOLLOW
+    if (flags & AT_SYMLINK_FOLLOW) {
+        U8 resolved[VFS_MAX_PATH];
+        if (realpath(old_full, resolved))
+            StrCpy(old_full, resolved);
+    }
+
+    return link(old_full, new_full);
+}
+
+// ============================================================================
+// LSTAT - STAT WITHOUT FOLLOWING SYMLINKS
+// ============================================================================
+
+I64 lstat(U8 *path, struct stat *buf)
+{
+    if (!path || !buf) {
+        errno = EINVAL;
+        return -1;
+    }
+
+    MemSet(buf, 0, sizeof(struct stat));
+
+    // Normalize path
+    U8 norm_path[VFS_MAX_PATH];
+    if (!VFSNormalizePath(path, norm_path, VFS_MAX_PATH)) {
+        errno = ENAMETOOLONG;
+        return -1;
+    }
+
+    // Check overlay symlinks first
+    CVFSSymlink *sym = VFSSymlinkLookup(norm_path);
+    if (sym) {
+        buf->st_mode = S_IFLNK | 0777;
+        buf->st_nlink = 1;
+        buf->st_size = StrLen(sym->target);
+        buf->st_mtime = sym->mtime;
+        buf->st_ctime = sym->mtime;
+        buf->st_atime = time(NULL);
+        buf->st_blksize = 4096;
+        buf->st_blocks = 1;
+        return 0;
+    }
+
+    // Use VFS to get inode without following links
+    CVFSInode *inode = NULL;
+    I64 err = VFSLstat(norm_path, &inode);
+
+    if (err < 0) {
+        // Fall back to native ZealOS stat
+        CDirEntry de;
+        if (!FileFind(norm_path, &de)) {
+            errno = ENOENT;
+            return -1;
+        }
+
+        // Convert ZealOS dir entry to stat
+        buf->st_mode = S_IFREG | 0644;
+        if (de.attr & RS_ATTR_DIR)
+            buf->st_mode = S_IFDIR | 0755;
+
+        buf->st_nlink = 1;
+        buf->st_size = de.size;
+        buf->st_mtime = de.datetime / CDATE_FREQ;
+        buf->st_ctime = buf->st_mtime;
+        buf->st_atime = buf->st_mtime;
+        buf->st_blksize = 4096;
+        buf->st_blocks = (de.size + 511) / 512;
+
+        return 0;
+    }
+
+    // Convert VFS inode to stat
+    buf->st_ino = inode->ino;
+    buf->st_mode = inode->mode;
+    buf->st_nlink = inode->nlink;
+    buf->st_uid = inode->uid;
+    buf->st_gid = inode->gid;
+    buf->st_size = inode->size;
+    buf->st_atime = inode->atime;
+    buf->st_mtime = inode->mtime;
+    buf->st_ctime = inode->ctime;
+    buf->st_blksize = 4096;
+    buf->st_blocks = inode->blocks;
+
+    if (VFS_ISBLK(inode->mode) || VFS_ISCHR(inode->mode)) {
+        buf->st_rdev = (inode->rdev_major << 8) | inode->rdev_minor;
+    }
+
+    VFSInodePut(inode);
+    return 0;
+}
+
+I64 fstatat(I64 dirfd, U8 *path, struct stat *buf, I64 flags)
+{
+    U8 full_path[VFS_MAX_PATH];
+
+    if (dirfd == AT_FDCWD || path[0] == '/') {
+        StrCpy(full_path, path);
+    } else {
+        CPosixFD *pfd = PosixFDGet(posix_current, dirfd);
+        if (!pfd || pfd->type != FD_TYPE_DIR) {
+            errno = EBADF;
+            return -1;
+        }
+        snprintf(full_path, VFS_MAX_PATH, "%s/%s", pfd->dir_path, path);
+    }
+
+    if (flags & AT_SYMLINK_NOFOLLOW) {
+        return lstat(full_path, buf);
+    }
+
+    return stat(full_path, buf);
+}
+
+// ============================================================================
+// REALPATH - RESOLVE SYMLINKS AND CANONICALIZE PATH
+// ============================================================================
+
+U8 *realpath(U8 *path, U8 *resolved_path)
+{
+    if (!path) {
+        errno = EINVAL;
+        return NULL;
+    }
+
+    U8 *result = resolved_path;
+    if (!result) {
+        result = MAlloc(VFS_MAX_PATH);
+        if (!result) {
+            errno = ENOMEM;
+            return NULL;
+        }
+    }
+
+    // Start with absolute path
+    if (path[0] == '/') {
+        result[0] = '/';
+        result[1] = 0;
+    } else {
+        if (!getcwd(result, VFS_MAX_PATH)) {
+            if (!resolved_path) Free(result);
+            return NULL;
+        }
+    }
+
+    U8 *p = path;
+    if (*p == '/')
+        p++;
+
+    I64 symlink_depth = 0;
+
+    while (*p) {
+        // Get next component
+        U8 component[VFS_MAX_NAME + 1];
+        U8 *cp = component;
+        while (*p && *p != '/' && cp < component + VFS_MAX_NAME)
+            *cp++ = *p++;
+        *cp = 0;
+
+        if (*p == '/')
+            p++;
+
+        if (component[0] == 0)
+            continue;
+
+        // Handle . and ..
+        if (StrCmp(component, ".") == 0) {
+            continue;
+        } else if (StrCmp(component, "..") == 0) {
+            // Go up
+            U8 *slash = StrRChr(result, '/');
+            if (slash && slash != result) {
+                *slash = 0;
+            }
+            continue;
+        }
+
+        // Append component
+        I64 len = StrLen(result);
+        if (len > 1 || result[0] != '/')
+            result[len++] = '/';
+        StrCpy(result + len, component);
+
+        // Check if it's a symlink
+        U8 link_target[VFS_MAX_PATH];
+        I64 link_len = VFSReadlink(result, link_target, VFS_MAX_PATH);
+
+        if (link_len > 0) {
+            if (++symlink_depth > VFS_MAX_SYMLINK_DEPTH) {
+                errno = ELOOP;
+                if (!resolved_path) Free(result);
+                return NULL;
+            }
+
+            // If absolute symlink, restart from root
+            if (link_target[0] == '/') {
+                result[0] = '/';
+                result[1] = 0;
+            } else {
+                // Go up one level
+                U8 *slash = StrRChr(result, '/');
+                if (slash && slash != result) {
+                    *slash = 0;
+                } else {
+                    result[0] = '/';
+                    result[1] = 0;
+                }
+            }
+
+            // Prepend remaining path to link target
+            U8 new_path[VFS_MAX_PATH];
+            if (*p) {
+                snprintf(new_path, VFS_MAX_PATH, "%s/%s", link_target, p);
+            } else {
+                StrCpy(new_path, link_target);
+            }
+
+            // Recursively resolve
+            U8 resolved_link[VFS_MAX_PATH];
+            U8 *link_result = realpath(new_path, resolved_link);
+            if (!link_result) {
+                if (!resolved_path) Free(result);
+                return NULL;
+            }
+
+            StrCpy(result, resolved_link);
+            return result;
+        }
+
+        // Check if path exists
+        struct stat st;
+        if (lstat(result, &st) < 0) {
+            // Path doesn't exist - if more components remain, error
+            if (*p) {
+                errno = ENOENT;
+                if (!resolved_path) Free(result);
+                return NULL;
+            }
+        }
+    }
+
+    return result;
+}
+
+// ============================================================================
+// UNLINK WITH SYMLINK SUPPORT
+// ============================================================================
+
+I64 unlink_vfs(U8 *path)
+{
+    if (!path) {
+        errno = EINVAL;
+        return -1;
+    }
+
+    // Check if it's an overlay symlink
+    if (VFSSymlinkLookup(path)) {
+        I64 err = VFSSymlinkDelete(path);
+        if (err < 0) {
+            errno = -err;
+            return -1;
+        }
+        SymlinkDBSave();
+        return 0;
+    }
+
+    // Use VFS unlink
+    I64 err = VFSUnlink(path);
+    if (err < 0) {
+        // Fall back to native ZealOS
+        if (Del(path))
+            return 0;
+        errno = ENOENT;
+        return -1;
+    }
+
+    return 0;
+}
+
+// ============================================================================
+// INITIALIZATION
+// ============================================================================
+
+U0 SymlinkInit()
+{
+    // Initialize VFS if needed
+    VFSInit();
+
+    // Load symlink database
+    SymlinkDBLoad();
+
+    "ZealOS Symlink support loaded.\n";
+    "  - symlink(), readlink(), lstat()\n";
+    "  - Overlay symlink table for native filesystems\n";
+    "  - Persistent symlink database\n";
+}
+
+// Auto-initialize
+SymlinkInit();

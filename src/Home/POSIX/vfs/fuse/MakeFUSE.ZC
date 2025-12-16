@@ -1,0 +1,14 @@
+// MakeFUSE.ZC - FUSE User-Space Filesystem Loader for ZealOS
+// Part of the POSIX compatibility layer
+
+Cd(__DIR__);;
+
+// Load VFS first if not already loaded
+#include "../VFS.HH"
+#include "../VFS.ZC"
+
+// Load FUSE interface
+#include "FUSE.HH"
+#include "FUSE.ZC"
+
+"FUSE user-space filesystem interface ready.\n";

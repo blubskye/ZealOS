@@ -1,0 +1,1026 @@
+// Ext4.ZC - Ext2/3/4 Filesystem Driver for ZealOS
+// Part of the POSIX compatibility layer
+//
+// Implementation based on FreeBSD ext2fs concepts (BSD-2-Clause).
+// See LICENSE file in this directory.
+//
+// This is a read-only driver supporting:
+// - Ext2, Ext3, and Ext4 filesystems
+// - Extent-based and indirect block mapping
+// - Symbolic links (fast and regular)
+// - 64-bit block addressing
+// - Large files (>2GB)
+//
+// Write support is not implemented for safety.
+
+#include "Ext4.HH"
+
+// ============================================================================
+// DEVICE I/O
+// ============================================================================
+
+// Read bytes from device at byte offset
+I64 Ext4DeviceRead(CExt4FS *fs, U64 offset, U0 *buf, I64 size)
+{
+    if (!fs || !buf)
+        return -EINVAL;
+
+    // Use ZealOS block device read
+    // For now, use file-based access (device file)
+    if (fs->device_fd >= 0) {
+        I64 result = PosixLseek(fs->device_fd, offset, SEEK_SET);
+        if (result < 0)
+            return result;
+        return PosixRead(fs->device_fd, buf, size);
+    }
+
+    return -EIO;
+}
+
+// Read a single block
+I64 Ext4ReadBlock(CExt4FS *fs, U64 block, U0 *buf)
+{
+    return Ext4DeviceRead(fs, block * fs->block_size, buf, fs->block_size);
+}
+
+// Read multiple contiguous blocks
+I64 Ext4ReadBlocks(CExt4FS *fs, U64 block, I64 count, U0 *buf)
+{
+    return Ext4DeviceRead(fs, block * fs->block_size, buf, count * fs->block_size);
+}
+
+// ============================================================================
+// SUPERBLOCK PARSING
+// ============================================================================
+
+I64 Ext4ParseSuperblock(CExt4FS *fs, CExt2Superblock *sb)
+{
+    // Check magic
+    if (sb->s_magic != EXT2_SUPER_MAGIC) {
+        return -EINVAL;
+    }
+
+    // Basic info
+    fs->log_block_size = sb->s_log_block_size;
+    fs->block_size = 1024 << sb->s_log_block_size;
+    fs->blocks_per_group = sb->s_blocks_per_group;
+    fs->inodes_per_group = sb->s_inodes_per_group;
+    fs->total_inodes = sb->s_inodes_count;
+    fs->free_inodes = sb->s_free_inodes_count;
+
+    // Revision level determines inode size
+    if (sb->s_rev_level >= EXT2_DYNAMIC_REV) {
+        fs->inode_size = sb->s_inode_size;
+        fs->first_ino = sb->s_first_ino;
+    } else {
+        fs->inode_size = EXT2_GOOD_OLD_INODE_SIZE;
+        fs->first_ino = EXT2_FIRST_INO;
+    }
+
+    // Feature flags
+    fs->features_compat = sb->s_feature_compat;
+    fs->features_incompat = sb->s_feature_incompat;
+    fs->features_ro_compat = sb->s_feature_ro_compat;
+
+    // 64-bit mode
+    fs->is_64bit = (fs->features_incompat & EXT4_FEATURE_INCOMPAT_64BIT) != 0;
+
+    // Block counts
+    if (fs->is_64bit) {
+        fs->total_blocks = (sb->s_blocks_count_hi(U64) << 32) | sb->s_blocks_count;
+        fs->free_blocks = (sb->s_free_blocks_count_hi(U64) << 32) | sb->s_free_blocks_count;
+    } else {
+        fs->total_blocks = sb->s_blocks_count;
+        fs->free_blocks = sb->s_free_blocks_count;
+    }
+
+    // Group descriptor size
+    if (fs->is_64bit) {
+        fs->desc_size = sb->s_desc_size;
+        if (fs->desc_size < 32)
+            fs->desc_size = 32;
+    } else {
+        fs->desc_size = 32;  // Old 32-byte format
+    }
+
+    // Number of block groups
+    fs->group_count = (fs->total_blocks + fs->blocks_per_group - 1) / fs->blocks_per_group;
+
+    // Feature detection
+    fs->has_extents = (fs->features_incompat & EXT4_FEATURE_INCOMPAT_EXTENTS) != 0;
+    fs->has_filetype = (fs->features_incompat & EXT2_FEATURE_INCOMPAT_FILETYPE) != 0;
+
+    // Copy UUID and volume name
+    MemCpy(fs->uuid, sb->s_uuid, 16);
+    MemCpy(fs->volume_name, sb->s_volume_name, 16);
+    fs->volume_name[16] = 0;
+
+    return 0;
+}
+
+// ============================================================================
+// GROUP DESCRIPTOR ACCESS
+// ============================================================================
+
+CExt2GroupDesc *Ext4GetGroupDesc(CExt4FS *fs, U32 group)
+{
+    if (!fs->group_desc_buf || group >= fs->group_count)
+        return NULL;
+
+    return fs->group_desc_buf + (group * fs->desc_size);
+}
+
+U64 Ext4GetBlockBitmap(CExt4FS *fs, U32 group)
+{
+    if (fs->is_64bit) {
+        CExt4GroupDesc *gd = Ext4GetGroupDesc(fs, group);
+        if (!gd) return 0;
+        return (gd->bg_block_bitmap_hi(U64) << 32) | gd->bg_block_bitmap;
+    } else {
+        CExt2GroupDesc *gd = Ext4GetGroupDesc(fs, group);
+        if (!gd) return 0;
+        return gd->bg_block_bitmap;
+    }
+}
+
+U64 Ext4GetInodeBitmap(CExt4FS *fs, U32 group)
+{
+    if (fs->is_64bit) {
+        CExt4GroupDesc *gd = Ext4GetGroupDesc(fs, group);
+        if (!gd) return 0;
+        return (gd->bg_inode_bitmap_hi(U64) << 32) | gd->bg_inode_bitmap;
+    } else {
+        CExt2GroupDesc *gd = Ext4GetGroupDesc(fs, group);
+        if (!gd) return 0;
+        return gd->bg_inode_bitmap;
+    }
+}
+
+U64 Ext4GetInodeTable(CExt4FS *fs, U32 group)
+{
+    if (fs->is_64bit) {
+        CExt4GroupDesc *gd = Ext4GetGroupDesc(fs, group);
+        if (!gd) return 0;
+        return (gd->bg_inode_table_hi(U64) << 32) | gd->bg_inode_table;
+    } else {
+        CExt2GroupDesc *gd = Ext4GetGroupDesc(fs, group);
+        if (!gd) return 0;
+        return gd->bg_inode_table;
+    }
+}
+
+// ============================================================================
+// INODE ACCESS
+// ============================================================================
+
+CExt2Inode *Ext4ReadInode(CExt4FS *fs, U64 ino)
+{
+    if (!fs || ino == 0)
+        return NULL;
+
+    // Calculate group and index
+    U32 group = (ino - 1) / fs->inodes_per_group;
+    U32 index = (ino - 1) % fs->inodes_per_group;
+
+    // Get inode table block
+    U64 inode_table = Ext4GetInodeTable(fs, group);
+    if (inode_table == 0)
+        return NULL;
+
+    // Calculate offset within inode table
+    U64 offset = inode_table * fs->block_size + index * fs->inode_size;
+
+    // Allocate buffer for inode
+    CExt2Inode *inode = MAlloc(fs->inode_size);
+    if (!inode)
+        return NULL;
+
+    // Read inode
+    I64 result = Ext4DeviceRead(fs, offset, inode, fs->inode_size);
+    if (result < 0) {
+        Free(inode);
+        return NULL;
+    }
+
+    return inode;
+}
+
+// Get file size from inode
+U64 Ext4InodeSize(CExt2Inode *inode)
+{
+    U64 size = inode->i_size;
+
+    // For regular files, i_size_high contains upper 32 bits
+    // For directories, i_size_high (dir_acl) is used differently
+    if ((inode->i_mode & EXT2_S_IFMT) == EXT2_S_IFREG) {
+        size |= inode->i_size_high(U64) << 32;
+    }
+
+    return size;
+}
+
+// Get block count from inode
+U64 Ext4InodeBlocks(CExt2Inode *inode)
+{
+    U64 blocks = inode->i_blocks;
+
+    // Check for huge file flag
+    if (inode->i_flags & EXT4_EXTENTS_FL) {
+        blocks |= inode->i_blocks_high(U64) << 32;
+    }
+
+    return blocks;
+}
+
+// ============================================================================
+// BLOCK MAPPING - INDIRECT BLOCKS
+// ============================================================================
+
+U64 Ext4IndirectBlock(CExt4FS *fs, CExt2Inode *inode, U64 logical_block)
+{
+    U32 ptrs_per_block = fs->block_size / 4;  // 32-bit pointers
+
+    // Direct blocks (0-11)
+    if (logical_block < EXT2_NDIR_BLOCKS) {
+        return inode->i_block[logical_block];
+    }
+
+    logical_block -= EXT2_NDIR_BLOCKS;
+
+    // Single indirect (12)
+    if (logical_block < ptrs_per_block) {
+        U32 ind_block = inode->i_block[EXT2_IND_BLOCK];
+        if (ind_block == 0)
+            return 0;
+
+        U32 *buf = MAlloc(fs->block_size);
+        if (!buf) return 0;
+
+        if (Ext4ReadBlock(fs, ind_block, buf) < 0) {
+            Free(buf);
+            return 0;
+        }
+
+        U64 result = buf[logical_block];
+        Free(buf);
+        return result;
+    }
+
+    logical_block -= ptrs_per_block;
+
+    // Double indirect (13)
+    if (logical_block < ptrs_per_block * ptrs_per_block) {
+        U32 dind_block = inode->i_block[EXT2_DIND_BLOCK];
+        if (dind_block == 0)
+            return 0;
+
+        U32 *buf = MAlloc(fs->block_size);
+        if (!buf) return 0;
+
+        // Read first level
+        if (Ext4ReadBlock(fs, dind_block, buf) < 0) {
+            Free(buf);
+            return 0;
+        }
+
+        U32 ind_index = logical_block / ptrs_per_block;
+        U32 ind_block = buf[ind_index];
+        if (ind_block == 0) {
+            Free(buf);
+            return 0;
+        }
+
+        // Read second level
+        if (Ext4ReadBlock(fs, ind_block, buf) < 0) {
+            Free(buf);
+            return 0;
+        }
+
+        U64 result = buf[logical_block % ptrs_per_block];
+        Free(buf);
+        return result;
+    }
+
+    logical_block -= ptrs_per_block * ptrs_per_block;
+
+    // Triple indirect (14)
+    U32 tind_block = inode->i_block[EXT2_TIND_BLOCK];
+    if (tind_block == 0)
+        return 0;
+
+    U32 *buf = MAlloc(fs->block_size);
+    if (!buf) return 0;
+
+    // Read first level
+    if (Ext4ReadBlock(fs, tind_block, buf) < 0) {
+        Free(buf);
+        return 0;
+    }
+
+    U64 pp2 = ptrs_per_block * ptrs_per_block;
+    U32 dind_index = logical_block / pp2;
+    U32 dind_blk = buf[dind_index];
+    if (dind_blk == 0) {
+        Free(buf);
+        return 0;
+    }
+
+    // Read second level
+    if (Ext4ReadBlock(fs, dind_blk, buf) < 0) {
+        Free(buf);
+        return 0;
+    }
+
+    U32 remainder = logical_block % pp2;
+    U32 ind_index = remainder / ptrs_per_block;
+    U32 ind_block = buf[ind_index];
+    if (ind_block == 0) {
+        Free(buf);
+        return 0;
+    }
+
+    // Read third level
+    if (Ext4ReadBlock(fs, ind_block, buf) < 0) {
+        Free(buf);
+        return 0;
+    }
+
+    U64 result = buf[remainder % ptrs_per_block];
+    Free(buf);
+    return result;
+}
+
+// ============================================================================
+// BLOCK MAPPING - EXTENTS
+// ============================================================================
+
+// Get physical block from extent tree
+U64 Ext4ExtentBlock(CExt4FS *fs, CExt2Inode *inode, U64 logical_block)
+{
+    CExt4ExtentHeader *eh = inode->i_block;
+
+    // Verify magic
+    if (eh->eh_magic != EXT4_EXTENT_MAGIC)
+        return 0;
+
+    U8 *buf = NULL;
+
+    // Walk extent tree
+    while (TRUE) {
+        if (eh->eh_depth == 0) {
+            // Leaf node - contains extents
+            CExt4Extent *ex = (eh + 1);
+            I64 i;
+            for (i = 0; i < eh->eh_entries; i++) {
+                U32 first = ex[i].ee_block;
+                U32 len = ex[i].ee_len;
+                U64 start = (ex[i].ee_start_hi(U64) << 32) | ex[i].ee_start_lo;
+
+                // Handle uninitialized extents (len > 32768)
+                if (len > 32768)
+                    len -= 32768;
+
+                if (logical_block >= first && logical_block < first + len) {
+                    if (buf) Free(buf);
+                    return start + (logical_block - first);
+                }
+            }
+            // Not found
+            if (buf) Free(buf);
+            return 0;
+        } else {
+            // Internal node - contains indexes
+            CExt4ExtentIdx *idx = (eh + 1);
+            CExt4ExtentIdx *found = NULL;
+
+            I64 i;
+            for (i = 0; i < eh->eh_entries; i++) {
+                if (logical_block >= idx[i].ei_block) {
+                    found = &idx[i];
+                } else {
+                    break;
+                }
+            }
+
+            if (!found) {
+                if (buf) Free(buf);
+                return 0;
+            }
+
+            // Read next level
+            U64 child_block = (found->ei_leaf_hi(U64) << 32) | found->ei_leaf_lo;
+
+            if (!buf)
+                buf = MAlloc(fs->block_size);
+
+            if (Ext4ReadBlock(fs, child_block, buf) < 0) {
+                Free(buf);
+                return 0;
+            }
+
+            eh = buf;
+            if (eh->eh_magic != EXT4_EXTENT_MAGIC) {
+                Free(buf);
+                return 0;
+            }
+        }
+    }
+}
+
+// Get physical block for logical block
+U64 Ext4InodeBlock(CExt4FS *fs, CExt2Inode *inode, U64 logical_block)
+{
+    if (inode->i_flags & EXT4_EXTENTS_FL) {
+        return Ext4ExtentBlock(fs, inode, logical_block);
+    } else {
+        return Ext4IndirectBlock(fs, inode, logical_block);
+    }
+}
+
+// ============================================================================
+// DIRECTORY OPERATIONS
+// ============================================================================
+
+// Read directory entries
+I64 Ext4ReaddirRaw(CExt4FS *fs, CExt2Inode *dir_inode, U64 offset,
+                   CExt2DirEntry2 *entry)
+{
+    U64 size = Ext4InodeSize(dir_inode);
+
+    if (offset >= size)
+        return -1;  // End of directory
+
+    // Calculate block and offset within block
+    U64 block_num = offset / fs->block_size;
+    U64 block_off = offset % fs->block_size;
+
+    // Get physical block
+    U64 phys_block = Ext4InodeBlock(fs, dir_inode, block_num);
+    if (phys_block == 0)
+        return -EIO;
+
+    // Read block
+    U8 *buf = MAlloc(fs->block_size);
+    if (!buf)
+        return -ENOMEM;
+
+    if (Ext4ReadBlock(fs, phys_block, buf) < 0) {
+        Free(buf);
+        return -EIO;
+    }
+
+    // Parse directory entry
+    CExt2DirEntry2 *de = buf + block_off;
+
+    if (de->rec_len == 0 || de->rec_len > fs->block_size - block_off) {
+        Free(buf);
+        return -EIO;
+    }
+
+    // Copy entry
+    MemCpy(entry, de, 8 + de->name_len);
+    entry->name[de->name_len] = 0;
+
+    Free(buf);
+
+    return offset + de->rec_len;  // Return next offset
+}
+
+// Look up name in directory
+I64 Ext4LookupInDir(CExt4FS *fs, CExt2Inode *dir_inode, U8 *name, U64 *found_ino)
+{
+    CExt2DirEntry2 entry;
+    I64 offset = 0;
+    I64 name_len = StrLen(name);
+
+    while (TRUE) {
+        I64 next = Ext4ReaddirRaw(fs, dir_inode, offset, &entry);
+        if (next < 0) {
+            if (next == -1)
+                return -ENOENT;
+            return next;
+        }
+
+        // Skip deleted entries
+        if (entry.inode != 0) {
+            if (entry.name_len == name_len &&
+                MemCmp(entry.name, name, name_len) == 0) {
+                *found_ino = entry.inode;
+                return 0;
+            }
+        }
+
+        offset = next;
+    }
+}
+
+// ============================================================================
+// VFS OPERATIONS - MOUNT
+// ============================================================================
+
+I64 Ext4Mount(CVFSMount *mnt, U8 *device, U8 *options)
+{
+    if (!mnt || !device)
+        return -EINVAL;
+
+    // Allocate filesystem structure
+    CExt4FS *fs = MAlloc(sizeof(CExt4FS));
+    if (!fs)
+        return -ENOMEM;
+
+    MemSet(fs, 0, sizeof(CExt4FS));
+    fs->device_path = StrNew(device);
+    fs->read_only = TRUE;  // Always read-only for safety
+
+    // Open device
+    fs->device_fd = PosixOpen(device, O_RDONLY, 0);
+    if (fs->device_fd < 0) {
+        Free(fs->device_path);
+        Free(fs);
+        return -ENODEV;
+    }
+
+    // Read superblock
+    CExt2Superblock *sb = MAlloc(sizeof(CExt2Superblock));
+    if (!sb) {
+        PosixClose(fs->device_fd);
+        Free(fs->device_path);
+        Free(fs);
+        return -ENOMEM;
+    }
+
+    I64 result = Ext4DeviceRead(fs, EXT2_SUPER_OFFSET, sb, sizeof(CExt2Superblock));
+    if (result < 0) {
+        Free(sb);
+        PosixClose(fs->device_fd);
+        Free(fs->device_path);
+        Free(fs);
+        return result;
+    }
+
+    // Parse superblock
+    result = Ext4ParseSuperblock(fs, sb);
+    Free(sb);
+
+    if (result < 0) {
+        PosixClose(fs->device_fd);
+        Free(fs->device_path);
+        Free(fs);
+        return result;
+    }
+
+    // Check for unsupported incompatible features
+    U32 unsupported = fs->features_incompat &
+        ~(EXT2_FEATURE_INCOMPAT_FILETYPE |
+          EXT4_FEATURE_INCOMPAT_EXTENTS |
+          EXT4_FEATURE_INCOMPAT_64BIT |
+          EXT4_FEATURE_INCOMPAT_FLEX_BG);
+
+    if (unsupported) {
+        printf("Ext4: Unsupported incompatible features: 0x%08X\n", unsupported);
+        PosixClose(fs->device_fd);
+        Free(fs->device_path);
+        Free(fs);
+        return -EINVAL;
+    }
+
+    // Read group descriptors
+    U64 gd_block = (fs->block_size == 1024) ? 2 : 1;  // After superblock
+    I64 gd_size = fs->group_count * fs->desc_size;
+    I64 gd_blocks = (gd_size + fs->block_size - 1) / fs->block_size;
+
+    fs->group_desc_buf = MAlloc(gd_blocks * fs->block_size);
+    if (!fs->group_desc_buf) {
+        PosixClose(fs->device_fd);
+        Free(fs->device_path);
+        Free(fs);
+        return -ENOMEM;
+    }
+
+    result = Ext4ReadBlocks(fs, gd_block, gd_blocks, fs->group_desc_buf);
+    if (result < 0) {
+        Free(fs->group_desc_buf);
+        PosixClose(fs->device_fd);
+        Free(fs->device_path);
+        Free(fs);
+        return result;
+    }
+
+    fs->group_desc_count = fs->group_count;
+
+    // Create VFS superblock
+    CVFSSuperblock *vfs_sb = MAlloc(sizeof(CVFSSuperblock));
+    if (!vfs_sb) {
+        Free(fs->group_desc_buf);
+        PosixClose(fs->device_fd);
+        Free(fs->device_path);
+        Free(fs);
+        return -ENOMEM;
+    }
+
+    MemSet(vfs_sb, 0, sizeof(CVFSSuperblock));
+    vfs_sb->magic = EXT2_SUPER_MAGIC;
+    vfs_sb->fs_type = VFS_FS_EXT4;
+    vfs_sb->block_size = fs->block_size;
+    vfs_sb->block_count = fs->total_blocks;
+    vfs_sb->free_blocks = fs->free_blocks;
+    vfs_sb->inode_count = fs->total_inodes;
+    vfs_sb->free_inodes = fs->free_inodes;
+    vfs_sb->mount = mnt;
+    vfs_sb->fs_private = fs;
+    MemCpy(vfs_sb->uuid, fs->uuid, 16);
+    StrCpy(vfs_sb->label, fs->volume_name);
+
+    if (fs->read_only)
+        vfs_sb->flags |= VFS_MNT_RDONLY;
+
+    fs->vfs_sb = vfs_sb;
+    fs->vfs_mount = mnt;
+
+    // Read root inode
+    CExt2Inode *root_di = Ext4ReadInode(fs, EXT2_ROOT_INO);
+    if (!root_di) {
+        Free(vfs_sb);
+        Free(fs->group_desc_buf);
+        PosixClose(fs->device_fd);
+        Free(fs->device_path);
+        Free(fs);
+        return -EIO;
+    }
+
+    // Create VFS root inode
+    CVFSInode *root = VFSInodeAlloc(vfs_sb);
+    if (!root) {
+        Free(root_di);
+        Free(vfs_sb);
+        Free(fs->group_desc_buf);
+        PosixClose(fs->device_fd);
+        Free(fs->device_path);
+        Free(fs);
+        return -ENOMEM;
+    }
+
+    root->ino = EXT2_ROOT_INO;
+    root->mode = root_di->i_mode;
+    root->nlink = root_di->i_links_count;
+    root->uid = root_di->i_uid | (root_di->i_uid_high << 16);
+    root->gid = root_di->i_gid | (root_di->i_gid_high << 16);
+    root->size = Ext4InodeSize(root_di);
+    root->atime = root_di->i_atime;
+    root->mtime = root_di->i_mtime;
+    root->ctime = root_di->i_ctime;
+    root->fs_private = root_di;
+
+    vfs_sb->root = root;
+    mnt->root = root;
+    mnt->sb = vfs_sb;
+
+    // Install operations
+    static CVFSOps ext4_ops = {
+        .mount = &Ext4Mount,
+        .unmount = &Ext4Unmount,
+        .lookup = &Ext4Lookup,
+        .readlink = &Ext4Readlink,
+        .open = &Ext4Open,
+        .close = &Ext4Close,
+        .read = &Ext4Read,
+        .readdir = &Ext4Readdir,
+    };
+
+    vfs_sb->ops = &ext4_ops;
+
+    printf("Ext4: Mounted %s (%s)\n", device, fs->volume_name[0] ? fs->volume_name : "unnamed");
+    printf("  Blocks: %lld (%lld free), Block size: %d\n",
+           fs->total_blocks, fs->free_blocks, fs->block_size);
+    printf("  Inodes: %d (%d free), Inode size: %d\n",
+           fs->total_inodes, fs->free_inodes, fs->inode_size);
+    printf("  Features: %s%s%s\n",
+           fs->has_extents ? "extents " : "",
+           fs->is_64bit ? "64bit " : "",
+           fs->has_filetype ? "filetype" : "");
+
+    return 0;
+}
+
+I64 Ext4Unmount(CVFSMount *mnt)
+{
+    if (!mnt || !mnt->sb)
+        return -EINVAL;
+
+    CVFSSuperblock *vfs_sb = mnt->sb;
+    CExt4FS *fs = vfs_sb->fs_private;
+
+    if (fs) {
+        if (fs->group_desc_buf)
+            Free(fs->group_desc_buf);
+        if (fs->device_fd >= 0)
+            PosixClose(fs->device_fd);
+        if (fs->device_path)
+            Free(fs->device_path);
+        Free(fs);
+    }
+
+    if (vfs_sb->root) {
+        if (vfs_sb->root->fs_private)
+            Free(vfs_sb->root->fs_private);
+        VFSInodeFree(vfs_sb->root);
+    }
+
+    Free(vfs_sb);
+    return 0;
+}
+
+// ============================================================================
+// VFS OPERATIONS - INODE
+// ============================================================================
+
+I64 Ext4Lookup(CVFSInode *dir, U8 *name, CVFSInode **result)
+{
+    if (!dir || !name || !result)
+        return -EINVAL;
+
+    *result = NULL;
+
+    if (!VFS_ISDIR(dir->mode))
+        return -ENOTDIR;
+
+    CExt4FS *fs = dir->sb->fs_private;
+    CExt2Inode *dir_di = dir->fs_private;
+
+    if (!fs || !dir_di)
+        return -EIO;
+
+    // Look up name
+    U64 found_ino;
+    I64 err = Ext4LookupInDir(fs, dir_di, name, &found_ino);
+    if (err < 0)
+        return err;
+
+    // Check inode cache
+    CVFSInode *inode = VFSInodeGet(dir->sb, found_ino);
+    if (inode) {
+        *result = inode;
+        return 0;
+    }
+
+    // Read inode from disk
+    CExt2Inode *di = Ext4ReadInode(fs, found_ino);
+    if (!di)
+        return -EIO;
+
+    // Create VFS inode
+    inode = VFSInodeAlloc(dir->sb);
+    if (!inode) {
+        Free(di);
+        return -ENOMEM;
+    }
+
+    inode->ino = found_ino;
+    inode->mode = di->i_mode;
+    inode->nlink = di->i_links_count;
+    inode->uid = di->i_uid | (di->i_uid_high << 16);
+    inode->gid = di->i_gid | (di->i_gid_high << 16);
+    inode->size = Ext4InodeSize(di);
+    inode->atime = di->i_atime;
+    inode->mtime = di->i_mtime;
+    inode->ctime = di->i_ctime;
+    inode->fs_private = di;
+    inode->parent = dir;
+
+    // Handle symlinks
+    if (VFS_ISLNK(inode->mode)) {
+        // Fast symlink (stored in block pointers)
+        if (inode->size < EXT2_MAX_SYMLINK_LEN && di->i_blocks == 0) {
+            inode->symlink_target = MAlloc(inode->size + 1);
+            MemCpy(inode->symlink_target, di->i_block, inode->size);
+            inode->symlink_target[inode->size] = 0;
+        }
+    }
+
+    // Insert into cache
+    VFSInodeInsertCache(inode);
+
+    *result = inode;
+    return 0;
+}
+
+I64 Ext4Readlink(CVFSInode *inode, U8 *buf, I64 size)
+{
+    if (!inode || !buf)
+        return -EINVAL;
+
+    if (!VFS_ISLNK(inode->mode))
+        return -EINVAL;
+
+    // Fast symlink
+    if (inode->symlink_target) {
+        I64 len = StrLen(inode->symlink_target);
+        if (len >= size)
+            len = size - 1;
+        MemCpy(buf, inode->symlink_target, len);
+        buf[len] = 0;
+        return len;
+    }
+
+    // Regular symlink (stored in data blocks)
+    CExt4FS *fs = inode->sb->fs_private;
+    CExt2Inode *di = inode->fs_private;
+
+    if (!fs || !di)
+        return -EIO;
+
+    // Read first block
+    U64 phys_block = Ext4InodeBlock(fs, di, 0);
+    if (phys_block == 0)
+        return -EIO;
+
+    U8 *block_buf = MAlloc(fs->block_size);
+    if (!block_buf)
+        return -ENOMEM;
+
+    if (Ext4ReadBlock(fs, phys_block, block_buf) < 0) {
+        Free(block_buf);
+        return -EIO;
+    }
+
+    I64 len = inode->size;
+    if (len >= size)
+        len = size - 1;
+    if (len > fs->block_size)
+        len = fs->block_size;
+
+    MemCpy(buf, block_buf, len);
+    buf[len] = 0;
+
+    Free(block_buf);
+    return len;
+}
+
+// ============================================================================
+// VFS OPERATIONS - FILE
+// ============================================================================
+
+I64 Ext4Open(CVFSFile *file)
+{
+    // Nothing special needed
+    return 0;
+}
+
+I64 Ext4Close(CVFSFile *file)
+{
+    return 0;
+}
+
+I64 Ext4Read(CVFSFile *file, U0 *buf, I64 size, I64 offset)
+{
+    if (!file || !buf || !file->inode)
+        return -EINVAL;
+
+    CVFSInode *inode = file->inode;
+    CExt4FS *fs = inode->sb->fs_private;
+    CExt2Inode *di = inode->fs_private;
+
+    if (!fs || !di)
+        return -EIO;
+
+    U64 file_size = inode->size;
+
+    // Adjust for EOF
+    if (offset >= file_size)
+        return 0;
+
+    if (offset + size > file_size)
+        size = file_size - offset;
+
+    I64 total_read = 0;
+    U8 *block_buf = MAlloc(fs->block_size);
+    if (!block_buf)
+        return -ENOMEM;
+
+    while (size > 0) {
+        U64 block_num = offset / fs->block_size;
+        U64 block_off = offset % fs->block_size;
+        I64 to_read = fs->block_size - block_off;
+        if (to_read > size)
+            to_read = size;
+
+        U64 phys_block = Ext4InodeBlock(fs, di, block_num);
+        if (phys_block == 0) {
+            // Sparse file - return zeros
+            MemSet(buf, 0, to_read);
+        } else {
+            if (Ext4ReadBlock(fs, phys_block, block_buf) < 0) {
+                Free(block_buf);
+                return total_read > 0 ? total_read : -EIO;
+            }
+            MemCpy(buf, block_buf + block_off, to_read);
+        }
+
+        buf += to_read;
+        offset += to_read;
+        size -= to_read;
+        total_read += to_read;
+    }
+
+    Free(block_buf);
+    return total_read;
+}
+
+I64 Ext4Readdir(CVFSFile *file, U0 *buf, I64 count)
+{
+    if (!file || !buf || !file->inode)
+        return -EINVAL;
+
+    CVFSInode *inode = file->inode;
+    if (!VFS_ISDIR(inode->mode))
+        return -ENOTDIR;
+
+    CExt4FS *fs = inode->sb->fs_private;
+    CExt2Inode *di = inode->fs_private;
+
+    if (!fs || !di)
+        return -EIO;
+
+    CVFSDirent *dirent = buf;
+    CExt2DirEntry2 entry;
+    I64 entries_read = 0;
+    I64 offset = file->dir_pos;
+
+    while (entries_read < count) {
+        I64 next = Ext4ReaddirRaw(fs, di, offset, &entry);
+        if (next < 0) {
+            if (next == -1)
+                break;  // End of directory
+            return next;
+        }
+
+        // Skip deleted entries
+        if (entry.inode != 0) {
+            dirent->ino = entry.inode;
+            dirent->off = next;
+            dirent->reclen = sizeof(CVFSDirent);
+
+            // Convert file type
+            switch (entry.file_type) {
+                case EXT2_FT_REG_FILE: dirent->type = DT_REG; break;
+                case EXT2_FT_DIR:      dirent->type = DT_DIR; break;
+                case EXT2_FT_CHRDEV:   dirent->type = DT_CHR; break;
+                case EXT2_FT_BLKDEV:   dirent->type = DT_BLK; break;
+                case EXT2_FT_FIFO:     dirent->type = DT_FIFO; break;
+                case EXT2_FT_SOCK:     dirent->type = DT_SOCK; break;
+                case EXT2_FT_SYMLINK:  dirent->type = DT_LNK; break;
+                default:               dirent->type = DT_UNKNOWN; break;
+            }
+
+            MemCpy(dirent->name, entry.name, entry.name_len);
+            dirent->name[entry.name_len] = 0;
+
+            dirent++;
+            entries_read++;
+        }
+
+        offset = next;
+    }
+
+    file->dir_pos = offset;
+    return entries_read;
+}
+
+// ============================================================================
+// REGISTRATION
+// ============================================================================
+
+static CVFSFilesystem ext4_filesystem = {
+    .name = "ext4",
+    .type = VFS_FS_EXT4,
+    .flags = 0,
+    .ops = NULL,  // Set during mount
+    .probe = NULL,
+    .next = NULL
+};
+
+U0 Ext4Register()
+{
+    VFSRegisterFilesystem(&ext4_filesystem);
+
+    // Also register as ext2 and ext3
+    static CVFSFilesystem ext2_filesystem = {
+        .name = "ext2",
+        .type = VFS_FS_EXT2,
+    };
+    static CVFSFilesystem ext3_filesystem = {
+        .name = "ext3",
+        .type = VFS_FS_EXT3,
+    };
+
+    ext2_filesystem.ops = ext4_filesystem.ops;
+    ext3_filesystem.ops = ext4_filesystem.ops;
+
+    VFSRegisterFilesystem(&ext2_filesystem);
+    VFSRegisterFilesystem(&ext3_filesystem);
+
+    "Ext2/3/4 filesystem driver registered (read-only).\n";
+}
+
+// Auto-register
+Ext4Register();

@@ -1,0 +1,117 @@
+$WW,1$$FG,5,1$ZealOS Filesystem Tools$FG$
+
+$FG,2$Overview$FG$
+
+This directory contains filesystem utilities for creating, checking,
+and inspecting filesystems from within ZealOS.
+
+$FG,2$Available Tools$FG$
+
+$ID,2$$FG,3$Formatting Tools (mkfs)$FG$
+
+  $FG,4$MkfsExt4(device, opts)$FG$
+    Create an ext4 filesystem on a device.
+    - 64-bit block addressing support
+    - Extent trees
+    - Directory hashing (htree)
+    - Journal support
+
+  $FG,4$MkfsExt3(device, opts)$FG$
+    Create an ext3 filesystem (ext4 without extents).
+
+  $FG,4$MkfsExt2(device, opts)$FG$
+    Create an ext2 filesystem (no journal).
+
+  $FG,4$MkfsFat32(device, opts)$FG$
+    Create a FAT32 filesystem.
+    - Auto cluster size selection
+    - Volume label support
+
+$FG,3$Checking Tools (fsck)$FG$
+
+  $FG,4$FsckExt4(device, flags)$FG$
+    Check and repair ext2/3/4 filesystems.
+    - Pass 1: Inode checking
+    - Pass 2: Directory structure
+    - Pass 3: Reference counts
+    - Pass 4: Block bitmaps
+
+  $FG,4$FsckFat32(device, flags)$FG$
+    Check FAT32 filesystems.
+    - FAT table comparison
+    - Directory structure validation
+    - Lost cluster detection
+
+$FG,3$Information Tools$FG$
+
+  $FG,4$DumpExt4Info(device)$FG$
+    Display ext2/3/4 superblock and group descriptor info.
+    Similar to Linux dumpe2fs.
+
+  $FG,4$DumpNtfsInfo(device)$FG$
+    Display NTFS volume information.
+    - Boot sector details
+    - MFT records
+    - Volume name and version
+
+  $FG,4$DumpFat32Info(device)$FG$
+    Display FAT32 volume information.
+    - Boot sector details
+    - FSInfo data
+    - Free space$ID,-2$
+
+$FG,2$Flags$FG$
+
+$ID,2$$FG,4$FSCK Flags:$FG$
+  FSCK_READONLY  (0x0001) - Don't modify filesystem
+  FSCK_VERBOSE   (0x0002) - Verbose output
+  FSCK_FORCE     (0x0004) - Force check even if clean$ID,-2$
+
+$FG,2$Usage$FG$
+
+$ID,2$$FG,3$Load all tools:$FG$
+  #include "/Home/POSIX/vfs/tools/MakeFSTools.ZC"
+
+$FG,3$Format a partition:$FG$
+  // Create ext4 with defaults
+  MkfsExt4("/dev/sda1", NULL);
+
+  // Create ext4 with options
+  CMkfsExt4Opts opts;
+  MkfsExt4DefaultOpts(&opts);
+  opts.label = "MYVOLUME";
+  opts.block_size = 4096;
+  MkfsExt4("/dev/sda1", &opts);
+
+$FG,3$Check a filesystem:$FG$
+  // Read-only verbose check
+  FsckExt4("/dev/sda1", FSCK_READONLY | FSCK_VERBOSE);
+
+  // Force check
+  FsckExt4("/dev/sda1", FSCK_FORCE);
+
+$FG,3$View filesystem info:$FG$
+  DumpExt4Info("/dev/sda1");
+  DumpNtfsInfo("/dev/sdb1");
+  DumpFat32Info("/dev/sdc1");$ID,-2$
+
+$FG,2$Return Values$FG$
+
+$ID,2$FSCK_OK          (0)  - No errors found
+FSCK_CORRECTED   (1)  - Errors were corrected
+FSCK_REBOOT      (2)  - System should be rebooted
+FSCK_ERRORS      (4)  - Errors remain uncorrected
+FSCK_OPERATIONAL (8)  - Operational error (can't open device)$ID,-2$
+
+$FG,2$License$FG$
+
+$ID,2$MIT License
+
+These tools are clean-room implementations based on publicly
+available filesystem specifications.$ID,-2$
+
+$FG,2$See Also$FG$
+
+$ID,2$$LK,"VFS Layer",A="FI:/Home/POSIX/vfs/README.DD"$
+$LK,"Ext4 Driver",A="FI:/Home/POSIX/vfs/ext4/Ext4.ZC"$
+$LK,"NTFS Driver",A="FI:/Home/POSIX/vfs/ntfs/NTFS.ZC"$$ID,-2$

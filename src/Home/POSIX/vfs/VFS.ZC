@@ -1,0 +1,1264 @@
+// VFS.ZC - Virtual File System Implementation for ZealOS
+// Part of the POSIX compatibility layer
+//
+// Provides unified filesystem interface, path resolution, and symlink support.
+//
+// Design inspired by:
+// - FreeBSD VFS (sys/kern/vfs_*.c) - BSD-2-Clause license
+// - Linux VFS concepts (fs/*.c) - Reference only, clean-room implementation
+//
+// This is a clean-room implementation for ZealOS, not a direct port.
+
+#include "VFS.HH"
+
+// ============================================================================
+// GLOBAL VFS STATE
+// ============================================================================
+
+static CVFS *g_vfs = NULL;
+
+// ============================================================================
+// INITIALIZATION
+// ============================================================================
+
+CVFS *VFSInit()
+{
+    if (g_vfs)
+        return g_vfs;
+
+    g_vfs = MAlloc(sizeof(CVFS));
+    MemSet(g_vfs, 0, sizeof(CVFS));
+
+    return g_vfs;
+}
+
+CVFS *VFSGet()
+{
+    if (!g_vfs)
+        VFSInit();
+    return g_vfs;
+}
+
+// ============================================================================
+// FILESYSTEM REGISTRATION
+// ============================================================================
+
+I64 VFSRegisterFilesystem(CVFSFilesystem *fs)
+{
+    CVFS *vfs = VFSGet();
+
+    if (!fs || !fs->name || !fs->ops) {
+        return -EINVAL;
+    }
+
+    // Check for duplicate
+    CVFSFilesystem *cur = vfs->filesystems;
+    while (cur) {
+        if (StrCmp(cur->name, fs->name) == 0)
+            return -EEXIST;
+        cur = cur->next;
+    }
+
+    // Add to list
+    fs->next = vfs->filesystems;
+    vfs->filesystems = fs;
+
+    return 0;
+}
+
+CVFSFilesystem *VFSFindFilesystem(U8 *name)
+{
+    CVFS *vfs = VFSGet();
+
+    CVFSFilesystem *fs = vfs->filesystems;
+    while (fs) {
+        if (StrCmp(fs->name, name) == 0)
+            return fs;
+        fs = fs->next;
+    }
+
+    return NULL;
+}
+
+CVFSFilesystem *VFSFindFilesystemByType(U32 type)
+{
+    CVFS *vfs = VFSGet();
+
+    CVFSFilesystem *fs = vfs->filesystems;
+    while (fs) {
+        if (fs->type == type)
+            return fs;
+        fs = fs->next;
+    }
+
+    return NULL;
+}
+
+// ============================================================================
+// INODE MANAGEMENT
+// ============================================================================
+
+U32 VFSInodeHash(CVFSSuperblock *sb, U64 ino)
+{
+    return (ino ^ (sb(U64) >> 8)) % VFS_INODE_HASH_SIZE;
+}
+
+CVFSInode *VFSInodeAlloc(CVFSSuperblock *sb)
+{
+    CVFSInode *inode = MAlloc(sizeof(CVFSInode));
+    if (!inode)
+        return NULL;
+
+    MemSet(inode, 0, sizeof(CVFSInode));
+    inode->sb = sb;
+    inode->ref_count = 1;
+    inode->nlink = 1;
+
+    return inode;
+}
+
+U0 VFSInodeFree(CVFSInode *inode)
+{
+    if (!inode)
+        return;
+
+    if (inode->symlink_target)
+        Free(inode->symlink_target);
+
+    if (inode->fs_private)
+        Free(inode->fs_private);
+
+    Free(inode);
+}
+
+CVFSInode *VFSInodeGet(CVFSSuperblock *sb, U64 ino)
+{
+    if (!sb)
+        return NULL;
+
+    // Check cache
+    U32 hash = VFSInodeHash(sb, ino);
+    CVFSInode *inode = sb->inode_hash[hash];
+
+    while (inode) {
+        if (inode->ino == ino) {
+            inode->ref_count++;
+            return inode;
+        }
+        inode = inode->hash_next;
+    }
+
+    return NULL;
+}
+
+U0 VFSInodePut(CVFSInode *inode)
+{
+    if (!inode)
+        return;
+
+    inode->ref_count--;
+
+    if (inode->ref_count <= 0 && inode->nlink == 0) {
+        // Remove from hash
+        CVFSSuperblock *sb = inode->sb;
+        if (sb) {
+            U32 hash = VFSInodeHash(sb, inode->ino);
+            CVFSInode **pp = &sb->inode_hash[hash];
+            while (*pp) {
+                if (*pp == inode) {
+                    *pp = inode->hash_next;
+                    break;
+                }
+                pp = &(*pp)->hash_next;
+            }
+        }
+
+        VFSInodeFree(inode);
+    }
+}
+
+U0 VFSInodeInsertCache(CVFSInode *inode)
+{
+    if (!inode || !inode->sb)
+        return;
+
+    CVFSSuperblock *sb = inode->sb;
+    U32 hash = VFSInodeHash(sb, inode->ino);
+
+    inode->hash_next = sb->inode_hash[hash];
+    sb->inode_hash[hash] = inode;
+}
+
+// ============================================================================
+// DENTRY MANAGEMENT
+// ============================================================================
+
+U32 VFSDentryHash(U8 *name, CVFSInode *parent)
+{
+    U32 hash = 5381;
+    while (*name)
+        hash = ((hash << 5) + hash) + *name++;
+    hash ^= parent(U64) >> 4;
+    return hash % VFS_DENTRY_CACHE_SIZE;
+}
+
+CVFSDentry *VFSDentryAlloc(U8 *name, CVFSInode *parent, CVFSInode *inode)
+{
+    CVFSDentry *dentry = MAlloc(sizeof(CVFSDentry));
+    if (!dentry)
+        return NULL;
+
+    MemSet(dentry, 0, sizeof(CVFSDentry));
+
+    I64 len = StrLen(name);
+    if (len > VFS_MAX_NAME)
+        len = VFS_MAX_NAME;
+
+    MemCpy(dentry->name, name, len);
+    dentry->name[len] = 0;
+    dentry->name_len = len;
+    dentry->parent = parent;
+    dentry->inode = inode;
+    dentry->ref_count = 1;
+
+    return dentry;
+}
+
+U0 VFSDentryFree(CVFSDentry *dentry)
+{
+    if (!dentry)
+        return;
+
+    if (dentry->inode)
+        VFSInodePut(dentry->inode);
+
+    Free(dentry);
+}
+
+CVFSDentry *VFSDentryLookupCache(U8 *name, CVFSInode *parent)
+{
+    CVFS *vfs = VFSGet();
+
+    U32 hash = VFSDentryHash(name, parent);
+    CVFSDentry *dentry = vfs->dentry_cache[hash];
+
+    while (dentry) {
+        if (dentry->parent == parent && StrCmp(dentry->name, name) == 0) {
+            dentry->ref_count++;
+            return dentry;
+        }
+        dentry = dentry->hash_next;
+    }
+
+    return NULL;
+}
+
+U0 VFSDentryInsertCache(CVFSDentry *dentry)
+{
+    CVFS *vfs = VFSGet();
+
+    U32 hash = VFSDentryHash(dentry->name, dentry->parent);
+    dentry->hash_next = vfs->dentry_cache[hash];
+    vfs->dentry_cache[hash] = dentry;
+}
+
+// ============================================================================
+// SYMLINK TABLE (for overlay symlinks on native ZealOS filesystems)
+// ============================================================================
+
+U32 VFSSymlinkHash(U8 *path)
+{
+    U32 hash = 5381;
+    while (*path)
+        hash = ((hash << 5) + hash) + *path++;
+    return hash % VFS_SYMLINK_TABLE_SIZE;
+}
+
+I64 VFSSymlinkCreate(U8 *path, U8 *target)
+{
+    CVFS *vfs = VFSGet();
+
+    // Check if already exists
+    U32 hash = VFSSymlinkHash(path);
+    CVFSSymlink *sym = vfs->symlink_table[hash];
+
+    while (sym) {
+        if (StrCmp(sym->path, path) == 0) {
+            // Update existing
+            Free(sym->target);
+            sym->target = StrNew(target);
+            sym->mtime = time(NULL);
+            return 0;
+        }
+        sym = sym->next;
+    }
+
+    // Create new
+    sym = MAlloc(sizeof(CVFSSymlink));
+    if (!sym)
+        return -ENOMEM;
+
+    sym->path = StrNew(path);
+    sym->target = StrNew(target);
+    sym->mtime = time(NULL);
+
+    sym->next = vfs->symlink_table[hash];
+    vfs->symlink_table[hash] = sym;
+    vfs->symlink_count++;
+
+    return 0;
+}
+
+CVFSSymlink *VFSSymlinkLookup(U8 *path)
+{
+    CVFS *vfs = VFSGet();
+
+    U32 hash = VFSSymlinkHash(path);
+    CVFSSymlink *sym = vfs->symlink_table[hash];
+
+    while (sym) {
+        if (StrCmp(sym->path, path) == 0)
+            return sym;
+        sym = sym->next;
+    }
+
+    return NULL;
+}
+
+I64 VFSSymlinkDelete(U8 *path)
+{
+    CVFS *vfs = VFSGet();
+
+    U32 hash = VFSSymlinkHash(path);
+    CVFSSymlink **pp = &vfs->symlink_table[hash];
+
+    while (*pp) {
+        if (StrCmp((*pp)->path, path) == 0) {
+            CVFSSymlink *sym = *pp;
+            *pp = sym->next;
+            Free(sym->path);
+            Free(sym->target);
+            Free(sym);
+            vfs->symlink_count--;
+            return 0;
+        }
+        pp = &(*pp)->next;
+    }
+
+    return -ENOENT;
+}
+
+I64 VFSSymlinkRead(U8 *path, U8 *buf, I64 size)
+{
+    CVFSSymlink *sym = VFSSymlinkLookup(path);
+    if (!sym)
+        return -EINVAL;
+
+    I64 len = StrLen(sym->target);
+    if (len >= size)
+        len = size - 1;
+
+    MemCpy(buf, sym->target, len);
+    buf[len] = 0;
+
+    return len;
+}
+
+// ============================================================================
+// PATH RESOLUTION
+// ============================================================================
+
+// Normalize path (remove ., .., duplicate slashes)
+U8 *VFSNormalizePath(U8 *path, U8 *buf, I64 bufsize)
+{
+    if (!path || !buf || bufsize < 2)
+        return NULL;
+
+    U8 *src = path;
+    U8 *dst = buf;
+    U8 *end = buf + bufsize - 1;
+
+    // Handle absolute vs relative
+    if (*src == '/') {
+        *dst++ = '/';
+        src++;
+    }
+
+    while (*src && dst < end) {
+        // Skip duplicate slashes
+        while (*src == '/')
+            src++;
+
+        if (!*src)
+            break;
+
+        // Find end of component
+        U8 *comp_start = src;
+        while (*src && *src != '/')
+            src++;
+        I64 comp_len = src - comp_start;
+
+        // Handle . and ..
+        if (comp_len == 1 && comp_start[0] == '.') {
+            // Skip "."
+            continue;
+        } else if (comp_len == 2 && comp_start[0] == '.' && comp_start[1] == '.') {
+            // Go up ".."
+            if (dst > buf + 1) {
+                dst--;  // Remove trailing /
+                while (dst > buf && dst[-1] != '/')
+                    dst--;
+            }
+            continue;
+        }
+
+        // Copy component
+        if (dst > buf && dst[-1] != '/')
+            *dst++ = '/';
+
+        while (comp_len-- > 0 && dst < end)
+            *dst++ = *comp_start++;
+    }
+
+    // Ensure at least "/"
+    if (dst == buf)
+        *dst++ = '/';
+
+    *dst = 0;
+    return buf;
+}
+
+// Resolve path to inode (with symlink following)
+I64 VFSLookupPath(U8 *path, I64 flags, CVFSInode **result, CVFSInode **parent_result)
+{
+    CVFS *vfs = VFSGet();
+    vfs->stat_lookups++;
+
+    if (!path || !result)
+        return -EINVAL;
+
+    *result = NULL;
+    if (parent_result)
+        *parent_result = NULL;
+
+    // Normalize path
+    U8 norm_path[VFS_MAX_PATH];
+    if (!VFSNormalizePath(path, norm_path, VFS_MAX_PATH))
+        return -ENAMETOOLONG;
+
+    // Start from root or cwd
+    CVFSInode *current;
+    if (norm_path[0] == '/') {
+        current = vfs->root_inode;
+        if (!current)
+            return -ENOENT;
+    } else {
+        // Get cwd from current process
+        CPosixProcess *proc = PosixGetCurrent();
+        if (proc && proc->cwd_inode) {
+            current = proc->cwd_inode;
+        } else {
+            current = vfs->root_inode;
+        }
+        if (!current)
+            return -ENOENT;
+    }
+
+    current->ref_count++;
+
+    // Walk path components
+    U8 *p = norm_path;
+    if (*p == '/')
+        p++;
+
+    I64 symlink_depth = 0;
+
+    while (*p) {
+        // Get next component
+        U8 component[VFS_MAX_NAME + 1];
+        U8 *cp = component;
+        while (*p && *p != '/' && cp < component + VFS_MAX_NAME)
+            *cp++ = *p++;
+        *cp = 0;
+
+        if (*p == '/')
+            p++;
+
+        // Skip empty components
+        if (component[0] == 0)
+            continue;
+
+        // Current must be a directory
+        if (!VFS_ISDIR(current->mode)) {
+            VFSInodePut(current);
+            return -ENOTDIR;
+        }
+
+        // Save parent before lookup
+        CVFSInode *parent = current;
+
+        // Check symlink table first (overlay)
+        U8 full_path[VFS_MAX_PATH];
+        // Build full path to this point for symlink check
+        // ... (simplified - would need to track full path)
+
+        // Look up in directory
+        CVFSInode *next = NULL;
+
+        // Check dentry cache
+        CVFSDentry *dentry = VFSDentryLookupCache(component, current);
+        if (dentry) {
+            vfs->stat_cache_hits++;
+            if (dentry->negative) {
+                VFSInodePut(current);
+                return -ENOENT;
+            }
+            next = dentry->inode;
+            if (next)
+                next->ref_count++;
+        }
+
+        // Cache miss - ask filesystem
+        if (!next && current->sb && current->sb->ops && current->sb->ops->lookup) {
+            I64 err = current->sb->ops->lookup(current, component, &next);
+            if (err < 0) {
+                VFSInodePut(current);
+                return err;
+            }
+
+            // Add to cache
+            if (next) {
+                dentry = VFSDentryAlloc(component, current, next);
+                if (dentry)
+                    VFSDentryInsertCache(dentry);
+            }
+        }
+
+        if (!next) {
+            // Check if remaining path and creating
+            if (*p == 0 && (flags & VFS_LOOKUP_CREATE)) {
+                if (parent_result)
+                    *parent_result = parent;
+                else
+                    VFSInodePut(parent);
+                return -ENOENT;  // Parent found, file doesn't exist
+            }
+
+            VFSInodePut(current);
+            return -ENOENT;
+        }
+
+        // Handle symlink
+        if (VFS_ISLNK(next->mode)) {
+            // Don't follow if last component and NOFOLLOW
+            Bool is_last = (*p == 0);
+            if (is_last && !(flags & VFS_LOOKUP_FOLLOW)) {
+                VFSInodePut(current);
+                *result = next;
+                if (parent_result)
+                    *parent_result = parent;
+                return 0;
+            }
+
+            // Follow symlink
+            if (++symlink_depth > VFS_MAX_SYMLINK_DEPTH) {
+                VFSInodePut(current);
+                VFSInodePut(next);
+                return -ELOOP;
+            }
+
+            // Read symlink target
+            U8 link_target[VFS_MAX_PATH];
+            I64 link_len = -1;
+
+            if (next->symlink_target) {
+                link_len = StrLen(next->symlink_target);
+                if (link_len < VFS_MAX_PATH)
+                    StrCpy(link_target, next->symlink_target);
+            } else if (next->sb && next->sb->ops && next->sb->ops->readlink) {
+                link_len = next->sb->ops->readlink(next, link_target, VFS_MAX_PATH);
+            }
+
+            VFSInodePut(next);
+
+            if (link_len < 0) {
+                VFSInodePut(current);
+                return -EIO;
+            }
+
+            // Resolve symlink (may be relative or absolute)
+            if (link_target[0] == '/') {
+                // Absolute - restart from root
+                VFSInodePut(current);
+                current = vfs->root_inode;
+                current->ref_count++;
+            }
+            // else relative - continue from current directory
+
+            // Prepend remaining path to link target
+            U8 new_path[VFS_MAX_PATH];
+            if (*p) {
+                snprintf(new_path, VFS_MAX_PATH, "%s/%s", link_target, p);
+            } else {
+                StrCpy(new_path, link_target);
+            }
+
+            // Restart with new path
+            return VFSLookupPath(new_path, flags, result, parent_result);
+        }
+
+        VFSInodePut(current);
+        current = next;
+
+        if (parent_result && *p == 0)
+            *parent_result = parent;
+        else if (parent != current)
+            ; // Don't free parent yet, might need for result
+    }
+
+    *result = current;
+    return 0;
+}
+
+// ============================================================================
+// MOUNT OPERATIONS
+// ============================================================================
+
+CVFSMount *VFSMountAlloc()
+{
+    CVFSMount *mnt = MAlloc(sizeof(CVFSMount));
+    if (!mnt)
+        return NULL;
+
+    MemSet(mnt, 0, sizeof(CVFSMount));
+    mnt->ref_count = 1;
+
+    return mnt;
+}
+
+I64 VFSMount(U8 *source, U8 *target, U8 *fstype, U32 flags, U8 *options)
+{
+    CVFS *vfs = VFSGet();
+
+    if (!target || !fstype)
+        return -EINVAL;
+
+    // Find filesystem type
+    CVFSFilesystem *fs = VFSFindFilesystem(fstype);
+    if (!fs) {
+        return -ENODEV;
+    }
+
+    // Allocate mount structure
+    CVFSMount *mnt = VFSMountAlloc();
+    if (!mnt)
+        return -ENOMEM;
+
+    mnt->mount_point = StrNew(target);
+    mnt->device = source ? StrNew(source) : NULL;
+    mnt->fs_type_name = StrNew(fstype);
+    mnt->fs_type = fs->type;
+    mnt->flags = flags;
+
+    // Call filesystem mount
+    if (fs->ops && fs->ops->mount) {
+        I64 err = fs->ops->mount(mnt, source, options);
+        if (err < 0) {
+            if (mnt->mount_point) Free(mnt->mount_point);
+            if (mnt->device) Free(mnt->device);
+            if (mnt->fs_type_name) Free(mnt->fs_type_name);
+            Free(mnt);
+            return err;
+        }
+    }
+
+    // Add to mount list
+    mnt->next = vfs->mounts;
+    vfs->mounts = mnt;
+    vfs->mount_count++;
+
+    // If mounting root
+    if (StrCmp(target, "/") == 0) {
+        vfs->root_mount = mnt;
+        vfs->root_inode = mnt->root;
+    }
+
+    return 0;
+}
+
+I64 VFSUnmount(U8 *target)
+{
+    CVFS *vfs = VFSGet();
+
+    CVFSMount **pp = &vfs->mounts;
+    while (*pp) {
+        if (StrCmp((*pp)->mount_point, target) == 0) {
+            CVFSMount *mnt = *pp;
+
+            // Check if busy
+            if (mnt->ref_count > 1)
+                return -EBUSY;
+
+            // Call filesystem unmount
+            if (mnt->sb && mnt->sb->ops && mnt->sb->ops->unmount) {
+                mnt->sb->ops->unmount(mnt);
+            }
+
+            // Remove from list
+            *pp = mnt->next;
+            vfs->mount_count--;
+
+            // Free resources
+            if (mnt->mount_point) Free(mnt->mount_point);
+            if (mnt->device) Free(mnt->device);
+            if (mnt->fs_type_name) Free(mnt->fs_type_name);
+            Free(mnt);
+
+            return 0;
+        }
+        pp = &(*pp)->next;
+    }
+
+    return -EINVAL;
+}
+
+CVFSMount *VFSFindMount(U8 *path)
+{
+    CVFS *vfs = VFSGet();
+
+    // Find longest matching mount point
+    CVFSMount *best = NULL;
+    I64 best_len = 0;
+
+    CVFSMount *mnt = vfs->mounts;
+    while (mnt) {
+        I64 len = StrLen(mnt->mount_point);
+        if (len > best_len && StrNCmp(path, mnt->mount_point, len) == 0) {
+            if (path[len] == '/' || path[len] == 0 || len == 1) {
+                best = mnt;
+                best_len = len;
+            }
+        }
+        mnt = mnt->next;
+    }
+
+    return best;
+}
+
+// ============================================================================
+// FILE OPERATIONS
+// ============================================================================
+
+CVFSFile *VFSFileAlloc()
+{
+    CVFSFile *file = MAlloc(sizeof(CVFSFile));
+    if (!file)
+        return NULL;
+
+    MemSet(file, 0, sizeof(CVFSFile));
+    file->ref_count = 1;
+
+    return file;
+}
+
+U0 VFSFileFree(CVFSFile *file)
+{
+    if (!file)
+        return;
+
+    if (file->inode)
+        VFSInodePut(file->inode);
+
+    if (file->fs_private)
+        Free(file->fs_private);
+
+    Free(file);
+}
+
+I64 VFSOpen(U8 *path, I64 flags, I64 mode, CVFSFile **result)
+{
+    if (!path || !result)
+        return -EINVAL;
+
+    *result = NULL;
+
+    // Lookup path
+    CVFSInode *inode = NULL;
+    CVFSInode *parent = NULL;
+    I64 lookup_flags = (flags & VFS_O_NOFOLLOW) ? 0 : VFS_LOOKUP_FOLLOW;
+
+    if (flags & VFS_O_CREAT)
+        lookup_flags |= VFS_LOOKUP_CREATE;
+
+    I64 err = VFSLookupPath(path, lookup_flags, &inode, &parent);
+
+    if (err == -ENOENT && (flags & VFS_O_CREAT) && parent) {
+        // Create new file
+        U8 *name = strrchr(path, '/');
+        name = name ? name + 1 : path;
+
+        if (parent->sb && parent->sb->ops && parent->sb->ops->create) {
+            err = parent->sb->ops->create(parent, name, mode | VFS_IFREG, &inode);
+        } else {
+            err = -EROFS;
+        }
+
+        VFSInodePut(parent);
+
+        if (err < 0)
+            return err;
+    } else if (err < 0) {
+        if (parent) VFSInodePut(parent);
+        return err;
+    } else {
+        if (parent) VFSInodePut(parent);
+    }
+
+    // Check O_EXCL
+    if ((flags & (VFS_O_CREAT | VFS_O_EXCL)) == (VFS_O_CREAT | VFS_O_EXCL)) {
+        // File existed when it shouldn't
+        if (inode) VFSInodePut(inode);
+        return -EEXIST;
+    }
+
+    // Check O_DIRECTORY
+    if ((flags & VFS_O_DIRECTORY) && !VFS_ISDIR(inode->mode)) {
+        VFSInodePut(inode);
+        return -ENOTDIR;
+    }
+
+    // Check write permission for read-only mount
+    if ((flags & (VFS_O_WRONLY | VFS_O_RDWR)) &&
+        inode->sb && (inode->sb->flags & VFS_MNT_RDONLY)) {
+        VFSInodePut(inode);
+        return -EROFS;
+    }
+
+    // Truncate if requested
+    if ((flags & VFS_O_TRUNC) && VFS_ISREG(inode->mode)) {
+        if (inode->sb && inode->sb->ops && inode->sb->ops->truncate) {
+            inode->sb->ops->truncate(inode, 0);
+        }
+    }
+
+    // Allocate file handle
+    CVFSFile *file = VFSFileAlloc();
+    if (!file) {
+        VFSInodePut(inode);
+        return -ENOMEM;
+    }
+
+    file->inode = inode;
+    file->mount = inode->sb ? inode->sb->mount : NULL;
+    file->flags = flags;
+    file->mode = mode;
+    file->offset = (flags & VFS_O_APPEND) ? inode->size : 0;
+
+    inode->open_count++;
+
+    // Call filesystem open
+    if (inode->sb && inode->sb->ops && inode->sb->ops->open) {
+        err = inode->sb->ops->open(file);
+        if (err < 0) {
+            inode->open_count--;
+            VFSFileFree(file);
+            return err;
+        }
+    }
+
+    *result = file;
+    return 0;
+}
+
+I64 VFSClose(CVFSFile *file)
+{
+    if (!file)
+        return -EBADF;
+
+    // Call filesystem close
+    if (file->inode && file->inode->sb &&
+        file->inode->sb->ops && file->inode->sb->ops->close) {
+        file->inode->sb->ops->close(file);
+    }
+
+    if (file->inode)
+        file->inode->open_count--;
+
+    VFSFileFree(file);
+    return 0;
+}
+
+I64 VFSRead(CVFSFile *file, U0 *buf, I64 size)
+{
+    if (!file || !buf)
+        return -EINVAL;
+
+    if (!file->inode)
+        return -EBADF;
+
+    CVFS *vfs = VFSGet();
+    vfs->stat_reads++;
+
+    CVFSInode *inode = file->inode;
+
+    // Check readable
+    if ((file->flags & VFS_O_ACCMODE) == VFS_O_WRONLY)
+        return -EBADF;
+
+    // Call filesystem read
+    if (inode->sb && inode->sb->ops && inode->sb->ops->read) {
+        I64 result = inode->sb->ops->read(file, buf, size, file->offset);
+        if (result > 0)
+            file->offset += result;
+        return result;
+    }
+
+    return -EIO;
+}
+
+I64 VFSWrite(CVFSFile *file, U0 *buf, I64 size)
+{
+    if (!file || !buf)
+        return -EINVAL;
+
+    if (!file->inode)
+        return -EBADF;
+
+    CVFS *vfs = VFSGet();
+    vfs->stat_writes++;
+
+    CVFSInode *inode = file->inode;
+
+    // Check writable
+    if ((file->flags & VFS_O_ACCMODE) == VFS_O_RDONLY)
+        return -EBADF;
+
+    // Check read-only mount
+    if (inode->sb && (inode->sb->flags & VFS_MNT_RDONLY))
+        return -EROFS;
+
+    // Handle append mode
+    if (file->flags & VFS_O_APPEND)
+        file->offset = inode->size;
+
+    // Call filesystem write
+    if (inode->sb && inode->sb->ops && inode->sb->ops->write) {
+        I64 result = inode->sb->ops->write(file, buf, size, file->offset);
+        if (result > 0) {
+            file->offset += result;
+            if (file->offset > inode->size)
+                inode->size = file->offset;
+            inode->dirty = TRUE;
+        }
+        return result;
+    }
+
+    return -EIO;
+}
+
+I64 VFSSeek(CVFSFile *file, I64 offset, I64 whence)
+{
+    if (!file || !file->inode)
+        return -EBADF;
+
+    I64 new_offset;
+
+    switch (whence) {
+        case SEEK_SET:
+            new_offset = offset;
+            break;
+        case SEEK_CUR:
+            new_offset = file->offset + offset;
+            break;
+        case SEEK_END:
+            new_offset = file->inode->size + offset;
+            break;
+        default:
+            return -EINVAL;
+    }
+
+    if (new_offset < 0)
+        return -EINVAL;
+
+    file->offset = new_offset;
+    return new_offset;
+}
+
+// ============================================================================
+// DIRECTORY OPERATIONS
+// ============================================================================
+
+I64 VFSMkdir(U8 *path, I64 mode)
+{
+    CVFSInode *parent = NULL;
+    CVFSInode *inode = NULL;
+
+    I64 err = VFSLookupPath(path, VFS_LOOKUP_PARENT, &inode, &parent);
+
+    // If it exists, error
+    if (err == 0 && inode) {
+        VFSInodePut(inode);
+        if (parent) VFSInodePut(parent);
+        return -EEXIST;
+    }
+
+    if (!parent)
+        return -ENOENT;
+
+    // Get name component
+    U8 *name = strrchr(path, '/');
+    name = name ? name + 1 : path;
+
+    // Create directory
+    if (parent->sb && parent->sb->ops && parent->sb->ops->mkdir) {
+        err = parent->sb->ops->mkdir(parent, name, mode | VFS_IFDIR, &inode);
+        if (inode) VFSInodePut(inode);
+    } else {
+        err = -EROFS;
+    }
+
+    VFSInodePut(parent);
+    return err;
+}
+
+I64 VFSRmdir(U8 *path)
+{
+    CVFSInode *parent = NULL;
+    CVFSInode *inode = NULL;
+
+    I64 err = VFSLookupPath(path, VFS_LOOKUP_FOLLOW, &inode, &parent);
+    if (err < 0)
+        return err;
+
+    if (!VFS_ISDIR(inode->mode)) {
+        VFSInodePut(inode);
+        if (parent) VFSInodePut(parent);
+        return -ENOTDIR;
+    }
+
+    // Get name component
+    U8 *name = strrchr(path, '/');
+    name = name ? name + 1 : path;
+
+    if (parent && parent->sb && parent->sb->ops && parent->sb->ops->rmdir) {
+        err = parent->sb->ops->rmdir(parent, name);
+    } else {
+        err = -EROFS;
+    }
+
+    VFSInodePut(inode);
+    if (parent) VFSInodePut(parent);
+    return err;
+}
+
+// ============================================================================
+// LINK OPERATIONS
+// ============================================================================
+
+I64 VFSSymlink(U8 *target, U8 *linkpath)
+{
+    CVFSInode *parent = NULL;
+    CVFSInode *inode = NULL;
+
+    // Check if linkpath exists
+    I64 err = VFSLookupPath(linkpath, 0, &inode, &parent);
+    if (err == 0 && inode) {
+        VFSInodePut(inode);
+        if (parent) VFSInodePut(parent);
+        return -EEXIST;
+    }
+
+    // Get parent directory
+    err = VFSLookupPath(linkpath, VFS_LOOKUP_PARENT | VFS_LOOKUP_CREATE, &inode, &parent);
+
+    if (!parent) {
+        // Try creating overlay symlink
+        return VFSSymlinkCreate(linkpath, target);
+    }
+
+    // Get name component
+    U8 *name = strrchr(linkpath, '/');
+    name = name ? name + 1 : linkpath;
+
+    // Create symlink via filesystem
+    if (parent->sb && parent->sb->ops && parent->sb->ops->symlink) {
+        err = parent->sb->ops->symlink(parent, name, target);
+    } else {
+        // Filesystem doesn't support symlinks - use overlay
+        err = VFSSymlinkCreate(linkpath, target);
+    }
+
+    VFSInodePut(parent);
+    return err;
+}
+
+I64 VFSReadlink(U8 *path, U8 *buf, I64 size)
+{
+    // First check overlay symlink table
+    CVFSSymlink *sym = VFSSymlinkLookup(path);
+    if (sym) {
+        I64 len = StrLen(sym->target);
+        if (len >= size)
+            len = size - 1;
+        MemCpy(buf, sym->target, len);
+        buf[len] = 0;
+        return len;
+    }
+
+    // Look up in filesystem
+    CVFSInode *inode = NULL;
+    I64 err = VFSLookupPath(path, 0, &inode, NULL);  // Don't follow
+    if (err < 0)
+        return err;
+
+    if (!VFS_ISLNK(inode->mode)) {
+        VFSInodePut(inode);
+        return -EINVAL;
+    }
+
+    // Read from inode
+    if (inode->symlink_target) {
+        I64 len = StrLen(inode->symlink_target);
+        if (len >= size)
+            len = size - 1;
+        MemCpy(buf, inode->symlink_target, len);
+        buf[len] = 0;
+        VFSInodePut(inode);
+        return len;
+    }
+
+    // Call filesystem readlink
+    if (inode->sb && inode->sb->ops && inode->sb->ops->readlink) {
+        err = inode->sb->ops->readlink(inode, buf, size);
+    } else {
+        err = -EIO;
+    }
+
+    VFSInodePut(inode);
+    return err;
+}
+
+I64 VFSLink(U8 *oldpath, U8 *newpath)
+{
+    CVFSInode *target = NULL;
+    CVFSInode *parent = NULL;
+
+    // Lookup target
+    I64 err = VFSLookupPath(oldpath, VFS_LOOKUP_FOLLOW, &target, NULL);
+    if (err < 0)
+        return err;
+
+    // Can't hardlink directories
+    if (VFS_ISDIR(target->mode)) {
+        VFSInodePut(target);
+        return -EPERM;
+    }
+
+    // Lookup parent of new path
+    err = VFSLookupPath(newpath, VFS_LOOKUP_PARENT | VFS_LOOKUP_CREATE, NULL, &parent);
+    if (!parent) {
+        VFSInodePut(target);
+        return -ENOENT;
+    }
+
+    // Must be same filesystem
+    if (target->sb != parent->sb) {
+        VFSInodePut(target);
+        VFSInodePut(parent);
+        return -EXDEV;
+    }
+
+    // Get name
+    U8 *name = strrchr(newpath, '/');
+    name = name ? name + 1 : newpath;
+
+    // Create link
+    if (parent->sb && parent->sb->ops && parent->sb->ops->link) {
+        err = parent->sb->ops->link(parent, name, target);
+    } else {
+        err = -EROFS;
+    }
+
+    VFSInodePut(target);
+    VFSInodePut(parent);
+    return err;
+}
+
+I64 VFSUnlink(U8 *path)
+{
+    CVFSInode *parent = NULL;
+    CVFSInode *inode = NULL;
+
+    // Check overlay symlinks first
+    if (VFSSymlinkLookup(path)) {
+        return VFSSymlinkDelete(path);
+    }
+
+    I64 err = VFSLookupPath(path, VFS_LOOKUP_FOLLOW, &inode, &parent);
+    if (err < 0)
+        return err;
+
+    if (VFS_ISDIR(inode->mode)) {
+        VFSInodePut(inode);
+        if (parent) VFSInodePut(parent);
+        return -EISDIR;
+    }
+
+    // Get name
+    U8 *name = strrchr(path, '/');
+    name = name ? name + 1 : path;
+
+    if (parent && parent->sb && parent->sb->ops && parent->sb->ops->unlink) {
+        err = parent->sb->ops->unlink(parent, name);
+    } else {
+        err = -EROFS;
+    }
+
+    VFSInodePut(inode);
+    if (parent) VFSInodePut(parent);
+    return err;
+}
+
+// ============================================================================
+// STAT OPERATIONS
+// ============================================================================
+
+I64 VFSStat(U8 *path, CVFSInode **inode_out, Bool follow_links)
+{
+    I64 flags = follow_links ? VFS_LOOKUP_FOLLOW : 0;
+    return VFSLookupPath(path, flags, inode_out, NULL);
+}
+
+I64 VFSLstat(U8 *path, CVFSInode **inode_out)
+{
+    // Check overlay symlinks first
+    CVFSSymlink *sym = VFSSymlinkLookup(path);
+    if (sym) {
+        // Create fake inode for overlay symlink
+        CVFSInode *inode = VFSInodeAlloc(NULL);
+        if (!inode)
+            return -ENOMEM;
+
+        inode->mode = VFS_IFLNK | 0777;
+        inode->size = StrLen(sym->target);
+        inode->symlink_target = StrNew(sym->target);
+        inode->mtime = sym->mtime;
+        inode->ctime = sym->mtime;
+        inode->atime = time(NULL);
+
+        *inode_out = inode;
+        return 0;
+    }
+
+    return VFSLookupPath(path, 0, inode_out, NULL);
+}
+
+// ============================================================================
+// INITIALIZATION MESSAGE
+// ============================================================================
+
+"ZealOS VFS layer loaded.\n";
+"  - Path resolution with symlink support\n";
+"  - Inode and dentry caching\n";
+"  - Mount point management\n";
+"  - Overlay symlink table\n";

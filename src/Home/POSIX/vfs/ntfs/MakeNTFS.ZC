@@ -1,0 +1,14 @@
+// MakeNTFS.ZC - NTFS Filesystem Driver Loader for ZealOS
+// Part of the POSIX compatibility layer
+
+Cd(__DIR__);;
+
+// Load VFS first if not already loaded
+#include "../VFS.HH"
+#include "../VFS.ZC"
+
+// Load NTFS driver
+#include "NTFS.HH"
+#include "NTFS.ZC"
+
+"NTFS filesystem support ready (read-only).\n";

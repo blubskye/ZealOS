@@ -1,0 +1,14 @@
+// MakeVFS.ZC - VFS Loader for ZealOS
+// Part of the POSIX compatibility layer
+
+Cd(__DIR__);;
+
+// Load VFS components
+#include "VFS.HH"
+#include "VFS.ZC"
+#include "Symlink.ZC"
+
+// Initialize VFS
+VFSInit();
+
+"VFS layer ready.\n";

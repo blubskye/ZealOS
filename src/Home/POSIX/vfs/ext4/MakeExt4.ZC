@@ -1,0 +1,14 @@
+// MakeExt4.ZC - Ext2/3/4 Filesystem Driver Loader for ZealOS
+// Part of the POSIX compatibility layer
+
+Cd(__DIR__);;
+
+// Load VFS first if not already loaded
+#include "../VFS.HH"
+#include "../VFS.ZC"
+
+// Load ext4 driver
+#include "Ext4.HH"
+#include "Ext4.ZC"
+
+"Ext2/3/4 filesystem support ready.\n";

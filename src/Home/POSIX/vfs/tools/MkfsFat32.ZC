@@ -1,0 +1,426 @@
+// MkfsFat32.ZC - Create FAT32 Filesystems for ZealOS
+// Part of the POSIX compatibility layer
+//
+// This utility creates FAT32 filesystems on a device.
+// Based on Microsoft FAT32 File System Specification (public domain).
+
+#include "FSTools.HH"
+
+// ============================================================================
+// FAT32 CONSTANTS
+// ============================================================================
+
+#define FAT32_BOOT_SIGNATURE    0xAA55
+#define FAT32_FSINFO_SIGNATURE1 0x41615252  // "RRaA"
+#define FAT32_FSINFO_SIGNATURE2 0x61417272  // "rrAa"
+#define FAT32_FSINFO_SIGNATURE3 0xAA550000
+
+#define FAT32_EOC               0x0FFFFFF8  // End of cluster chain
+#define FAT32_BAD               0x0FFFFFF7  // Bad cluster
+#define FAT32_FREE              0x00000000  // Free cluster
+
+#define FAT32_ATTR_READ_ONLY    0x01
+#define FAT32_ATTR_HIDDEN       0x02
+#define FAT32_ATTR_SYSTEM       0x04
+#define FAT32_ATTR_VOLUME_ID    0x08
+#define FAT32_ATTR_DIRECTORY    0x10
+#define FAT32_ATTR_ARCHIVE      0x20
+#define FAT32_ATTR_LONG_NAME    0x0F
+
+// ============================================================================
+// FAT32 ON-DISK STRUCTURES
+// ============================================================================
+
+class CFat32BootSector {
+    U8      jmp_boot[3];        // Jump instruction
+    U8      oem_name[8];        // OEM identifier
+    // BIOS Parameter Block
+    U16     bytes_per_sector;   // Bytes per sector (512, 1024, 2048, 4096)
+    U8      sectors_per_cluster;// Sectors per cluster
+    U16     reserved_sectors;   // Reserved sectors (FAT32: 32)
+    U8      num_fats;           // Number of FATs (usually 2)
+    U16     root_entry_count;   // Root entries (FAT32: 0)
+    U16     total_sectors_16;   // Total sectors (FAT32: 0)
+    U8      media_type;         // Media type (0xF8 for fixed disk)
+    U16     fat_size_16;        // FAT size in sectors (FAT32: 0)
+    U16     sectors_per_track;  // Sectors per track
+    U16     num_heads;          // Number of heads
+    U32     hidden_sectors;     // Hidden sectors before partition
+    U32     total_sectors_32;   // Total sectors (FAT32)
+    // FAT32 Extended BPB
+    U32     fat_size_32;        // FAT size in sectors
+    U16     ext_flags;          // Extended flags
+    U16     fs_version;         // Filesystem version
+    U32     root_cluster;       // Root directory cluster
+    U16     fsinfo_sector;      // FSInfo sector
+    U16     backup_boot_sector; // Backup boot sector
+    U8      reserved[12];       // Reserved
+    U8      drive_number;       // Drive number
+    U8      reserved1;          // Reserved
+    U8      boot_signature;     // Extended boot signature (0x29)
+    U32     volume_id;          // Volume serial number
+    U8      volume_label[11];   // Volume label
+    U8      fs_type[8];         // "FAT32   "
+    U8      boot_code[420];     // Boot code
+    U16     signature;          // 0xAA55
+};
+
+class CFat32FSInfo {
+    U32     lead_signature;     // 0x41615252
+    U8      reserved1[480];     // Reserved
+    U32     struct_signature;   // 0x61417272
+    U32     free_count;         // Free cluster count
+    U32     next_free;          // Next free cluster hint
+    U8      reserved2[12];      // Reserved
+    U32     trail_signature;    // 0xAA550000
+};
+
+class CFat32DirEntry {
+    U8      name[11];           // Short name (8.3 format)
+    U8      attr;               // Attributes
+    U8      nt_reserved;        // Reserved for NT
+    U8      create_time_tenth;  // Creation time (tenths)
+    U16     create_time;        // Creation time
+    U16     create_date;        // Creation date
+    U16     access_date;        // Last access date
+    U16     first_cluster_hi;   // High word of first cluster
+    U16     modify_time;        // Last modification time
+    U16     modify_date;        // Last modification date
+    U16     first_cluster_lo;   // Low word of first cluster
+    U32     file_size;          // File size in bytes
+};
+
+// ============================================================================
+// DEFAULT OPTIONS
+// ============================================================================
+
+U0 MkfsFat32DefaultOpts(CMkfsFat32Opts *opts)
+{
+    MemSet(opts, 0, sizeof(CMkfsFat32Opts));
+
+    opts->sectors_per_cluster = 0;  // Auto-calculate
+    opts->label = NULL;
+    opts->volume_id = 0;            // Generate random
+    opts->quick = FALSE;
+}
+
+// ============================================================================
+// HELPER FUNCTIONS
+// ============================================================================
+
+// Calculate appropriate sectors per cluster based on volume size
+static U8 CalcSectorsPerCluster(U64 total_sectors, U16 bytes_per_sector)
+{
+    U64 volume_size = total_sectors * bytes_per_sector;
+
+    // FAT32 recommended cluster sizes per Microsoft spec
+    if (volume_size <= 64 * 1024 * 1024ULL)           // <= 64MB: not recommended for FAT32
+        return 1;
+    else if (volume_size <= 128 * 1024 * 1024ULL)     // <= 128MB
+        return 1;
+    else if (volume_size <= 256 * 1024 * 1024ULL)     // <= 256MB
+        return 8;                                      // 4KB clusters
+    else if (volume_size <= 8ULL * 1024 * 1024 * 1024)     // <= 8GB
+        return 8;                                      // 4KB clusters
+    else if (volume_size <= 16ULL * 1024 * 1024 * 1024)    // <= 16GB
+        return 16;                                     // 8KB clusters
+    else if (volume_size <= 32ULL * 1024 * 1024 * 1024)    // <= 32GB
+        return 32;                                     // 16KB clusters
+    else                                              // > 32GB
+        return 64;                                     // 32KB clusters
+}
+
+// Convert time to FAT format
+static U16 TimeToDosTime(U64 unix_time)
+{
+    // Simplified - just return a fixed time
+    // Real implementation would convert properly
+    return (12 << 11) | (0 << 5) | 0;  // 12:00:00
+}
+
+static U16 TimeToDosDate(U64 unix_time)
+{
+    // Simplified - return a fixed date
+    // Real implementation would convert properly
+    return ((2024 - 1980) << 9) | (1 << 5) | 1;  // 2024-01-01
+}
+
+// ============================================================================
+// FAT32 FILESYSTEM CREATION
+// ============================================================================
+
+I64 MkfsFat32(U8 *device, CMkfsFat32Opts *opts)
+{
+    CMkfsFat32Opts default_opts;
+    if (!opts) {
+        MkfsFat32DefaultOpts(&default_opts);
+        opts = &default_opts;
+    }
+
+    // Get device size
+    I64 device_size = GetDeviceSize(device);
+    if (device_size < 0) {
+        "mkfs.fat32: Cannot determine device size for %s\n", device;
+        return -EIO;
+    }
+
+    U16 bytes_per_sector = 512;
+    U64 total_sectors = device_size / bytes_per_sector;
+
+    // FAT32 minimum is about 65527 clusters
+    if (total_sectors < 66584) {
+        "mkfs.fat32: Device too small for FAT32 (minimum ~33MB)\n";
+        return -EINVAL;
+    }
+
+    "Creating FAT32 filesystem on %s\n", device;
+    "  Total size: %lld bytes (%lld sectors)\n", device_size, total_sectors;
+
+    // Open device
+    I64 fd = PosixOpen(device, O_RDWR, 0);
+    if (fd < 0) {
+        "mkfs.fat32: Cannot open %s for writing\n", device;
+        return -EACCES;
+    }
+
+    // Calculate parameters
+    U8 sectors_per_cluster = opts->sectors_per_cluster;
+    if (sectors_per_cluster == 0) {
+        sectors_per_cluster = CalcSectorsPerCluster(total_sectors, bytes_per_sector);
+    }
+
+    U32 cluster_size = sectors_per_cluster * bytes_per_sector;
+    U16 reserved_sectors = 32;
+    U8 num_fats = 2;
+
+    // Calculate FAT size
+    // Formula from FAT spec:
+    // DataSec = TotSec - ResSec - (NumFATs * FATSz)
+    // CountOfClusters = DataSec / SecPerClus
+    // FATSz = (CountOfClusters + 2) * 4 / BytsPerSec (rounded up)
+
+    U64 data_sectors_estimate = total_sectors - reserved_sectors;
+    U64 clusters_estimate = data_sectors_estimate / sectors_per_cluster;
+
+    // FAT32 entries are 4 bytes each
+    U32 fat_size = ((clusters_estimate + 2) * 4 + bytes_per_sector - 1) / bytes_per_sector;
+
+    // Recalculate with actual FAT size
+    U64 data_start = reserved_sectors + (num_fats * fat_size);
+    U64 data_sectors = total_sectors - data_start;
+    U64 total_clusters = data_sectors / sectors_per_cluster;
+
+    "  Sectors per cluster: %d (%d KB clusters)\n", sectors_per_cluster, cluster_size / 1024;
+    "  Reserved sectors: %d\n", reserved_sectors;
+    "  FAT size: %d sectors\n", fat_size;
+    "  Data clusters: %lld\n", total_clusters;
+
+    // Generate volume ID if not provided
+    U32 volume_id = opts->volume_id;
+    if (volume_id == 0) {
+        volume_id = RandU32;
+    }
+
+    // Create boot sector
+    CFat32BootSector *bs = MAlloc(bytes_per_sector);
+    MemSet(bs, 0, bytes_per_sector);
+
+    // Jump instruction
+    bs->jmp_boot[0] = 0xEB;
+    bs->jmp_boot[1] = 0x58;  // Jump over BPB
+    bs->jmp_boot[2] = 0x90;
+
+    // OEM name
+    MemCpy(bs->oem_name, "ZEALOS  ", 8);
+
+    // BIOS Parameter Block
+    bs->bytes_per_sector = bytes_per_sector;
+    bs->sectors_per_cluster = sectors_per_cluster;
+    bs->reserved_sectors = reserved_sectors;
+    bs->num_fats = num_fats;
+    bs->root_entry_count = 0;           // FAT32: 0
+    bs->total_sectors_16 = 0;           // FAT32: 0
+    bs->media_type = 0xF8;              // Fixed disk
+    bs->fat_size_16 = 0;                // FAT32: 0
+    bs->sectors_per_track = 63;         // Standard
+    bs->num_heads = 255;                // Standard
+    bs->hidden_sectors = 0;
+    bs->total_sectors_32 = total_sectors;
+
+    // FAT32 Extended BPB
+    bs->fat_size_32 = fat_size;
+    bs->ext_flags = 0;                  // Both FATs active, mirrored
+    bs->fs_version = 0;
+    bs->root_cluster = 2;               // Root dir at cluster 2
+    bs->fsinfo_sector = 1;
+    bs->backup_boot_sector = 6;
+
+    bs->drive_number = 0x80;            // First hard disk
+    bs->boot_signature = 0x29;
+    bs->volume_id = volume_id;
+
+    // Volume label
+    if (opts->label) {
+        I64 len = StrLen(opts->label);
+        if (len > 11) len = 11;
+        MemSet(bs->volume_label, ' ', 11);
+        MemCpy(bs->volume_label, opts->label, len);
+    } else {
+        MemCpy(bs->volume_label, "NO NAME    ", 11);
+    }
+
+    MemCpy(bs->fs_type, "FAT32   ", 8);
+
+    // Boot signature
+    bs->signature = FAT32_BOOT_SIGNATURE;
+
+    // Write boot sector
+    DeviceWrite(fd, 0, bs, bytes_per_sector);
+
+    // Write backup boot sector
+    DeviceWrite(fd, 6 * bytes_per_sector, bs, bytes_per_sector);
+
+    Free(bs);
+
+    // Create FSInfo sector
+    "Writing FSInfo...\n";
+
+    CFat32FSInfo *fsinfo = MAlloc(bytes_per_sector);
+    MemSet(fsinfo, 0, bytes_per_sector);
+
+    fsinfo->lead_signature = FAT32_FSINFO_SIGNATURE1;
+    fsinfo->struct_signature = FAT32_FSINFO_SIGNATURE2;
+    fsinfo->free_count = total_clusters - 1;  // Root dir uses cluster 2
+    fsinfo->next_free = 3;                     // Next free cluster
+    fsinfo->trail_signature = FAT32_FSINFO_SIGNATURE3;
+
+    // Write FSInfo sector
+    DeviceWrite(fd, 1 * bytes_per_sector, fsinfo, bytes_per_sector);
+
+    // Write backup FSInfo sector
+    DeviceWrite(fd, 7 * bytes_per_sector, fsinfo, bytes_per_sector);
+
+    Free(fsinfo);
+
+    // Create FATs
+    "Writing FAT tables...\n";
+
+    U32 *fat = MAlloc(bytes_per_sector);
+    MemSet(fat, 0, bytes_per_sector);
+
+    // First FAT sector has special entries
+    fat[0] = 0x0FFFFF00 | 0xF8;  // Media type in low byte
+    fat[1] = FAT32_EOC;          // End marker
+    fat[2] = FAT32_EOC;          // Root directory (cluster 2)
+
+    // Write first FAT sector to both FATs
+    U64 fat1_start = reserved_sectors * bytes_per_sector;
+    U64 fat2_start = (reserved_sectors + fat_size) * bytes_per_sector;
+
+    DeviceWrite(fd, fat1_start, fat, bytes_per_sector);
+    DeviceWrite(fd, fat2_start, fat, bytes_per_sector);
+
+    // Zero remaining FAT sectors if not quick format
+    MemSet(fat, 0, bytes_per_sector);
+
+    if (!opts->quick) {
+        I64 i;
+        for (i = 1; i < fat_size; i++) {
+            DeviceWrite(fd, fat1_start + i * bytes_per_sector, fat, bytes_per_sector);
+            DeviceWrite(fd, fat2_start + i * bytes_per_sector, fat, bytes_per_sector);
+
+            if ((i % 1000) == 0) {
+                "  FAT sector %d/%d\r", i, fat_size;
+            }
+        }
+        "\n";
+    }
+
+    Free(fat);
+
+    // Create root directory
+    "Creating root directory...\n";
+
+    U8 *root_dir = MAlloc(cluster_size);
+    MemSet(root_dir, 0, cluster_size);
+
+    // Create volume label entry if label provided
+    if (opts->label) {
+        CFat32DirEntry *vol_entry = root_dir;
+        MemSet(vol_entry->name, ' ', 11);
+
+        I64 len = StrLen(opts->label);
+        if (len > 11) len = 11;
+        MemCpy(vol_entry->name, opts->label, len);
+
+        vol_entry->attr = FAT32_ATTR_VOLUME_ID;
+        vol_entry->create_time = TimeToDosTime(time(NULL));
+        vol_entry->create_date = TimeToDosDate(time(NULL));
+        vol_entry->modify_time = vol_entry->create_time;
+        vol_entry->modify_date = vol_entry->create_date;
+    }
+
+    // Write root directory (cluster 2)
+    U64 root_offset = data_start * bytes_per_sector;
+    DeviceWrite(fd, root_offset, root_dir, cluster_size);
+
+    Free(root_dir);
+
+    // Zero data area if not quick format
+    if (!opts->quick) {
+        "Zeroing data area...\n";
+
+        U8 *zero_buf = MAlloc(cluster_size);
+        MemSet(zero_buf, 0, cluster_size);
+
+        // Start from cluster 3 (cluster 2 is root)
+        I64 i;
+        I64 clusters_to_zero = total_clusters - 1;  // Skip cluster 2
+        for (i = 0; i < clusters_to_zero; i++) {
+            U64 offset = root_offset + (i + 1) * cluster_size;
+            DeviceWrite(fd, offset, zero_buf, cluster_size);
+
+            if ((i % 1000) == 0) {
+                "  Cluster %lld/%lld\r", i, clusters_to_zero;
+            }
+        }
+        "\n";
+
+        Free(zero_buf);
+    }
+
+    PosixClose(fd);
+
+    "\nFilesystem created successfully!\n";
+    "  Volume ID: %08X\n", volume_id;
+    "  %lld total clusters\n", total_clusters;
+    "  %lld bytes per cluster\n", cluster_size;
+
+    return 0;
+}
+
+// ============================================================================
+// COMMAND LINE INTERFACE
+// ============================================================================
+
+U0 MkfsFat32Help()
+{
+    "Usage: MkfsFat32(device, opts)\n";
+    "\n";
+    "Create a FAT32 filesystem on the specified device.\n";
+    "\n";
+    "Options (CMkfsFat32Opts):\n";
+    "  sectors_per_cluster - Cluster size (0 = auto)\n";
+    "  label               - Volume label (11 chars max)\n";
+    "  volume_id           - Volume ID (0 = random)\n";
+    "  quick               - Quick format (don't zero)\n";
+    "\n";
+    "Examples:\n";
+    "  MkfsFat32(\"/dev/sda1\", NULL);  // Use defaults\n";
+    "\n";
+    "  CMkfsFat32Opts opts;\n";
+    "  MkfsFat32DefaultOpts(&opts);\n";
+    "  opts.label = \"MYVOLUME\";\n";
+    "  opts.quick = TRUE;\n";
+    "  MkfsFat32(\"/dev/sda1\", &opts);\n";
+}

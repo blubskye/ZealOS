@@ -1,0 +1,527 @@
+// FsckFat32.ZC - Check and Repair FAT32 Filesystems for ZealOS
+// Part of the POSIX compatibility layer
+//
+// This utility checks FAT32 filesystems for errors.
+// Based on Microsoft FAT32 File System Specification (public domain).
+
+#include "FSTools.HH"
+
+// FAT32 constants from MkfsFat32.ZC
+#define FAT32_BOOT_SIGNATURE    0xAA55
+#define FAT32_FSINFO_SIGNATURE1 0x41615252
+#define FAT32_FSINFO_SIGNATURE2 0x61417272
+#define FAT32_EOC               0x0FFFFFF8
+#define FAT32_BAD               0x0FFFFFF7
+#define FAT32_FREE              0x00000000
+
+#define FAT32_ATTR_LONG_NAME    0x0F
+#define FAT32_ATTR_DIRECTORY    0x10
+
+// ============================================================================
+// FSCK CONTEXT
+// ============================================================================
+
+class CFsckFat32Context : CFsckContext {
+    // Boot sector info
+    U16     bytes_per_sector;
+    U8      sectors_per_cluster;
+    U16     reserved_sectors;
+    U8      num_fats;
+    U32     fat_size;
+    U32     root_cluster;
+    U32     total_sectors;
+    U32     total_clusters;
+    U64     data_start;
+
+    // FAT tables
+    U32     *fat1;
+    U32     *fat2;
+
+    // Cluster usage tracking
+    U8      *cluster_used;      // Which clusters we've visited
+    U32     *cluster_refs;      // Reference count per cluster
+};
+
+// ============================================================================
+// HELPER FUNCTIONS
+// ============================================================================
+
+static I64 FsckFat32ReadCluster(CFsckFat32Context *ctx, U32 cluster, U0 *buf)
+{
+    if (cluster < 2 || cluster >= ctx->total_clusters + 2)
+        return -EINVAL;
+
+    U64 offset = ctx->data_start + (cluster - 2)(U64) * ctx->sectors_per_cluster * ctx->bytes_per_sector;
+    I64 size = ctx->sectors_per_cluster * ctx->bytes_per_sector;
+
+    return DeviceRead(ctx->device_fd, offset, buf, size);
+}
+
+static U32 FsckFat32GetFatEntry(CFsckFat32Context *ctx, U32 cluster)
+{
+    if (cluster >= ctx->total_clusters + 2)
+        return FAT32_BAD;
+
+    return ctx->fat1[cluster] & 0x0FFFFFFF;  // Mask off high 4 bits
+}
+
+static Bool FsckFat32IsEOC(U32 entry)
+{
+    return (entry >= 0x0FFFFFF8);
+}
+
+static Bool FsckFat32IsFree(U32 entry)
+{
+    return (entry == 0);
+}
+
+static Bool FsckFat32IsBad(U32 entry)
+{
+    return (entry == FAT32_BAD);
+}
+
+// ============================================================================
+// CHAIN VALIDATION
+// ============================================================================
+
+static I64 FsckFat32ValidateChain(CFsckFat32Context *ctx, U32 start_cluster,
+                                   U64 expected_size, Bool is_dir, U8 *name)
+{
+    I64 errors = 0;
+    U32 cluster = start_cluster;
+    U64 chain_length = 0;
+    U32 cluster_size = ctx->sectors_per_cluster * ctx->bytes_per_sector;
+
+    if (start_cluster == 0) {
+        // Empty file/dir is valid
+        if (expected_size != 0 && !is_dir) {
+            errors++;
+            if (ctx->flags & FSCK_VERBOSE) {
+                "  ERROR: %s has size %lld but no cluster chain\n", name, expected_size;
+            }
+        }
+        return errors;
+    }
+
+    // Follow the chain
+    while (!FsckFat32IsEOC(cluster) && !FsckFat32IsFree(cluster) && !FsckFat32IsBad(cluster)) {
+        if (cluster < 2 || cluster >= ctx->total_clusters + 2) {
+            errors++;
+            if (ctx->flags & FSCK_VERBOSE) {
+                "  ERROR: %s has invalid cluster %d in chain\n", name, cluster;
+            }
+            break;
+        }
+
+        // Check for cross-links
+        if (ctx->cluster_refs[cluster] > 0) {
+            errors++;
+            if (ctx->flags & FSCK_VERBOSE) {
+                "  ERROR: %s cluster %d is cross-linked\n", name, cluster;
+            }
+            break;
+        }
+
+        ctx->cluster_used[cluster] = 1;
+        ctx->cluster_refs[cluster]++;
+        chain_length++;
+
+        // Prevent infinite loops
+        if (chain_length > ctx->total_clusters) {
+            errors++;
+            if (ctx->flags & FSCK_VERBOSE) {
+                "  ERROR: %s has circular cluster chain\n", name;
+            }
+            break;
+        }
+
+        cluster = FsckFat32GetFatEntry(ctx, cluster);
+    }
+
+    // Validate chain length against file size
+    if (!is_dir && expected_size > 0) {
+        U64 expected_clusters = (expected_size + cluster_size - 1) / cluster_size;
+        if (chain_length != expected_clusters) {
+            errors++;
+            if (ctx->flags & FSCK_VERBOSE) {
+                "  WARNING: %s size mismatch (size=%lld, clusters=%d, expected=%d)\n",
+                    name, expected_size, chain_length, expected_clusters;
+            }
+        }
+    }
+
+    return errors;
+}
+
+// ============================================================================
+// DIRECTORY CHECKING
+// ============================================================================
+
+// Directory entry structure (same as MkfsFat32.ZC)
+class CFsckFat32DirEntry {
+    U8      name[11];
+    U8      attr;
+    U8      nt_reserved;
+    U8      create_time_tenth;
+    U16     create_time;
+    U16     create_date;
+    U16     access_date;
+    U16     first_cluster_hi;
+    U16     modify_time;
+    U16     modify_date;
+    U16     first_cluster_lo;
+    U32     file_size;
+};
+
+static I64 FsckFat32CheckDirectory(CFsckFat32Context *ctx, U32 dir_cluster,
+                                    U32 parent_cluster, U8 *path)
+{
+    I64 errors = 0;
+    U32 cluster_size = ctx->sectors_per_cluster * ctx->bytes_per_sector;
+    U8 *cluster_buf = MAlloc(cluster_size);
+    U32 cluster = dir_cluster;
+    Bool found_dot = FALSE;
+    Bool found_dotdot = FALSE;
+    Bool is_root = (dir_cluster == ctx->root_cluster);
+
+    ctx->dirs_checked++;
+
+    // Process each cluster in directory
+    while (!FsckFat32IsEOC(cluster) && cluster >= 2 && cluster < ctx->total_clusters + 2) {
+        if (FsckFat32ReadCluster(ctx, cluster, cluster_buf) < 0) {
+            errors++;
+            if (ctx->flags & FSCK_VERBOSE) {
+                "  ERROR: Cannot read directory cluster %d\n", cluster;
+            }
+            break;
+        }
+
+        // Process directory entries
+        I64 entries_per_cluster = cluster_size / sizeof(CFsckFat32DirEntry);
+        CFsckFat32DirEntry *entries = cluster_buf;
+
+        I64 i;
+        for (i = 0; i < entries_per_cluster; i++) {
+            CFsckFat32DirEntry *de = &entries[i];
+
+            // End of directory marker
+            if (de->name[0] == 0x00)
+                break;
+
+            // Deleted entry
+            if (de->name[0] == 0xE5)
+                continue;
+
+            // Long filename entry
+            if ((de->attr & FAT32_ATTR_LONG_NAME) == FAT32_ATTR_LONG_NAME)
+                continue;
+
+            // Build name for reporting
+            U8 name[13];
+            I64 j, k = 0;
+
+            // Copy base name
+            for (j = 0; j < 8 && de->name[j] != ' '; j++) {
+                name[k++] = de->name[j];
+            }
+
+            // Add extension if present
+            if (de->name[8] != ' ') {
+                name[k++] = '.';
+                for (j = 8; j < 11 && de->name[j] != ' '; j++) {
+                    name[k++] = de->name[j];
+                }
+            }
+            name[k] = 0;
+
+            // Check "." entry
+            if (de->name[0] == '.' && de->name[1] == ' ') {
+                found_dot = TRUE;
+                U32 dot_cluster = de->first_cluster_lo | (de->first_cluster_hi(U32) << 16);
+                if (dot_cluster != dir_cluster) {
+                    errors++;
+                    if (ctx->flags & FSCK_VERBOSE) {
+                        "  ERROR: '.' entry in %s points to %d (expected %d)\n",
+                            path, dot_cluster, dir_cluster;
+                    }
+                }
+                continue;
+            }
+
+            // Check ".." entry
+            if (de->name[0] == '.' && de->name[1] == '.' && de->name[2] == ' ') {
+                found_dotdot = TRUE;
+                U32 dotdot_cluster = de->first_cluster_lo | (de->first_cluster_hi(U32) << 16);
+
+                // Root's parent should be 0 or root itself
+                if (is_root) {
+                    if (dotdot_cluster != 0 && dotdot_cluster != ctx->root_cluster) {
+                        errors++;
+                        if (ctx->flags & FSCK_VERBOSE) {
+                            "  ERROR: '..' in root points to %d\n", dotdot_cluster;
+                        }
+                    }
+                } else if (dotdot_cluster != parent_cluster) {
+                    // For subdirs, parent_cluster of 0 means parent is root
+                    if (!(parent_cluster == ctx->root_cluster && dotdot_cluster == 0)) {
+                        errors++;
+                        if (ctx->flags & FSCK_VERBOSE) {
+                            "  ERROR: '..' in %s points to %d (expected %d)\n",
+                                path, dotdot_cluster, parent_cluster;
+                        }
+                    }
+                }
+                continue;
+            }
+
+            // Regular entry
+            U32 entry_cluster = de->first_cluster_lo | (de->first_cluster_hi(U32) << 16);
+
+            // Validate cluster chain
+            errors += FsckFat32ValidateChain(ctx, entry_cluster, de->file_size,
+                                             (de->attr & FAT32_ATTR_DIRECTORY), name);
+
+            ctx->files_checked++;
+
+            // Recurse into subdirectories
+            if (de->attr & FAT32_ATTR_DIRECTORY) {
+                U8 subpath[256];
+                snprintf(subpath, 256, "%s/%s", path, name);
+                errors += FsckFat32CheckDirectory(ctx, entry_cluster, dir_cluster, subpath);
+            }
+        }
+
+        // Move to next cluster
+        cluster = FsckFat32GetFatEntry(ctx, cluster);
+    }
+
+    // Verify . and .. exist (except root which may not have them)
+    if (!is_root) {
+        if (!found_dot) {
+            errors++;
+            if (ctx->flags & FSCK_VERBOSE) {
+                "  ERROR: Missing '.' entry in %s\n", path;
+            }
+        }
+        if (!found_dotdot) {
+            errors++;
+            if (ctx->flags & FSCK_VERBOSE) {
+                "  ERROR: Missing '..' entry in %s\n", path;
+            }
+        }
+    }
+
+    Free(cluster_buf);
+    return errors;
+}
+
+// ============================================================================
+// MAIN FSCK FUNCTION
+// ============================================================================
+
+I64 FsckFat32(U8 *device, U32 flags)
+{
+    CFsckFat32Context ctx;
+    MemSet(&ctx, 0, sizeof(CFsckFat32Context));
+
+    ctx.device_path = device;
+    ctx.flags = flags;
+
+    "Checking %s...\n", device;
+
+    // Open device
+    I64 open_flags = (flags & FSCK_READONLY) ? O_RDONLY : O_RDWR;
+    ctx.device_fd = PosixOpen(device, open_flags, 0);
+    if (ctx.device_fd < 0) {
+        "fsck.fat32: Cannot open %s\n", device;
+        return FSCK_OPERATIONAL;
+    }
+
+    // Read boot sector
+    U8 boot_buf[512];
+    if (DeviceRead(ctx.device_fd, 0, boot_buf, 512) < 0) {
+        "fsck.fat32: Cannot read boot sector\n";
+        PosixClose(ctx.device_fd);
+        return FSCK_OPERATIONAL;
+    }
+
+    // Parse boot sector
+    U16 *sig = boot_buf + 510;
+    if (*sig != FAT32_BOOT_SIGNATURE) {
+        "fsck.fat32: Invalid boot signature 0x%04x\n", *sig;
+        PosixClose(ctx.device_fd);
+        return FSCK_OPERATIONAL;
+    }
+
+    // Extract BPB values
+    ctx.bytes_per_sector = *(boot_buf + 11)(U16*);
+    ctx.sectors_per_cluster = boot_buf[13];
+    ctx.reserved_sectors = *(boot_buf + 14)(U16*);
+    ctx.num_fats = boot_buf[16];
+    ctx.fat_size = *(boot_buf + 36)(U32*);
+    ctx.root_cluster = *(boot_buf + 44)(U32*);
+    ctx.total_sectors = *(boot_buf + 32)(U32*);
+
+    // Calculate derived values
+    ctx.data_start = ctx.reserved_sectors + (ctx.num_fats * ctx.fat_size);
+    U64 data_sectors = ctx.total_sectors - ctx.data_start;
+    ctx.total_clusters = data_sectors / ctx.sectors_per_cluster;
+
+    // Verify this is FAT32 (not FAT12/16)
+    if (ctx.total_clusters < 65525) {
+        "fsck.fat32: Not a FAT32 filesystem (only %d clusters)\n", ctx.total_clusters;
+        PosixClose(ctx.device_fd);
+        return FSCK_OPERATIONAL;
+    }
+
+    "Filesystem: FAT32\n";
+    "Bytes per sector: %d\n", ctx.bytes_per_sector;
+    "Sectors per cluster: %d\n", ctx.sectors_per_cluster;
+    "Total clusters: %d\n", ctx.total_clusters;
+    "Root cluster: %d\n", ctx.root_cluster;
+
+    // Read FAT tables
+    "Reading FAT tables...\n";
+
+    I64 fat_bytes = ctx.fat_size * ctx.bytes_per_sector;
+    ctx.fat1 = MAlloc(fat_bytes);
+    ctx.fat2 = MAlloc(fat_bytes);
+
+    U64 fat1_offset = ctx.reserved_sectors * ctx.bytes_per_sector;
+    U64 fat2_offset = (ctx.reserved_sectors + ctx.fat_size) * ctx.bytes_per_sector;
+
+    if (DeviceRead(ctx.device_fd, fat1_offset, ctx.fat1, fat_bytes) < 0) {
+        "fsck.fat32: Cannot read FAT1\n";
+        Free(ctx.fat1);
+        Free(ctx.fat2);
+        PosixClose(ctx.device_fd);
+        return FSCK_OPERATIONAL;
+    }
+
+    if (DeviceRead(ctx.device_fd, fat2_offset, ctx.fat2, fat_bytes) < 0) {
+        "fsck.fat32: Cannot read FAT2\n";
+        Free(ctx.fat1);
+        Free(ctx.fat2);
+        PosixClose(ctx.device_fd);
+        return FSCK_OPERATIONAL;
+    }
+
+    // Pass 1: Compare FAT tables
+    "Pass 1: Comparing FAT tables...\n";
+
+    I64 fat_differences = 0;
+    I64 i;
+    for (i = 0; i < ctx.total_clusters + 2; i++) {
+        if ((ctx.fat1[i] & 0x0FFFFFFF) != (ctx.fat2[i] & 0x0FFFFFFF)) {
+            fat_differences++;
+            if (flags & FSCK_VERBOSE && fat_differences <= 10) {
+                "  FAT mismatch at cluster %d: FAT1=%08x FAT2=%08x\n",
+                    i, ctx.fat1[i], ctx.fat2[i];
+            }
+        }
+    }
+
+    if (fat_differences > 0) {
+        ctx.errors_found += fat_differences;
+        "  %lld FAT differences found\n", fat_differences;
+    } else {
+        "  FAT tables match\n";
+    }
+
+    // Allocate cluster tracking
+    ctx.cluster_used = MAlloc(ctx.total_clusters + 2);
+    ctx.cluster_refs = MAlloc((ctx.total_clusters + 2) * sizeof(U32));
+    MemSet(ctx.cluster_used, 0, ctx.total_clusters + 2);
+    MemSet(ctx.cluster_refs, 0, (ctx.total_clusters + 2) * sizeof(U32));
+
+    // Pass 2: Check directory structure
+    "Pass 2: Checking directory structure...\n";
+
+    ctx.errors_found += FsckFat32CheckDirectory(&ctx, ctx.root_cluster, 0, "/");
+
+    "  %lld directories, %lld files checked\n", ctx.dirs_checked, ctx.files_checked;
+
+    // Pass 3: Check for lost clusters
+    "Pass 3: Checking for lost clusters...\n";
+
+    I64 lost_clusters = 0;
+    I64 free_clusters = 0;
+    I64 bad_clusters = 0;
+
+    for (i = 2; i < ctx.total_clusters + 2; i++) {
+        U32 entry = ctx.fat1[i] & 0x0FFFFFFF;
+
+        if (FsckFat32IsFree(entry)) {
+            free_clusters++;
+        } else if (FsckFat32IsBad(entry)) {
+            bad_clusters++;
+        } else if (!ctx.cluster_used[i]) {
+            // Cluster is allocated in FAT but not reachable from any file
+            lost_clusters++;
+            if (flags & FSCK_VERBOSE && lost_clusters <= 10) {
+                "  Lost cluster %d (value %08x)\n", i, entry;
+            }
+        }
+    }
+
+    if (lost_clusters > 0) {
+        ctx.errors_found += lost_clusters;
+        "  %lld lost clusters found\n", lost_clusters;
+    }
+
+    // Summary
+    "\n";
+    if (ctx.errors_found == 0) {
+        "%s: clean\n", device;
+    } else {
+        "%s: %lld errors found\n", device, ctx.errors_found;
+    }
+
+    "\n";
+    "  %lld files\n", ctx.files_checked;
+    "  %lld directories\n", ctx.dirs_checked;
+    "  %lld free clusters\n", free_clusters;
+    "  %lld bad clusters\n", bad_clusters;
+    if (lost_clusters > 0) {
+        "  %lld lost clusters\n", lost_clusters;
+    }
+
+    // Clean up
+    Free(ctx.fat1);
+    Free(ctx.fat2);
+    Free(ctx.cluster_used);
+    Free(ctx.cluster_refs);
+    PosixClose(ctx.device_fd);
+
+    if (ctx.errors_found == 0)
+        return FSCK_OK;
+    else if (ctx.errors_fixed == ctx.errors_found)
+        return FSCK_CORRECTED;
+    else
+        return FSCK_ERRORS;
+}
+
+// ============================================================================
+// COMMAND LINE INTERFACE
+// ============================================================================
+
+U0 FsckFat32Help()
+{
+    "Usage: FsckFat32(device, flags)\n";
+    "\n";
+    "Check a FAT32 filesystem for errors.\n";
+    "\n";
+    "Flags:\n";
+    "  FSCK_READONLY     - Don't modify filesystem\n";
+    "  FSCK_VERBOSE      - Verbose output\n";
+    "  FSCK_FORCE        - Force check\n";
+    "\n";
+    "Return values:\n";
+    "  FSCK_OK           (0)  - No errors\n";
+    "  FSCK_CORRECTED    (1)  - Errors corrected\n";
+    "  FSCK_ERRORS       (4)  - Uncorrected errors\n";
+    "  FSCK_OPERATIONAL  (8)  - Operational error\n";
+    "\n";
+    "Examples:\n";
+    "  FsckFat32(\"/dev/sda1\", FSCK_READONLY | FSCK_VERBOSE);\n";
+}
