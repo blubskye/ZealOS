@@ -1,0 +1,676 @@
+// wget.ZC - Native wget implementation for ZealOS
+// Part of the POSIX compatibility layer
+//
+// Uses the native HTTP/TLS stack for downloading files.
+
+// ============================================================================
+// WGET OPTIONS
+// ============================================================================
+
+#define WGET_DEFAULT_TIMEOUT  30000  // 30 seconds
+#define WGET_MAX_REDIRECTS    10
+
+class CWgetOptions {
+    U8 *output_file;       // -O, --output-document
+    Bool quiet;            // -q, --quiet
+    Bool verbose;          // -v, --verbose (default)
+    Bool continue_dl;      // -c, --continue
+    Bool no_clobber;       // -nc, --no-clobber
+    Bool show_progress;    // Progress bar (default for TTY)
+    Bool server_response;  // -S, --server-response
+    I64 timeout;           // -T, --timeout
+    I64 tries;             // -t, --tries
+    I64 max_redirect;      // --max-redirect
+    U8 *user_agent;        // -U, --user-agent
+    U8 *referer;           // --referer
+    Bool no_check_cert;    // --no-check-certificate
+    Bool spider;           // --spider (check only, don't download)
+    U8 **headers;          // --header
+    I64 header_count;
+};
+
+// ============================================================================
+// PROGRESS BAR
+// ============================================================================
+
+U0 WgetPrintProgress(I64 downloaded, I64 total, I64 start_time)
+{
+    I64 now = GetTickCount();
+    I64 elapsed = (now - start_time) / 1000;  // seconds
+    I64 speed = elapsed > 0 ? downloaded / elapsed : 0;
+
+    // Calculate percentage
+    I64 percent = 0;
+    if (total > 0) {
+        percent = (downloaded * 100) / total;
+        if (percent > 100) percent = 100;
+    }
+
+    // Build progress bar
+    U8 bar[52];
+    I64 filled = (percent * 50) / 100;
+    I64 i;
+    bar[0] = '[';
+    for (i = 1; i <= 50; i++) {
+        if (i <= filled) {
+            bar[i] = '=';
+        } else if (i == filled + 1) {
+            bar[i] = '>';
+        } else {
+            bar[i] = ' ';
+        }
+    }
+    bar[51] = ']';
+
+    // Format size
+    U8 dl_str[32], total_str[32], speed_str[32];
+
+    if (downloaded >= 1048576) {
+        StrPrint(dl_str, "%.1fM", downloaded / 1048576.0);
+    } else if (downloaded >= 1024) {
+        StrPrint(dl_str, "%.1fK", downloaded / 1024.0);
+    } else {
+        StrPrint(dl_str, "%d", downloaded);
+    }
+
+    if (total > 0) {
+        if (total >= 1048576) {
+            StrPrint(total_str, "%.1fM", total / 1048576.0);
+        } else if (total >= 1024) {
+            StrPrint(total_str, "%.1fK", total / 1024.0);
+        } else {
+            StrPrint(total_str, "%d", total);
+        }
+    } else {
+        StrCpy(total_str, "?");
+    }
+
+    if (speed >= 1048576) {
+        StrPrint(speed_str, "%.1fMB/s", speed / 1048576.0);
+    } else if (speed >= 1024) {
+        StrPrint(speed_str, "%.1fKB/s", speed / 1024.0);
+    } else {
+        StrPrint(speed_str, "%dB/s", speed);
+    }
+
+    // Calculate ETA
+    U8 eta_str[32];
+    if (total > 0 && speed > 0) {
+        I64 remaining = (total - downloaded) / speed;
+        if (remaining >= 3600) {
+            StrPrint(eta_str, "%dh%dm", remaining / 3600, (remaining % 3600) / 60);
+        } else if (remaining >= 60) {
+            StrPrint(eta_str, "%dm%ds", remaining / 60, remaining % 60);
+        } else {
+            StrPrint(eta_str, "%ds", remaining);
+        }
+    } else {
+        StrCpy(eta_str, "--:--");
+    }
+
+    // Print progress (overwrite line)
+    "\r%3d%% %.51s %s/%s %s eta %s   ", percent, bar, dl_str, total_str, speed_str, eta_str;
+}
+
+// ============================================================================
+// URL FILENAME EXTRACTION
+// ============================================================================
+
+// Extract filename from URL
+U8 *WgetGetFilename(U8 *url)
+{
+    U8 *p = url;
+    U8 *last_slash = NULL;
+    U8 *query_start = NULL;
+
+    // Skip scheme
+    if (StrNICmp(p, "http://", 7) == 0) {
+        p += 7;
+    } else if (StrNICmp(p, "https://", 8) == 0) {
+        p += 8;
+    }
+
+    // Find last slash before query string
+    while (*p) {
+        if (*p == '/') {
+            last_slash = p;
+        } else if (*p == '?') {
+            query_start = p;
+            break;
+        }
+        p++;
+    }
+
+    // Get filename part
+    U8 *filename_start;
+    if (last_slash) {
+        filename_start = last_slash + 1;
+    } else {
+        // No path, use index.html
+        return StrNew("index.html");
+    }
+
+    // Calculate length (until query string or end)
+    I64 filename_len;
+    if (query_start) {
+        filename_len = query_start - filename_start;
+    } else {
+        filename_len = StrLen(filename_start);
+    }
+
+    // Empty filename means it ended with /
+    if (filename_len == 0) {
+        return StrNew("index.html");
+    }
+
+    // Copy filename
+    U8 *filename = MAlloc(filename_len + 1);
+    MemCpy(filename, filename_start, filename_len);
+    filename[filename_len] = 0;
+
+    return filename;
+}
+
+// ============================================================================
+// MAIN WGET FUNCTION
+// ============================================================================
+
+I64 WgetDownload(U8 *url, CWgetOptions *opts)
+{
+    CHTTPClient *client = NULL;
+    CHTTPRequest *req = NULL;
+    CHTTPResponse *resp = NULL;
+    I64 result = 0;
+    I64 redirects = 0;
+    U8 *current_url = StrNew(url);
+    U8 *output_filename = NULL;
+    FILE *output_file = NULL;
+    I64 start_time = GetTickCount();
+
+    // Determine output filename
+    if (opts->output_file) {
+        if (StrCmp(opts->output_file, "-") == 0) {
+            // Output to stdout - handled differently
+            output_filename = NULL;
+        } else {
+            output_filename = StrNew(opts->output_file);
+        }
+    } else {
+        output_filename = WgetGetFilename(url);
+    }
+
+    // Check no-clobber
+    if (output_filename && opts->no_clobber) {
+        if (FileFind(output_filename)) {
+            if (!opts->quiet) {
+                fprintf(stderr, "File '%s' already there; not retrieving.\n", output_filename);
+            }
+            Free(output_filename);
+            Free(current_url);
+            return 0;
+        }
+    }
+
+    // Create HTTP client
+    client = HTTPClientNew();
+    if (opts->timeout > 0) {
+        client->timeout = opts->timeout;
+    }
+
+    // Follow redirects loop
+    while (redirects < opts->max_redirect) {
+        if (!opts->quiet) {
+            "--[%d] %s\n", GetTickCount() / 1000, current_url;
+        }
+
+        // Create request
+        req = HTTPRequestNew(HTTP_METHOD_GET, current_url);
+        if (!req) {
+            if (!opts->quiet) {
+                fprintf(stderr, "wget: invalid URL '%s'\n", current_url);
+            }
+            result = -1;
+            break;
+        }
+
+        // Add custom user agent
+        if (opts->user_agent) {
+            HTTPRequestAddHeader(req, "User-Agent", opts->user_agent);
+        } else {
+            HTTPRequestAddHeader(req, "User-Agent", "ZealOS-wget/1.0");
+        }
+
+        // Add referer
+        if (opts->referer) {
+            HTTPRequestAddHeader(req, "Referer", opts->referer);
+        }
+
+        // Add custom headers
+        I64 i;
+        for (i = 0; i < opts->header_count; i++) {
+            // Parse header string (Name: Value)
+            U8 *colon = StrStr(opts->headers[i], ":");
+            if (colon) {
+                U8 *name = MAlloc(colon - opts->headers[i] + 1);
+                MemCpy(name, opts->headers[i], colon - opts->headers[i]);
+                name[colon - opts->headers[i]] = 0;
+
+                U8 *value = colon + 1;
+                while (*value == ' ') value++;
+
+                HTTPRequestAddHeader(req, name, value);
+                Free(name);
+            }
+        }
+
+        // Make request
+        if (!opts->quiet) {
+            "Connecting to %s:%d... ", req->host, req->port;
+        }
+
+        resp = HTTPRequest(client, req);
+
+        if (!resp) {
+            if (!opts->quiet) {
+                "failed.\n";
+                fprintf(stderr, "wget: unable to connect to %s\n", req->host);
+            }
+            HTTPRequestFree(req);
+            result = -1;
+            break;
+        }
+
+        if (!opts->quiet) {
+            "connected.\n";
+            "HTTP request sent, awaiting response... %d %s\n",
+                resp->status_code, resp->status_text;
+        }
+
+        // Print server response if requested
+        if (opts->server_response) {
+            "  HTTP/1.1 %d %s\n", resp->status_code, resp->status_text;
+            for (i = 0; i < resp->header_count; i++) {
+                "  %s: %s\n", resp->headers[i].name, resp->headers[i].value;
+            }
+        }
+
+        // Handle redirects
+        if (resp->status_code >= 300 && resp->status_code < 400) {
+            U8 *location = HTTPResponseGetHeader(resp, "Location");
+            if (location) {
+                if (!opts->quiet) {
+                    "Location: %s [following]\n", location;
+                }
+
+                // Build new URL (handle relative URLs)
+                U8 *new_url;
+                if (StrNICmp(location, "http://", 7) == 0 ||
+                    StrNICmp(location, "https://", 8) == 0) {
+                    // Absolute URL
+                    new_url = StrNew(location);
+                } else if (location[0] == '/') {
+                    // Relative to host
+                    I64 scheme_len = req->use_tls ? 8 : 7;  // https:// or http://
+                    I64 url_len = scheme_len + StrLen(req->host) +
+                                  (req->port != (req->use_tls ? 443 : 80) ? 6 : 0) +
+                                  StrLen(location);
+                    new_url = MAlloc(url_len + 1);
+                    if (req->port != (req->use_tls ? 443 : 80)) {
+                        StrPrint(new_url, "%s%s:%d%s",
+                                req->use_tls ? "https://" : "http://",
+                                req->host, req->port, location);
+                    } else {
+                        StrPrint(new_url, "%s%s%s",
+                                req->use_tls ? "https://" : "http://",
+                                req->host, location);
+                    }
+                } else {
+                    // Relative to current path - simplified handling
+                    new_url = StrNew(location);
+                }
+
+                Free(current_url);
+                current_url = new_url;
+
+                HTTPResponseFree(resp);
+                HTTPRequestFree(req);
+                resp = NULL;
+                req = NULL;
+                redirects++;
+                continue;
+            }
+        }
+
+        // Handle errors
+        if (resp->status_code >= 400) {
+            if (!opts->quiet) {
+                fprintf(stderr, "wget: server returned %d %s\n",
+                       resp->status_code, resp->status_text);
+            }
+            result = -1;
+            HTTPResponseFree(resp);
+            HTTPRequestFree(req);
+            break;
+        }
+
+        // Spider mode - just check, don't download
+        if (opts->spider) {
+            if (!opts->quiet) {
+                "Remote file exists.\n";
+            }
+            HTTPResponseFree(resp);
+            HTTPRequestFree(req);
+            result = 0;
+            break;
+        }
+
+        // Get content length
+        I64 content_length = resp->content_length;
+        if (!opts->quiet) {
+            if (content_length > 0) {
+                U8 size_str[32];
+                if (content_length >= 1048576) {
+                    StrPrint(size_str, "%.1fM", content_length / 1048576.0);
+                } else if (content_length >= 1024) {
+                    StrPrint(size_str, "%.1fK", content_length / 1024.0);
+                } else {
+                    StrPrint(size_str, "%d", content_length);
+                }
+                "Length: %d (%s)", content_length, size_str;
+
+                U8 *content_type = HTTPResponseGetHeader(resp, "Content-Type");
+                if (content_type) {
+                    " [%s]", content_type;
+                }
+                "\n";
+            } else {
+                "Length: unspecified";
+                U8 *content_type = HTTPResponseGetHeader(resp, "Content-Type");
+                if (content_type) {
+                    " [%s]", content_type;
+                }
+                "\n";
+            }
+
+            if (output_filename) {
+                "Saving to: '%s'\n\n", output_filename;
+            } else {
+                "Saving to: STDOUT\n\n";
+            }
+        }
+
+        // Write body to file
+        if (output_filename) {
+            output_file = fopen(output_filename, "wb");
+            if (!output_file) {
+                if (!opts->quiet) {
+                    fprintf(stderr, "wget: cannot open '%s' for writing\n", output_filename);
+                }
+                result = -1;
+            } else {
+                // Write downloaded content
+                if (resp->body && resp->body_length > 0) {
+                    fwrite(resp->body, 1, resp->body_length, output_file);
+
+                    // Show final progress
+                    if (opts->show_progress && !opts->quiet) {
+                        WgetPrintProgress(resp->body_length, content_length, start_time);
+                        "\n\n";
+                    }
+                }
+                fclose(output_file);
+
+                if (!opts->quiet) {
+                    I64 end_time = GetTickCount();
+                    I64 elapsed_ms = end_time - start_time;
+                    F64 elapsed_sec = elapsed_ms / 1000.0;
+
+                    U8 time_str[32];
+                    if (elapsed_sec >= 60) {
+                        StrPrint(time_str, "%dm %.1fs", (I64)(elapsed_sec / 60),
+                                elapsed_sec - ((I64)(elapsed_sec / 60)) * 60);
+                    } else {
+                        StrPrint(time_str, "%.2fs", elapsed_sec);
+                    }
+
+                    U8 size_str[32];
+                    I64 size = resp->body_length;
+                    if (size >= 1048576) {
+                        StrPrint(size_str, "%.1fM", size / 1048576.0);
+                    } else if (size >= 1024) {
+                        StrPrint(size_str, "%.1fK", size / 1024.0);
+                    } else {
+                        StrPrint(size_str, "%d", size);
+                    }
+
+                    F64 speed = elapsed_sec > 0 ? size / elapsed_sec : 0;
+                    U8 speed_str[32];
+                    if (speed >= 1048576) {
+                        StrPrint(speed_str, "%.1f MB/s", speed / 1048576.0);
+                    } else if (speed >= 1024) {
+                        StrPrint(speed_str, "%.1f KB/s", speed / 1024.0);
+                    } else {
+                        StrPrint(speed_str, "%.0f B/s", speed);
+                    }
+
+                    "'%s' saved [%d/%d] in %s (%s)\n",
+                        output_filename, resp->body_length,
+                        content_length > 0 ? content_length : resp->body_length,
+                        time_str, speed_str;
+                }
+            }
+        } else {
+            // Output to stdout
+            if (resp->body && resp->body_length > 0) {
+                fwrite(resp->body, 1, resp->body_length, stdout);
+            }
+        }
+
+        HTTPResponseFree(resp);
+        HTTPRequestFree(req);
+        break;
+    }
+
+    // Check redirect limit
+    if (redirects >= opts->max_redirect) {
+        if (!opts->quiet) {
+            fprintf(stderr, "wget: maximum redirects (%d) exceeded\n", opts->max_redirect);
+        }
+        result = -1;
+    }
+
+    // Cleanup
+    HTTPClientFree(client);
+    if (output_filename) Free(output_filename);
+    Free(current_url);
+
+    return result;
+}
+
+// ============================================================================
+// HELP
+// ============================================================================
+
+U0 WgetPrintHelp()
+{
+    "ZealOS wget - HTTP/HTTPS file retrieval\n\n";
+    "Usage: wget [OPTIONS]... [URL]...\n\n";
+    "Download:\n";
+    "  -O, --output-document=FILE   write documents to FILE\n";
+    "  -c, --continue               resume partially-downloaded file\n";
+    "  -nc, --no-clobber           skip downloads that would overwrite\n";
+    "  --spider                     don't download, just check if exists\n\n";
+    "Output:\n";
+    "  -q, --quiet                  quiet (no output)\n";
+    "  -v, --verbose               verbose (default)\n";
+    "  -S, --server-response       print server response headers\n\n";
+    "Connection:\n";
+    "  -T, --timeout=SECONDS       set all timeout values to SECONDS\n";
+    "  -t, --tries=NUMBER          set retry count (0 = unlimited)\n";
+    "  --max-redirect=NUMBER       max redirects (default 10)\n\n";
+    "HTTP:\n";
+    "  -U, --user-agent=AGENT      use AGENT as User-Agent header\n";
+    "  --referer=URL               set Referer header\n";
+    "  --header=STRING             add custom header\n";
+    "  --no-check-certificate      don't validate server certificates\n\n";
+    "Examples:\n";
+    "  wget https://example.com/file.zip\n";
+    "  wget -O output.html https://example.com/page\n";
+    "  wget -q --spider https://example.com/check\n";
+}
+
+U0 WgetPrintVersion()
+{
+    "ZealOS wget 1.0\n";
+    "Built with native TLS/HTTP stack\n";
+    "Supports HTTP/1.1 and HTTPS (TLS 1.3)\n";
+}
+
+// ============================================================================
+// MAIN ENTRY POINT
+// ============================================================================
+
+I64 wget_main(I64 argc, U8 **argv)
+{
+    CWgetOptions opts;
+    MemSet(&opts, 0, sizeof(CWgetOptions));
+
+    // Defaults
+    opts.verbose = TRUE;
+    opts.show_progress = TRUE;
+    opts.timeout = WGET_DEFAULT_TIMEOUT;
+    opts.tries = 3;
+    opts.max_redirect = WGET_MAX_REDIRECTS;
+    opts.headers = MAlloc(64 * sizeof(U8*));
+
+    // Parse arguments
+    U8 **urls = MAlloc(argc * sizeof(U8*));
+    I64 url_count = 0;
+
+    I64 i;
+    for (i = 1; i < argc; i++) {
+        U8 *arg = argv[i];
+
+        if (arg[0] == '-') {
+            // Option
+            if (StrCmp(arg, "-h") == 0 || StrCmp(arg, "--help") == 0) {
+                WgetPrintHelp();
+                Free(urls);
+                Free(opts.headers);
+                return 0;
+            } else if (StrCmp(arg, "-V") == 0 || StrCmp(arg, "--version") == 0) {
+                WgetPrintVersion();
+                Free(urls);
+                Free(opts.headers);
+                return 0;
+            } else if (StrCmp(arg, "-q") == 0 || StrCmp(arg, "--quiet") == 0) {
+                opts.quiet = TRUE;
+                opts.verbose = FALSE;
+                opts.show_progress = FALSE;
+            } else if (StrCmp(arg, "-v") == 0 || StrCmp(arg, "--verbose") == 0) {
+                opts.verbose = TRUE;
+            } else if (StrCmp(arg, "-S") == 0 || StrCmp(arg, "--server-response") == 0) {
+                opts.server_response = TRUE;
+            } else if (StrCmp(arg, "-c") == 0 || StrCmp(arg, "--continue") == 0) {
+                opts.continue_dl = TRUE;
+            } else if (StrCmp(arg, "-nc") == 0 || StrCmp(arg, "--no-clobber") == 0) {
+                opts.no_clobber = TRUE;
+            } else if (StrCmp(arg, "--spider") == 0) {
+                opts.spider = TRUE;
+            } else if (StrCmp(arg, "--no-check-certificate") == 0) {
+                opts.no_check_cert = TRUE;
+            } else if (StrCmp(arg, "-O") == 0 || StrNICmp(arg, "--output-document", 17) == 0) {
+                if (arg[2] == 0 && i + 1 < argc) {
+                    opts.output_file = argv[++i];
+                } else if (arg[17] == '=') {
+                    opts.output_file = &arg[18];
+                }
+            } else if (StrCmp(arg, "-U") == 0 || StrNICmp(arg, "--user-agent", 12) == 0) {
+                if (arg[2] == 0 && i + 1 < argc) {
+                    opts.user_agent = argv[++i];
+                } else if (arg[12] == '=') {
+                    opts.user_agent = &arg[13];
+                }
+            } else if (StrNICmp(arg, "--referer", 9) == 0) {
+                if (arg[9] == '=') {
+                    opts.referer = &arg[10];
+                }
+            } else if (StrCmp(arg, "-T") == 0 || StrNICmp(arg, "--timeout", 9) == 0) {
+                U8 *val = NULL;
+                if (arg[2] == 0 && i + 1 < argc) {
+                    val = argv[++i];
+                } else if (arg[9] == '=') {
+                    val = &arg[10];
+                }
+                if (val) {
+                    opts.timeout = Str2I64(val) * 1000;
+                }
+            } else if (StrCmp(arg, "-t") == 0 || StrNICmp(arg, "--tries", 7) == 0) {
+                U8 *val = NULL;
+                if (arg[2] == 0 && i + 1 < argc) {
+                    val = argv[++i];
+                } else if (arg[7] == '=') {
+                    val = &arg[8];
+                }
+                if (val) {
+                    opts.tries = Str2I64(val);
+                }
+            } else if (StrNICmp(arg, "--max-redirect", 14) == 0) {
+                if (arg[14] == '=') {
+                    opts.max_redirect = Str2I64(&arg[15]);
+                }
+            } else if (StrNICmp(arg, "--header", 8) == 0) {
+                if (arg[8] == '=' && opts.header_count < 64) {
+                    opts.headers[opts.header_count++] = &arg[9];
+                }
+            } else {
+                fprintf(stderr, "wget: unrecognized option '%s'\n", arg);
+                fprintf(stderr, "Try 'wget --help' for more information.\n");
+                Free(urls);
+                Free(opts.headers);
+                return 1;
+            }
+        } else {
+            // URL
+            urls[url_count++] = arg;
+        }
+    }
+
+    // Check for URLs
+    if (url_count == 0) {
+        fprintf(stderr, "wget: missing URL\n");
+        fprintf(stderr, "Usage: wget [OPTIONS]... [URL]...\n");
+        fprintf(stderr, "Try 'wget --help' for more information.\n");
+        Free(urls);
+        Free(opts.headers);
+        return 1;
+    }
+
+    // Download each URL
+    I64 result = 0;
+    for (i = 0; i < url_count; i++) {
+        I64 ret = WgetDownload(urls[i], &opts);
+        if (ret != 0) {
+            result = ret;
+        }
+    }
+
+    Free(urls);
+    Free(opts.headers);
+    return result;
+}
+
+// ============================================================================
+// COMMAND REGISTRATION
+// ============================================================================
+
+U0 WgetRegister()
+{
+    extern U0 PosixRegisterCommand(U8 *name, I64 (*main_func)(I64, U8**));
+    PosixRegisterCommand("wget", &wget_main);
+}
+
+// Register on load
+WgetRegister();
+
+"wget command registered. Use 'wget --help' for usage.\n";

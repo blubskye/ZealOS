@@ -1,0 +1,635 @@
+// Lexer.ZC - Shell Lexer/Tokenizer for ZealOS POSIX Shell
+// Part of ZealOS POSIX compatibility layer
+
+// ============================================================================
+// RESERVED WORD TABLE
+// ============================================================================
+
+class CReservedWord
+{
+	U8     *word;
+	I64     token;
+};
+
+CReservedWord shell_reserved_words[] = {
+	{"if",       TOK_IF},
+	{"then",     TOK_THEN},
+	{"else",     TOK_ELSE},
+	{"elif",     TOK_ELIF},
+	{"fi",       TOK_FI},
+	{"do",       TOK_DO},
+	{"done",     TOK_DONE},
+	{"case",     TOK_CASE},
+	{"esac",     TOK_ESAC},
+	{"while",    TOK_WHILE},
+	{"until",    TOK_UNTIL},
+	{"for",      TOK_FOR},
+	{"in",       TOK_IN},
+	{"{",        TOK_LBRACE},
+	{"}",        TOK_RBRACE},
+	{"!",        TOK_BANG},
+	{"function", TOK_FUNCTION},
+	{NULL, 0}
+};
+
+// ============================================================================
+// LEXER INITIALIZATION
+// ============================================================================
+
+U0 ShellLexerInit(CShellLexer *lex, U8 *input)
+{
+	MemSet(lex, 0, sizeof(CShellLexer));
+	lex->input = input;
+	lex->input_len = StrLen(input);
+	lex->pos = 0;
+	lex->line = 1;
+	lex->column = 1;
+	lex->at_line_start = TRUE;
+	lex->in_case = FALSE;
+}
+
+U0 ShellLexerFree(CShellLexer *lex)
+{
+	if (lex->current.value) {
+		Free(lex->current.value);
+		lex->current.value = NULL;
+	}
+}
+
+// ============================================================================
+// CHARACTER CLASSIFICATION
+// ============================================================================
+
+Bool ShellIsBlank(U8 c)
+{
+	return c == ' ' || c == '\t';
+}
+
+Bool ShellIsOperatorStart(U8 c)
+{
+	return c == ';' || c == '&' || c == '|' || c == '<' || c == '>' ||
+	       c == '(' || c == ')' || c == '{' || c == '}';
+}
+
+Bool ShellIsSpecial(U8 c)
+{
+	return c == '\n' || ShellIsBlank(c) || ShellIsOperatorStart(c) ||
+	       c == '\'' || c == '"' || c == '`' || c == '$' || c == '\\';
+}
+
+Bool ShellIsDigit(U8 c)
+{
+	return c >= '0' && c <= '9';
+}
+
+Bool ShellIsAlpha(U8 c)
+{
+	return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_';
+}
+
+Bool ShellIsAlnum(U8 c)
+{
+	return ShellIsAlpha(c) || ShellIsDigit(c);
+}
+
+Bool ShellIsNameChar(U8 c)
+{
+	return ShellIsAlnum(c) || c == '_';
+}
+
+// ============================================================================
+// LEXER HELPERS
+// ============================================================================
+
+U8 ShellLexerPeekChar(CShellLexer *lex)
+{
+	if (lex->pos >= lex->input_len)
+		return 0;
+	return lex->input[lex->pos];
+}
+
+U8 ShellLexerPeekChar2(CShellLexer *lex)
+{
+	if (lex->pos + 1 >= lex->input_len)
+		return 0;
+	return lex->input[lex->pos + 1];
+}
+
+U8 ShellLexerGetChar(CShellLexer *lex)
+{
+	U8 c;
+
+	if (lex->pos >= lex->input_len)
+		return 0;
+
+	c = lex->input[lex->pos++];
+
+	if (c == '\n') {
+		lex->line++;
+		lex->column = 1;
+	} else {
+		lex->column++;
+	}
+
+	return c;
+}
+
+U0 ShellLexerSkipBlanks(CShellLexer *lex)
+{
+	while (ShellIsBlank(ShellLexerPeekChar(lex))) {
+		ShellLexerGetChar(lex);
+	}
+}
+
+U0 ShellLexerSkipComment(CShellLexer *lex)
+{
+	if (ShellLexerPeekChar(lex) == '#') {
+		while (ShellLexerPeekChar(lex) && ShellLexerPeekChar(lex) != '\n') {
+			ShellLexerGetChar(lex);
+		}
+	}
+}
+
+// Add character to buffer
+U0 ShellLexerBufferAdd(CShellLexer *lex, U8 c)
+{
+	if (lex->buffer_len < LEXER_BUFFER_SIZE - 1) {
+		lex->buffer[lex->buffer_len++] = c;
+	}
+}
+
+// Clear buffer
+U0 ShellLexerBufferClear(CShellLexer *lex)
+{
+	lex->buffer_len = 0;
+}
+
+// Get buffer as string
+U8 *ShellLexerBufferGet(CShellLexer *lex)
+{
+	U8 *str = MAlloc(lex->buffer_len + 1);
+	MemCpy(str, lex->buffer, lex->buffer_len);
+	str[lex->buffer_len] = 0;
+	return str;
+}
+
+// ============================================================================
+// TOKEN CREATION
+// ============================================================================
+
+U0 ShellLexerMakeToken(CShellLexer *lex, I64 type, U8 *value)
+{
+	if (lex->current.value) {
+		Free(lex->current.value);
+	}
+
+	lex->current.type = type;
+	lex->current.value = value;
+	lex->current.length = value ? StrLen(value) : 0;
+	lex->current.line = lex->line;
+	lex->current.column = lex->column;
+}
+
+// ============================================================================
+// QUOTED STRING LEXING
+// ============================================================================
+
+// Read single-quoted string
+Bool ShellLexerReadSingleQuote(CShellLexer *lex)
+{
+	U8 c;
+
+	// Skip opening quote
+	ShellLexerGetChar(lex);
+	ShellLexerBufferAdd(lex, '\'');
+
+	while ((c = ShellLexerPeekChar(lex)) != 0) {
+		if (c == '\'') {
+			ShellLexerGetChar(lex);
+			ShellLexerBufferAdd(lex, '\'');
+			return TRUE;
+		}
+		ShellLexerBufferAdd(lex, ShellLexerGetChar(lex));
+	}
+
+	// Unterminated string
+	return FALSE;
+}
+
+// Read double-quoted string
+Bool ShellLexerReadDoubleQuote(CShellLexer *lex)
+{
+	U8 c;
+
+	// Skip opening quote
+	ShellLexerGetChar(lex);
+	ShellLexerBufferAdd(lex, '"');
+
+	while ((c = ShellLexerPeekChar(lex)) != 0) {
+		if (c == '"') {
+			ShellLexerGetChar(lex);
+			ShellLexerBufferAdd(lex, '"');
+			return TRUE;
+		}
+
+		if (c == '\\') {
+			ShellLexerBufferAdd(lex, ShellLexerGetChar(lex));
+			U8 next = ShellLexerPeekChar(lex);
+			// Only certain chars are special in double quotes
+			if (next == '$' || next == '`' || next == '"' ||
+			    next == '\\' || next == '\n') {
+				ShellLexerBufferAdd(lex, ShellLexerGetChar(lex));
+			}
+			continue;
+		}
+
+		if (c == '`') {
+			// Command substitution
+			ShellLexerBufferAdd(lex, ShellLexerGetChar(lex));
+			while ((c = ShellLexerPeekChar(lex)) != 0 && c != '`') {
+				if (c == '\\') {
+					ShellLexerBufferAdd(lex, ShellLexerGetChar(lex));
+					if (ShellLexerPeekChar(lex))
+						ShellLexerBufferAdd(lex, ShellLexerGetChar(lex));
+				} else {
+					ShellLexerBufferAdd(lex, ShellLexerGetChar(lex));
+				}
+			}
+			if (c == '`')
+				ShellLexerBufferAdd(lex, ShellLexerGetChar(lex));
+			continue;
+		}
+
+		if (c == '$') {
+			// Variable or command substitution
+			ShellLexerBufferAdd(lex, ShellLexerGetChar(lex));
+			c = ShellLexerPeekChar(lex);
+
+			if (c == '(') {
+				// $(command) - need to match parens
+				ShellLexerBufferAdd(lex, ShellLexerGetChar(lex));
+				I64 depth = 1;
+				while (depth > 0 && (c = ShellLexerPeekChar(lex)) != 0) {
+					if (c == '(') depth++;
+					else if (c == ')') depth--;
+					ShellLexerBufferAdd(lex, ShellLexerGetChar(lex));
+				}
+			} else if (c == '{') {
+				// ${var} - need to match braces
+				ShellLexerBufferAdd(lex, ShellLexerGetChar(lex));
+				I64 depth = 1;
+				while (depth > 0 && (c = ShellLexerPeekChar(lex)) != 0) {
+					if (c == '{') depth++;
+					else if (c == '}') depth--;
+					ShellLexerBufferAdd(lex, ShellLexerGetChar(lex));
+				}
+			} else {
+				// $var or $special
+				while (ShellIsNameChar(ShellLexerPeekChar(lex))) {
+					ShellLexerBufferAdd(lex, ShellLexerGetChar(lex));
+				}
+			}
+			continue;
+		}
+
+		ShellLexerBufferAdd(lex, ShellLexerGetChar(lex));
+	}
+
+	// Unterminated string
+	return FALSE;
+}
+
+// ============================================================================
+// WORD LEXING
+// ============================================================================
+
+// Check if token is a reserved word
+I64 ShellLexerCheckReserved(U8 *word)
+{
+	I64 i;
+
+	for (i = 0; shell_reserved_words[i].word; i++) {
+		if (StrCmp(word, shell_reserved_words[i].word) == 0) {
+			return shell_reserved_words[i].token;
+		}
+	}
+
+	return TOK_WORD;
+}
+
+// Read a word token
+I64 ShellLexerReadWord(CShellLexer *lex)
+{
+	U8 c;
+	I64 token_type;
+
+	ShellLexerBufferClear(lex);
+
+	while ((c = ShellLexerPeekChar(lex)) != 0) {
+		// End of word
+		if (c == '\n' || ShellIsBlank(c) || ShellIsOperatorStart(c)) {
+			break;
+		}
+
+		// Single quote
+		if (c == '\'') {
+			if (!ShellLexerReadSingleQuote(lex))
+				return TOK_EOF;  // Error
+			continue;
+		}
+
+		// Double quote
+		if (c == '"') {
+			if (!ShellLexerReadDoubleQuote(lex))
+				return TOK_EOF;  // Error
+			continue;
+		}
+
+		// Backslash escape
+		if (c == '\\') {
+			ShellLexerBufferAdd(lex, ShellLexerGetChar(lex));
+			c = ShellLexerPeekChar(lex);
+			if (c == '\n') {
+				// Line continuation - skip newline
+				ShellLexerGetChar(lex);
+				lex->buffer_len--;  // Remove backslash
+			} else if (c) {
+				ShellLexerBufferAdd(lex, ShellLexerGetChar(lex));
+			}
+			continue;
+		}
+
+		// Backtick command substitution
+		if (c == '`') {
+			ShellLexerBufferAdd(lex, ShellLexerGetChar(lex));
+			while ((c = ShellLexerPeekChar(lex)) != 0 && c != '`') {
+				if (c == '\\') {
+					ShellLexerBufferAdd(lex, ShellLexerGetChar(lex));
+					if (ShellLexerPeekChar(lex))
+						ShellLexerBufferAdd(lex, ShellLexerGetChar(lex));
+				} else {
+					ShellLexerBufferAdd(lex, ShellLexerGetChar(lex));
+				}
+			}
+			if (c == '`')
+				ShellLexerBufferAdd(lex, ShellLexerGetChar(lex));
+			continue;
+		}
+
+		// Dollar expansion
+		if (c == '$') {
+			ShellLexerBufferAdd(lex, ShellLexerGetChar(lex));
+			c = ShellLexerPeekChar(lex);
+
+			if (c == '(') {
+				// $(command) or $((arithmetic))
+				ShellLexerBufferAdd(lex, ShellLexerGetChar(lex));
+				if (ShellLexerPeekChar(lex) == '(') {
+					// $(( arithmetic ))
+					ShellLexerBufferAdd(lex, ShellLexerGetChar(lex));
+					I64 depth = 2;
+					while (depth > 0 && (c = ShellLexerPeekChar(lex)) != 0) {
+						if (c == '(') depth++;
+						else if (c == ')') depth--;
+						ShellLexerBufferAdd(lex, ShellLexerGetChar(lex));
+					}
+				} else {
+					// $(command)
+					I64 depth = 1;
+					while (depth > 0 && (c = ShellLexerPeekChar(lex)) != 0) {
+						if (c == '(') depth++;
+						else if (c == ')') depth--;
+						ShellLexerBufferAdd(lex, ShellLexerGetChar(lex));
+					}
+				}
+			} else if (c == '{') {
+				// ${var}
+				ShellLexerBufferAdd(lex, ShellLexerGetChar(lex));
+				I64 depth = 1;
+				while (depth > 0 && (c = ShellLexerPeekChar(lex)) != 0) {
+					if (c == '{') depth++;
+					else if (c == '}') depth--;
+					ShellLexerBufferAdd(lex, ShellLexerGetChar(lex));
+				}
+			} else {
+				// $var or $special
+				if (ShellIsDigit(c) || c == '@' || c == '*' || c == '#' ||
+				    c == '?' || c == '-' || c == '$' || c == '!' || c == '_') {
+					ShellLexerBufferAdd(lex, ShellLexerGetChar(lex));
+				} else {
+					while (ShellIsNameChar(ShellLexerPeekChar(lex))) {
+						ShellLexerBufferAdd(lex, ShellLexerGetChar(lex));
+					}
+				}
+			}
+			continue;
+		}
+
+		// Regular character
+		ShellLexerBufferAdd(lex, ShellLexerGetChar(lex));
+	}
+
+	if (lex->buffer_len == 0)
+		return TOK_EOF;
+
+	// Check for assignment (name=value at start of command)
+	U8 *word = ShellLexerBufferGet(lex);
+	U8 *eq = StrFirstOcc(word, "=");
+
+	if (eq && eq != word) {
+		// Check if everything before = is a valid name
+		Bool is_assignment = TRUE;
+		U8 *p = word;
+		if (!ShellIsAlpha(*p) && *p != '_')
+			is_assignment = FALSE;
+		p++;
+		while (p < eq && is_assignment) {
+			if (!ShellIsNameChar(*p))
+				is_assignment = FALSE;
+			p++;
+		}
+		if (is_assignment) {
+			ShellLexerMakeToken(lex, TOK_ASSIGNMENT, word);
+			return TOK_ASSIGNMENT;
+		}
+	}
+
+	// Check for reserved word (only at start of command context)
+	token_type = ShellLexerCheckReserved(word);
+
+	ShellLexerMakeToken(lex, token_type, word);
+	return token_type;
+}
+
+// ============================================================================
+// OPERATOR LEXING
+// ============================================================================
+
+I64 ShellLexerReadOperator(CShellLexer *lex)
+{
+	U8 c1, c2;
+	I64 token_type;
+	U8 op[3];
+
+	c1 = ShellLexerGetChar(lex);
+	c2 = ShellLexerPeekChar(lex);
+
+	op[0] = c1;
+	op[1] = 0;
+	op[2] = 0;
+
+	switch (c1) {
+		case ';':
+			if (c2 == ';') {
+				ShellLexerGetChar(lex);
+				op[1] = ';';
+				token_type = TOK_DSEMI;
+			} else {
+				token_type = TOK_SEMI;
+			}
+			break;
+
+		case '&':
+			if (c2 == '&') {
+				ShellLexerGetChar(lex);
+				op[1] = '&';
+				token_type = TOK_AND;
+			} else {
+				token_type = TOK_AMP;
+			}
+			break;
+
+		case '|':
+			if (c2 == '|') {
+				ShellLexerGetChar(lex);
+				op[1] = '|';
+				token_type = TOK_OR;
+			} else {
+				token_type = TOK_PIPE;
+			}
+			break;
+
+		case '(':
+			token_type = TOK_LPAREN;
+			break;
+
+		case ')':
+			token_type = TOK_RPAREN;
+			break;
+
+		case '<':
+			if (c2 == '<') {
+				ShellLexerGetChar(lex);
+				op[1] = '<';
+				if (ShellLexerPeekChar(lex) == '-') {
+					ShellLexerGetChar(lex);
+					op[2] = '-';
+					token_type = TOK_DLESSDASH;
+				} else {
+					token_type = TOK_DLESS;
+				}
+			} else if (c2 == '&') {
+				ShellLexerGetChar(lex);
+				op[1] = '&';
+				token_type = TOK_LESSAND;
+			} else if (c2 == '>') {
+				ShellLexerGetChar(lex);
+				op[1] = '>';
+				token_type = TOK_LESSGREAT;
+			} else {
+				token_type = TOK_LESS;
+			}
+			break;
+
+		case '>':
+			if (c2 == '>') {
+				ShellLexerGetChar(lex);
+				op[1] = '>';
+				token_type = TOK_DGREAT;
+			} else if (c2 == '&') {
+				ShellLexerGetChar(lex);
+				op[1] = '&';
+				token_type = TOK_GREATAND;
+			} else if (c2 == '|') {
+				ShellLexerGetChar(lex);
+				op[1] = '|';
+				token_type = TOK_CLOBBER;
+			} else {
+				token_type = TOK_GREAT;
+			}
+			break;
+
+		default:
+			// Single character operator
+			token_type = c1;
+	}
+
+	ShellLexerMakeToken(lex, token_type, StrNew(op));
+	return token_type;
+}
+
+// ============================================================================
+// MAIN LEXER FUNCTIONS
+// ============================================================================
+
+// Get next token
+I64 ShellLexerNext(CShellLexer *lex)
+{
+	U8 c;
+
+	// Skip whitespace and comments
+	while (1) {
+		ShellLexerSkipBlanks(lex);
+		ShellLexerSkipComment(lex);
+
+		c = ShellLexerPeekChar(lex);
+		if (c == 0 || c != '#')
+			break;
+	}
+
+	// Check for end of input
+	if (c == 0) {
+		ShellLexerMakeToken(lex, TOK_EOF, NULL);
+		return TOK_EOF;
+	}
+
+	// Newline
+	if (c == '\n') {
+		ShellLexerGetChar(lex);
+		ShellLexerMakeToken(lex, TOK_NEWLINE, StrNew("\n"));
+		lex->at_line_start = TRUE;
+		return TOK_NEWLINE;
+	}
+
+	// Check for operator
+	if (ShellIsOperatorStart(c)) {
+		lex->at_line_start = FALSE;
+		return ShellLexerReadOperator(lex);
+	}
+
+	// Must be a word
+	lex->at_line_start = FALSE;
+	return ShellLexerReadWord(lex);
+}
+
+// Peek at next token without consuming
+I64 ShellLexerPeek(CShellLexer *lex)
+{
+	// Save state
+	I64 saved_pos = lex->pos;
+	I64 saved_line = lex->line;
+	I64 saved_col = lex->column;
+	CShellToken saved_token;
+	MemCpy(&saved_token, &lex->current, sizeof(CShellToken));
+
+	// Get next token
+	I64 token = ShellLexerNext(lex);
+
+	// Restore state (but keep current token info for caller to use)
+	lex->pos = saved_pos;
+	lex->line = saved_line;
+	lex->column = saved_col;
+
+	return token;
+}
+

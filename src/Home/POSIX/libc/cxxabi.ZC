@@ -1,0 +1,470 @@
+// cxxabi.ZC - C++ ABI Support for ZealOS
+// Part of the POSIX compatibility layer
+//
+// Implements the Itanium C++ ABI functions needed for C++ programs
+// Reference: https://itanium-cxx-abi.github.io/cxx-abi/abi.html
+
+// ============================================================================
+// C++ ABI TYPES
+// ============================================================================
+
+// Type info for RTTI
+class __class_type_info {
+    U8 *__type_name;
+};
+
+class __si_class_type_info : __class_type_info {
+    __class_type_info *__base_type;
+};
+
+// Exception header
+class __cxa_exception {
+    U8 *exceptionType;           // Type info
+    U0 (*exceptionDestructor)(U8*);  // Destructor
+    U0 (*unexpectedHandler)();
+    U0 (*terminateHandler)();
+    __cxa_exception *nextException;
+    I64 handlerCount;
+    I64 handlerSwitchValue;
+    U8 *actionRecord;
+    U8 *languageSpecificData;
+    U8 *catchTemp;
+    U8 *adjustedPtr;
+    // Unwind info follows
+};
+
+// Thread-local exception globals
+class __cxa_eh_globals {
+    __cxa_exception *caughtExceptions;
+    I64 uncaughtExceptions;
+};
+
+// ============================================================================
+// ATEXIT SUPPORT
+// ============================================================================
+
+// Maximum number of atexit handlers
+#define ATEXIT_MAX 256
+
+// Atexit entry types
+#define ATEXIT_FUNC   0
+#define ATEXIT_CXA    1
+
+class CAtexitEntry {
+    I64 type;
+    union {
+        U0 (*func)();                    // For atexit()
+        U0 (*cxa_func)(U8*);             // For __cxa_atexit()
+    };
+    U8 *arg;                             // Argument for __cxa_atexit
+    U8 *dso_handle;                      // DSO handle
+};
+
+static CAtexitEntry g_atexit_funcs[ATEXIT_MAX];
+static I64 g_atexit_count = 0;
+
+// __cxa_atexit - Register destructor for static/global objects
+// Called by compiler-generated code for static objects with destructors
+I64 __cxa_atexit(U0 (*destructor)(U8*), U8 *arg, U8 *dso_handle)
+{
+    if (g_atexit_count >= ATEXIT_MAX) {
+        return -1;
+    }
+
+    CAtexitEntry *entry = &g_atexit_funcs[g_atexit_count++];
+    entry->type = ATEXIT_CXA;
+    entry->cxa_func = destructor;
+    entry->arg = arg;
+    entry->dso_handle = dso_handle;
+
+    return 0;
+}
+
+// atexit - Register function to call at exit (C version)
+I64 atexit(U0 (*func)())
+{
+    if (g_atexit_count >= ATEXIT_MAX) {
+        return -1;
+    }
+
+    CAtexitEntry *entry = &g_atexit_funcs[g_atexit_count++];
+    entry->type = ATEXIT_FUNC;
+    entry->func = func;
+    entry->arg = NULL;
+    entry->dso_handle = NULL;
+
+    return 0;
+}
+
+// __cxa_finalize - Call registered destructors
+// If dso_handle is NULL, call all; otherwise only those matching dso_handle
+U0 __cxa_finalize(U8 *dso_handle)
+{
+    // Call in reverse order
+    for (I64 i = g_atexit_count - 1; i >= 0; i--) {
+        CAtexitEntry *entry = &g_atexit_funcs[i];
+
+        // Skip if already called (marked with NULL)
+        if (entry->type == ATEXIT_FUNC && !entry->func) continue;
+        if (entry->type == ATEXIT_CXA && !entry->cxa_func) continue;
+
+        // Check DSO handle filter
+        if (dso_handle && entry->dso_handle != dso_handle) continue;
+
+        // Call the destructor
+        if (entry->type == ATEXIT_FUNC) {
+            U0 (*func)() = entry->func;
+            entry->func = NULL;  // Mark as called
+            func();
+        } else {
+            U0 (*func)(U8*) = entry->cxa_func;
+            U8 *arg = entry->arg;
+            entry->cxa_func = NULL;  // Mark as called
+            func(arg);
+        }
+    }
+}
+
+// ============================================================================
+// STATIC INITIALIZATION GUARDS
+// ============================================================================
+
+// Guard variable states
+#define GUARD_UNINITIALIZED  0
+#define GUARD_INITIALIZING   1
+#define GUARD_INITIALIZED    2
+
+// Guard byte layout (64-bit):
+// Byte 0: initialization status
+// Bytes 1-7: reserved/lock
+
+// __cxa_guard_acquire - Begin static initialization
+// Returns 1 if initialization should proceed, 0 if already done
+I64 __cxa_guard_acquire(U64 *guard)
+{
+    U8 *guard_byte = (U8*)guard;
+
+    // Fast path: already initialized
+    if (*guard_byte == GUARD_INITIALIZED) {
+        return 0;
+    }
+
+    // Check if another thread is initializing (simplified - no real locking)
+    if (*guard_byte == GUARD_INITIALIZING) {
+        // In single-threaded ZealOS, this shouldn't happen
+        // but if it does, we have recursive initialization
+        return 0;
+    }
+
+    // Mark as initializing
+    *guard_byte = GUARD_INITIALIZING;
+    return 1;
+}
+
+// __cxa_guard_release - Complete successful static initialization
+U0 __cxa_guard_release(U64 *guard)
+{
+    U8 *guard_byte = (U8*)guard;
+    *guard_byte = GUARD_INITIALIZED;
+}
+
+// __cxa_guard_abort - Abort static initialization (exception thrown)
+U0 __cxa_guard_abort(U64 *guard)
+{
+    U8 *guard_byte = (U8*)guard;
+    *guard_byte = GUARD_UNINITIALIZED;
+}
+
+// ============================================================================
+// PURE VIRTUAL FUNCTIONS
+// ============================================================================
+
+// Called when a pure virtual function is invoked
+U0 __cxa_pure_virtual()
+{
+    fprintf(stderr, "Pure virtual function called!\n");
+    abort();
+}
+
+// Called when a deleted virtual function is invoked
+U0 __cxa_deleted_virtual()
+{
+    fprintf(stderr, "Deleted virtual function called!\n");
+    abort();
+}
+
+// ============================================================================
+// EXCEPTION HANDLING
+// ============================================================================
+
+// Thread-local exception state (simplified - single thread)
+static __cxa_eh_globals g_eh_globals;
+
+// Get exception globals for current thread
+__cxa_eh_globals *__cxa_get_globals()
+{
+    return &g_eh_globals;
+}
+
+// Get exception globals (no-alloc version)
+__cxa_eh_globals *__cxa_get_globals_fast()
+{
+    return &g_eh_globals;
+}
+
+// Allocate exception object
+// Size is the size of the exception object (not including header)
+U8 *__cxa_allocate_exception(I64 size)
+{
+    // Allocate header + object
+    I64 total_size = sizeof(__cxa_exception) + size;
+    U8 *mem = MAlloc(total_size);
+
+    if (!mem) {
+        // Out of memory during exception - terminate
+        abort();
+    }
+
+    MemSet(mem, 0, total_size);
+
+    // Return pointer to exception object (after header)
+    return mem + sizeof(__cxa_exception);
+}
+
+// Free exception object
+U0 __cxa_free_exception(U8 *exception_object)
+{
+    if (!exception_object) return;
+
+    // Get header
+    __cxa_exception *header = (__cxa_exception*)(exception_object - sizeof(__cxa_exception));
+
+    // Call destructor if present
+    if (header->exceptionDestructor) {
+        header->exceptionDestructor(exception_object);
+    }
+
+    // Free the memory
+    Free(header);
+}
+
+// Throw an exception
+U0 __cxa_throw(U8 *exception_object, U8 *type_info, U0 (*destructor)(U8*))
+{
+    __cxa_exception *header = (__cxa_exception*)(exception_object - sizeof(__cxa_exception));
+
+    header->exceptionType = type_info;
+    header->exceptionDestructor = destructor;
+    header->unexpectedHandler = NULL;
+    header->terminateHandler = NULL;
+
+    // Increment uncaught exception count
+    g_eh_globals.uncaughtExceptions++;
+
+    // In ZealOS, we use the native exception mechanism
+    // The exception object pointer is passed via throw
+    throw('CXX ', exception_object);
+}
+
+// Rethrow current exception
+U0 __cxa_rethrow()
+{
+    __cxa_exception *current = g_eh_globals.caughtExceptions;
+
+    if (!current) {
+        // No current exception - terminate
+        fprintf(stderr, "Attempting to rethrow without active exception\n");
+        abort();
+    }
+
+    // Get exception object
+    U8 *exception_object = ((U8*)current) + sizeof(__cxa_exception);
+
+    g_eh_globals.uncaughtExceptions++;
+
+    throw('CXX ', exception_object);
+}
+
+// Begin catch block
+U8 *__cxa_begin_catch(U8 *exception_object)
+{
+    if (!exception_object) return NULL;
+
+    __cxa_exception *header = (__cxa_exception*)(exception_object - sizeof(__cxa_exception));
+
+    // Decrement uncaught count
+    if (g_eh_globals.uncaughtExceptions > 0) {
+        g_eh_globals.uncaughtExceptions--;
+    }
+
+    // Add to caught exceptions chain
+    header->nextException = g_eh_globals.caughtExceptions;
+    g_eh_globals.caughtExceptions = header;
+    header->handlerCount++;
+
+    return exception_object;
+}
+
+// End catch block
+U0 __cxa_end_catch()
+{
+    __cxa_exception *header = g_eh_globals.caughtExceptions;
+
+    if (!header) return;
+
+    header->handlerCount--;
+
+    if (header->handlerCount == 0) {
+        // Remove from chain
+        g_eh_globals.caughtExceptions = header->nextException;
+
+        // Free the exception
+        U8 *exception_object = ((U8*)header) + sizeof(__cxa_exception);
+        __cxa_free_exception(exception_object);
+    }
+}
+
+// Get current exception object
+U8 *__cxa_current_exception()
+{
+    __cxa_exception *header = g_eh_globals.caughtExceptions;
+    if (!header) return NULL;
+    return ((U8*)header) + sizeof(__cxa_exception);
+}
+
+// Get current exception type
+U8 *__cxa_current_exception_type()
+{
+    __cxa_exception *header = g_eh_globals.caughtExceptions;
+    if (!header) return NULL;
+    return header->exceptionType;
+}
+
+// Check if there are uncaught exceptions
+Bool __cxa_uncaught_exception()
+{
+    return g_eh_globals.uncaughtExceptions > 0;
+}
+
+// C++11: Get uncaught exception count
+I64 __cxa_uncaught_exceptions()
+{
+    return g_eh_globals.uncaughtExceptions;
+}
+
+// ============================================================================
+// EXCEPTION PERSONALITY (GCC)
+// ============================================================================
+
+// GCC personality routine - simplified version
+// This is called by the unwinder to determine if a handler exists
+I64 __gxx_personality_v0(I64 version, I64 actions, U64 exception_class,
+                         U8 *exception_info, U8 *context)
+{
+    // Simplified: always continue unwinding
+    // Real implementation would parse LSDA and find handlers
+    return 0;  // _URC_CONTINUE_UNWIND
+}
+
+// ============================================================================
+// TERMINATE AND UNEXPECTED
+// ============================================================================
+
+static U0 (*g_terminate_handler)() = NULL;
+static U0 (*g_unexpected_handler)() = NULL;
+
+// Set terminate handler
+U0 (*std_set_terminate(U0 (*handler)()))()
+{
+    U0 (*old)() = g_terminate_handler;
+    g_terminate_handler = handler;
+    return old;
+}
+
+// Get terminate handler
+U0 (*std_get_terminate())()
+{
+    return g_terminate_handler;
+}
+
+// Set unexpected handler
+U0 (*std_set_unexpected(U0 (*handler)()))()
+{
+    U0 (*old)() = g_unexpected_handler;
+    g_unexpected_handler = handler;
+    return old;
+}
+
+// Get unexpected handler
+U0 (*std_get_unexpected())()
+{
+    return g_unexpected_handler;
+}
+
+// Call terminate
+U0 std_terminate()
+{
+    if (g_terminate_handler) {
+        g_terminate_handler();
+    }
+    abort();
+}
+
+// Call unexpected
+U0 std_unexpected()
+{
+    if (g_unexpected_handler) {
+        g_unexpected_handler();
+    }
+    std_terminate();
+}
+
+// __cxa_call_terminate
+U0 __cxa_call_terminate(U8 *exception_object)
+{
+    std_terminate();
+}
+
+// __cxa_call_unexpected
+U0 __cxa_call_unexpected(U8 *exception_object)
+{
+    std_unexpected();
+}
+
+// ============================================================================
+// BAD FUNCTION CALLS
+// ============================================================================
+
+U0 __cxa_bad_cast()
+{
+    fprintf(stderr, "std::bad_cast\n");
+    abort();
+}
+
+U0 __cxa_bad_typeid()
+{
+    fprintf(stderr, "std::bad_typeid\n");
+    abort();
+}
+
+U0 __cxa_throw_bad_array_new_length()
+{
+    fprintf(stderr, "std::bad_array_new_length\n");
+    abort();
+}
+
+// ============================================================================
+// DSO HANDLE
+// ============================================================================
+
+// DSO handle for this executable (not a shared library)
+U8 __dso_handle[1];
+
+// ============================================================================
+// INITIALIZATION
+// ============================================================================
+
+"ZealOS C++ ABI loaded.\n";
+"  - Static init: __cxa_atexit, __cxa_guard_*\n";
+"  - Exceptions: __cxa_throw, __cxa_catch, __cxa_rethrow\n";
+"  - Terminate: std::terminate, std::unexpected\n";

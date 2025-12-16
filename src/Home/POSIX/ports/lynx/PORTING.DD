@@ -1,0 +1,163 @@
+$WW,1$$FG,5,0$Porting Lynx to ZealOS$FG$
+
+$TR,"Overview"$
+Lynx is a text-mode web browser that uses curses for its UI. To run
+Lynx on ZealOS, we have two options:
+
+1. Cross-compile Lynx on a Linux host and run it via our ELF loader
+2. Rewrite key parts of Lynx in HolyC (native ZealOS)
+
+This document covers both approaches.
+
+$TR,"Cross-Compilation Approach"$
+
+$FG,2$Step 1: Set up cross-compilation environment$FG$
+
+On a Linux host with GCC installed:
+
+$FG,4$
+cd /path/to/lynx2.9.2
+
+# Configure for static build
+CFLAGS="-static" \
+LDFLAGS="-static" \
+./configure \
+    --disable-nls \
+    --disable-idna \
+    --without-ssl \
+    --with-screen=curses \
+    --disable-color-style
+
+make clean
+make
+$FG$
+
+$FG,2$Step 2: Copy binary to ZealOS$FG$
+
+Copy the resulting $FG,4$lynx$FG$ binary to:
+$FG,4$/Home/POSIX/bin/lynx$FG$
+
+$FG,2$Step 3: Run via ELF loader$FG$
+
+In ZealOS:
+$FG,4$
+#include "/Home/POSIX/bin/MakeBin"
+ELFRun("/Home/POSIX/bin/lynx", argc, argv);
+$FG$
+
+$TR,"Required libc Functions"$
+
+Lynx requires these functions from our POSIX layer:
+
+$FG,2$Already Implemented:$FG$
+- String: strlen, strcpy, strncpy, strcmp, strncmp, strcat, strncat
+- String: strchr, strrchr, strstr, strcasecmp, strncasecmp, strdup
+- Memory: malloc, realloc, calloc, free, memcpy, memmove, memset
+- I/O: fopen, fclose, fread, fwrite, fgets, fputs, printf, fprintf
+- I/O: open, close, read, write, lseek, stat, fstat
+- Directory: opendir, readdir, closedir, mkdir, rmdir, getcwd
+- Process: fork, exec*, waitpid, getpid, system, popen
+- Network: socket, connect, send, recv, gethostbyname, getaddrinfo
+- Terminal: tcgetattr, tcsetattr, isatty
+- Curses: initscr, endwin, newwin, addch, printw, getch, etc.
+- Time: time, localtime, gmtime, mktime, strftime, gettimeofday
+
+$FG,2$May Need Implementation:$FG$
+- getpwuid, getpwnam (user database - partially done)
+- sigsetjmp, siglongjmp (signal handling jumps)
+- Some less common socket options
+
+$TR,"ZealOS-Specific Adaptations"$
+
+$FG,2$1. TLS/SSL$FG$
+
+Lynx typically uses OpenSSL or GnuTLS. We have two options:
+
+a) Disable SSL and use our native HTTPS:
+   - Configure lynx with --without-ssl
+   - Create a wrapper that intercepts https:// URLs
+   - Route them through ZealOS HTTP/TLS stack
+
+b) Create SSL shim library:
+   - Implement enough of OpenSSL API
+   - Map to our TLS implementation
+
+$FG,2$2. Terminal Handling$FG$
+
+Lynx expects ncurses. Our curses.ZC provides most functionality.
+Key functions that may need adjustment:
+- Color pairs (we support 8 colors)
+- Special key handling (escape sequences)
+- Mouse support (not currently implemented)
+
+$FG,2$3. Configuration Files$FG$
+
+Create these in /Home/POSIX/etc/:
+- lynx.cfg    - Main configuration
+- lynx.lss    - Color style sheet
+- mailcap     - MIME handlers
+- mime.types  - File type mappings
+
+$TR,"Native HolyC Browser"$
+
+Instead of porting Lynx, we could create a native HolyC web browser
+using our existing HTTP/TLS stack. This would be:
+- More integrated with ZealOS
+- Use native graphics capabilities
+- Not require POSIX compatibility layer for basic browsing
+
+See /Home/Net/HTTP/Browser.ZC for a starting point.
+
+$TR,"Missing libc Functions to Add"$
+
+$FG,4$
+// pwd.h - User database (partial)
+struct passwd *getpwuid(uid_t uid);
+struct passwd *getpwnam(char *name);
+void setpwent(void);
+void endpwent(void);
+struct passwd *getpwent(void);
+
+// grp.h - Group database
+struct group *getgrgid(gid_t gid);
+struct group *getgrnam(char *name);
+
+// signal.h - Extended signals
+int sigsetjmp(sigjmp_buf env, int savesigs);
+void siglongjmp(sigjmp_buf env, int val);
+
+// locale.h - Locale support
+char *setlocale(int category, char *locale);
+struct lconv *localeconv(void);
+$FG$
+
+$TR,"Build Instructions Summary"$
+
+$FG,2$For Cross-Compiled Lynx:$FG$
+
+1. On Linux:
+   $FG,4$./configure --disable-nls --without-ssl && make$FG$
+
+2. Copy lynx binary to ZealOS
+
+3. In ZealOS:
+   $FG,4$
+   #include "/Home/POSIX/MakePOSIX"
+   #include "/Home/POSIX/libc/MakeLibc"
+   ELFRun("/Home/POSIX/bin/lynx", 1, {"lynx"});
+   $FG$
+
+$FG,2$For Native ZealOS Browser:$FG$
+
+See /Home/Net/HTTP/MakeHTTP.ZC for the HTTP client.
+A basic text browser can be built using:
+- HTTPGet() for fetching pages
+- Simple HTML parsing
+- Native ZealOS text display or curses
+
+$TR,"Files"$
+
+$FG,4$/Home/POSIX/ports/lynx/zealos_lynx.h$FG$ - Configuration header
+$FG,4$/Home/POSIX/ports/lynx/PORTING.DD$FG$ - This file
+$FG,4$/Home/POSIX/etc/lynx.cfg$FG$ - Runtime configuration (to create)
+

@@ -1,0 +1,195 @@
+// MakeUtils.ZC - POSIX Utilities Loader for ZealOS
+// Part of ZealOS POSIX compatibility layer
+//
+// This loads all POSIX utilities and provides a registry
+// for looking them up by name.
+//
+// Usage:
+//   #include "../MakePOSIX"   // Load POSIX layer first
+//   #include "MakeUtils"      // Load utilities
+//
+//   PosixUtilRun("cat", argc, argv);
+
+Cd(__DIR__);
+
+// Utility headers
+#include "Utils.HH"
+
+// File utilities
+#include "FileUtils"
+
+// Text utilities
+#include "TextUtils"
+
+// System utilities
+#include "SysUtils"
+
+// ============================================================================
+// UTILITY REGISTRY
+// ============================================================================
+
+CPosixUtil posix_utils[] = {
+	// File utilities
+	{"cat",       &UtilCat,       "Concatenate files"},
+	{"head",      &UtilHead,      "Output first part of files"},
+	{"tail",      &UtilTail,      "Output last part of files"},
+	{"wc",        &UtilWc,        "Word, line, character count"},
+	{"cp",        &UtilCp,        "Copy files"},
+	{"mv",        &UtilMv,        "Move/rename files"},
+	{"rm",        &UtilRm,        "Remove files"},
+	{"mkdir",     &UtilMkdir,     "Create directories"},
+	{"rmdir",     &UtilRmdir,     "Remove directories"},
+	{"ls",        &UtilLs,        "List directory contents"},
+	{"touch",     &UtilTouch,     "Change file timestamps"},
+	{"chmod",     &UtilChmod,     "Change file mode"},
+	{"ln",        &UtilLn,        "Create links"},
+
+	// Text utilities
+	{"echo",      &UtilEcho,      "Display a line of text"},
+	{"printf",    &UtilPrintf,    "Format and print data"},
+	{"cut",       &UtilCut,       "Remove sections from lines"},
+	{"tr",        &UtilTr,        "Translate characters"},
+	{"sort",      &UtilSort,      "Sort lines"},
+	{"uniq",      &UtilUniq,      "Report repeated lines"},
+	{"grep",      &UtilGrep,      "Search for patterns"},
+	{"tee",       &UtilTee,       "Read stdin, write to files"},
+
+	// System utilities
+	{"basename",  &UtilBasename,  "Strip directory from filename"},
+	{"dirname",   &UtilDirname,   "Strip last component from path"},
+	{"env",       &UtilEnv,       "Run in modified environment"},
+	{"expr",      &UtilExpr,      "Evaluate expressions"},
+	{"seq",       &UtilSeq,       "Print number sequence"},
+	{"sleep",     &UtilSleep,     "Delay for a time"},
+	{"true",      &UtilTrue,      "Do nothing, successfully"},
+	{"false",     &UtilFalse,     "Do nothing, unsuccessfully"},
+	{"yes",       &UtilYes,       "Output a string repeatedly"},
+	{"date",      &UtilDate,      "Print date and time"},
+	{"uname",     &UtilUname,     "Print system information"},
+	{"whoami",    &UtilWhoami,    "Print effective user name"},
+	{"hostname",  &UtilHostname,  "Print system host name"},
+	{"id",        &UtilId,        "Print user and group IDs"},
+	{"pwd",       &UtilPwd,       "Print working directory"},
+	{"clear",     &UtilClear,     "Clear the terminal"},
+
+	// Comparison utilities
+	{"cmp",       &UtilCmp,       "Compare two files"},
+
+	// Hex dump utilities
+	{"xxd",       &UtilXxd,       "Make a hexdump"},
+	{"od",        &UtilOd,        "Octal dump"},
+	{"hexdump",   &UtilHexdump,   "Display file in hex"},
+
+	{NULL, NULL, NULL}
+};
+
+// ============================================================================
+// UTILITY LOOKUP AND EXECUTION
+// ============================================================================
+
+// Find a utility by name
+CPosixUtil *PosixUtilFind(U8 *name)
+{
+	for (I64 i = 0; posix_utils[i].name; i++) {
+		if (!StrCmp(posix_utils[i].name, name))
+			return &posix_utils[i];
+	}
+	return NULL;
+}
+
+// Run a utility by name
+I64 PosixUtilRun(U8 *name, I64 argc, U8 **argv)
+{
+	CPosixUtil *util = PosixUtilFind(name);
+	if (!util) {
+		"%s: command not found\n", name;
+		return 127;
+	}
+	return util->main(argc, argv);
+}
+
+// List all available utilities
+U0 PosixUtilList()
+{
+	"Available POSIX utilities:\n";
+	"\n";
+
+	// File utilities
+	"File utilities:\n";
+	for (I64 i = 0; posix_utils[i].name; i++) {
+		if (posix_utils[i].main == &UtilCat ||
+		    posix_utils[i].main == &UtilHead ||
+		    posix_utils[i].main == &UtilTail ||
+		    posix_utils[i].main == &UtilWc ||
+		    posix_utils[i].main == &UtilCp ||
+		    posix_utils[i].main == &UtilMv ||
+		    posix_utils[i].main == &UtilRm ||
+		    posix_utils[i].main == &UtilMkdir ||
+		    posix_utils[i].main == &UtilRmdir ||
+		    posix_utils[i].main == &UtilLs ||
+		    posix_utils[i].main == &UtilTouch ||
+		    posix_utils[i].main == &UtilChmod ||
+		    posix_utils[i].main == &UtilLn) {
+			"  %-12s %s\n", posix_utils[i].name, posix_utils[i].description;
+		}
+	}
+
+	"\nText utilities:\n";
+	for (I64 i = 0; posix_utils[i].name; i++) {
+		if (posix_utils[i].main == &UtilEcho ||
+		    posix_utils[i].main == &UtilPrintf ||
+		    posix_utils[i].main == &UtilCut ||
+		    posix_utils[i].main == &UtilTr ||
+		    posix_utils[i].main == &UtilSort ||
+		    posix_utils[i].main == &UtilUniq ||
+		    posix_utils[i].main == &UtilGrep ||
+		    posix_utils[i].main == &UtilTee) {
+			"  %-12s %s\n", posix_utils[i].name, posix_utils[i].description;
+		}
+	}
+
+	"\nSystem utilities:\n";
+	for (I64 i = 0; posix_utils[i].name; i++) {
+		if (posix_utils[i].main == &UtilBasename ||
+		    posix_utils[i].main == &UtilDirname ||
+		    posix_utils[i].main == &UtilEnv ||
+		    posix_utils[i].main == &UtilExpr ||
+		    posix_utils[i].main == &UtilSeq ||
+		    posix_utils[i].main == &UtilSleep ||
+		    posix_utils[i].main == &UtilTrue ||
+		    posix_utils[i].main == &UtilFalse ||
+		    posix_utils[i].main == &UtilYes ||
+		    posix_utils[i].main == &UtilDate ||
+		    posix_utils[i].main == &UtilUname ||
+		    posix_utils[i].main == &UtilWhoami ||
+		    posix_utils[i].main == &UtilHostname ||
+		    posix_utils[i].main == &UtilId ||
+		    posix_utils[i].main == &UtilPwd ||
+		    posix_utils[i].main == &UtilClear) {
+			"  %-12s %s\n", posix_utils[i].name, posix_utils[i].description;
+		}
+	}
+
+	"\nOther utilities:\n";
+	for (I64 i = 0; posix_utils[i].name; i++) {
+		if (posix_utils[i].main == &UtilCmp ||
+		    posix_utils[i].main == &UtilXxd ||
+		    posix_utils[i].main == &UtilOd ||
+		    posix_utils[i].main == &UtilHexdump) {
+			"  %-12s %s\n", posix_utils[i].name, posix_utils[i].description;
+		}
+	}
+}
+
+// ============================================================================
+// INITIALIZATION MESSAGE
+// ============================================================================
+
+"POSIX utilities loaded.\n";
+"  - File: cat, head, tail, wc, cp, mv, rm, mkdir, rmdir, ls, touch\n";
+"  - Text: echo, printf, cut, tr, sort, uniq, grep, tee\n";
+"  - System: basename, dirname, env, expr, seq, sleep, date, uname, pwd\n";
+"  - Other: cmp, xxd, od, hexdump\n";
+"\n";
+"Use PosixUtilRun(name, argc, argv) to run a utility.\n";
+"Use PosixUtilList() to list all utilities.\n";

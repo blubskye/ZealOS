@@ -1,0 +1,172 @@
+// head.ZC - GNU coreutils 'head' implementation
+// Output the first part of files
+
+// C-style main function
+I64 head_main(I64 argc, U8 **argv)
+{
+    I64 num_lines = 10;     // Default
+    I64 num_bytes = -1;     // -1 means use lines
+    Bool quiet = FALSE;     // -q
+    Bool verbose = FALSE;   // -v
+    I64 start = 1;
+
+    // Parse options
+    while (start < argc && argv[start][0] == '-') {
+        U8 *arg = argv[start];
+
+        if (strcmp(arg, "--help") == 0) {
+            printf("Usage: head [OPTION]... [FILE]...\n");
+            printf("Print the first 10 lines of each FILE to standard output.\n");
+            printf("With more than one FILE, precede each with a header.\n");
+            printf("With no FILE, or when FILE is -, read standard input.\n\n");
+            printf("  -c, --bytes=[-]NUM   print the first NUM bytes; with '-', print all but\n");
+            printf("                       the last NUM bytes of each file\n");
+            printf("  -n, --lines=[-]NUM   print the first NUM lines instead of first 10;\n");
+            printf("                       with '-', print all but the last NUM lines\n");
+            printf("  -q, --quiet          never print headers giving file names\n");
+            printf("  -v, --verbose        always print headers giving file names\n");
+            printf("      --help           display this help and exit\n");
+            printf("      --version        output version information and exit\n");
+            return 0;
+        }
+
+        if (strcmp(arg, "--version") == 0) {
+            printf("head (ZealOS coreutils) 1.0\n");
+            return 0;
+        }
+
+        if (strcmp(arg, "-q") == 0 || strcmp(arg, "--quiet") == 0 ||
+            strcmp(arg, "--silent") == 0) {
+            quiet = TRUE;
+            start++;
+            continue;
+        }
+
+        if (strcmp(arg, "-v") == 0 || strcmp(arg, "--verbose") == 0) {
+            verbose = TRUE;
+            start++;
+            continue;
+        }
+
+        // -n NUM or -NUM
+        if (arg[1] == 'n') {
+            if (arg[2]) {
+                num_lines = atoi(&arg[2]);
+            } else if (start + 1 < argc) {
+                start++;
+                num_lines = atoi(argv[start]);
+            }
+            start++;
+            continue;
+        }
+
+        // -c NUM
+        if (arg[1] == 'c') {
+            if (arg[2]) {
+                num_bytes = atoi(&arg[2]);
+            } else if (start + 1 < argc) {
+                start++;
+                num_bytes = atoi(argv[start]);
+            }
+            num_lines = -1;  // Use bytes mode
+            start++;
+            continue;
+        }
+
+        // -NUM shorthand
+        if (arg[1] >= '0' && arg[1] <= '9') {
+            num_lines = atoi(&arg[1]);
+            start++;
+            continue;
+        }
+
+        // -- ends options
+        if (strcmp(arg, "--") == 0) {
+            start++;
+            break;
+        }
+
+        fprintf(stderr, "head: invalid option -- '%s'\n", arg);
+        return 1;
+    }
+
+    // Determine file count for header logic
+    I64 file_count = argc - start;
+    if (file_count == 0)
+        file_count = 1;  // stdin
+
+    Bool show_headers = (file_count > 1 && !quiet) || verbose;
+    Bool first_file = TRUE;
+
+    // Process files
+    I64 exit_status = 0;
+
+    auto process_file = [](FILE *fp, I64 lines, I64 bytes) {
+        if (bytes >= 0) {
+            // Byte mode
+            I64 count = 0;
+            I64 c;
+            while (count < bytes && (c = fgetc(fp)) != EOF) {
+                putchar(c);
+                count++;
+            }
+        } else {
+            // Line mode
+            I64 count = 0;
+            I64 c;
+            while (count < lines && (c = fgetc(fp)) != EOF) {
+                putchar(c);
+                if (c == '\n')
+                    count++;
+            }
+        }
+    };
+
+    if (start >= argc) {
+        // Read from stdin
+        if (show_headers)
+            printf("==> standard input <==\n");
+        process_file(stdin, num_lines, num_bytes);
+    } else {
+        for (I64 i = start; i < argc; i++) {
+            FILE *fp;
+
+            if (strcmp(argv[i], "-") == 0) {
+                fp = stdin;
+                if (show_headers) {
+                    if (!first_file)
+                        printf("\n");
+                    printf("==> standard input <==\n");
+                }
+            } else {
+                fp = fopen(argv[i], "r");
+                if (!fp) {
+                    fprintf(stderr, "head: cannot open '%s' for reading: %s\n",
+                            argv[i], strerror(errno));
+                    exit_status = 1;
+                    continue;
+                }
+                if (show_headers) {
+                    if (!first_file)
+                        printf("\n");
+                    printf("==> %s <==\n", argv[i]);
+                }
+            }
+
+            process_file(fp, num_lines, num_bytes);
+
+            if (fp != stdin)
+                fclose(fp);
+
+            first_file = FALSE;
+        }
+    }
+
+    return exit_status;
+}
+
+// Register as a utility
+U0 GnuHeadRegister()
+{
+    "GNU 'head' utility loaded. Run: CRun(&head_main, \"head -n 5 file.txt\");\n";
+}

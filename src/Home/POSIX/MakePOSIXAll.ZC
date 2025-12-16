@@ -1,0 +1,102 @@
+// MakePOSIXAll.ZC - Complete POSIX System Loader for ZealOS
+// This loads the complete POSIX compatibility layer including:
+// - Core POSIX functions
+// - POSIX Shell
+// - POSIX Utilities
+//
+// Usage:
+//   #include "MakePOSIXAll"
+//
+// Then you can:
+//   PosixInit();                        // Initialize POSIX layer
+//   CShellState *sh = ShellNew();       // Create shell
+//   ShellRun(sh, "ls -la");             // Run commands
+//   ShellInteractive(sh);               // Interactive mode
+//   ShellFree(sh);                      // Clean up
+
+Cd(__DIR__);
+
+// ============================================================================
+// CORE POSIX LAYER
+// ============================================================================
+
+#include "MakePOSIX"
+
+// ============================================================================
+// POSIX UTILITIES (must come before shell since shell uses them)
+// ============================================================================
+
+#include "Utils/MakeUtils"
+
+// ============================================================================
+// POSIX SHELL
+// ============================================================================
+
+#include "Shell/MakeShell"
+
+// ============================================================================
+// CONVENIENCE FUNCTION
+// ============================================================================
+
+// Run a simple POSIX command (creates temporary shell)
+I64 PosixSystem(U8 *command)
+{
+	CShellState *sh = ShellNew();
+	I64 status = ShellRun(sh, command);
+	ShellFree(sh);
+	return status;
+}
+
+// Start an interactive POSIX shell
+I64 PosixShell()
+{
+	CShellState *sh;
+	I64 status;
+
+	"ZealOS POSIX Shell\n";
+	"Type 'exit' to quit.\n\n";
+
+	sh = ShellNew();
+	sh->interactive = TRUE;
+
+	status = ShellInteractive(sh);
+
+	ShellFree(sh);
+	return status;
+}
+
+// ============================================================================
+// COMPLETE SYSTEM INITIALIZATION MESSAGE
+// ============================================================================
+
+"\n";
+"======================================================\n";
+"ZealOS POSIX Compatibility Layer - Complete System\n";
+"======================================================\n";
+"\n";
+"Core POSIX functions:\n";
+"  - File I/O: open, close, read, write, lseek, dup, dup2\n";
+"  - Pipes: pipe, pipe2\n";
+"  - Signals: signal, kill, raise, sigaction\n";
+"  - Processes: fork (emulated), exec, wait, waitpid\n";
+"  - Environment: getenv, setenv, unsetenv\n";
+"  - Time: sleep, usleep, time, gettimeofday\n";
+"  - Directories: opendir, readdir, closedir\n";
+"\n";
+"POSIX Shell:\n";
+"  - Full command parsing with pipelines and redirections\n";
+"  - Control structures: if/then/else, while, for, case\n";
+"  - Functions, aliases, variables\n";
+"  - Job control (limited)\n";
+"\n";
+"POSIX Utilities (40+):\n";
+"  - cat, head, tail, wc, cp, mv, rm, mkdir, ls, touch\n";
+"  - echo, printf, cut, tr, sort, uniq, grep, tee\n";
+"  - basename, dirname, env, expr, seq, sleep, date, uname\n";
+"  - And more...\n";
+"\n";
+"Quick Start:\n";
+"  PosixInit();                  // Initialize\n";
+"  PosixSystem(\"ls -la\");        // Run command\n";
+"  PosixShell();                 // Interactive shell\n";
+"\n";

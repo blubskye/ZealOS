@@ -1,0 +1,445 @@
+// popen.ZC - Process I/O for ZealOS libc
+// Implements popen(), pclose() for capturing command output
+
+#include "stdio.h"
+
+// ============================================================================
+// POPEN STATE TRACKING
+// ============================================================================
+
+#define POPEN_MAX 64
+
+class CPopenEntry {
+    FILE    *fp;            // The FILE* returned to user
+    I64     pid;            // Child process ID
+    I64     pipe_fd;        // Our end of the pipe
+    Bool    is_read;        // TRUE if reading from command
+};
+
+static CPopenEntry _popen_table[POPEN_MAX];
+static Bool _popen_initialized = FALSE;
+
+U0 _popen_init()
+{
+    if (_popen_initialized)
+        return;
+    MemSet(_popen_table, 0, sizeof(_popen_table));
+    _popen_initialized = TRUE;
+}
+
+CPopenEntry *_popen_alloc()
+{
+    _popen_init();
+    for (I64 i = 0; i < POPEN_MAX; i++) {
+        if (!_popen_table[i].fp)
+            return &_popen_table[i];
+    }
+    return NULL;
+}
+
+CPopenEntry *_popen_find(FILE *fp)
+{
+    for (I64 i = 0; i < POPEN_MAX; i++) {
+        if (_popen_table[i].fp == fp)
+            return &_popen_table[i];
+    }
+    return NULL;
+}
+
+// ============================================================================
+// POPEN / PCLOSE
+// ============================================================================
+
+FILE *popen(U8 *command, U8 *type)
+{
+    CPopenEntry *entry;
+    I64 pipefd[2];
+    I64 pid;
+    Bool is_read;
+    FILE *fp;
+
+    if (!command || !type)
+        return NULL;
+
+    // Determine direction
+    if (type[0] == 'r')
+        is_read = TRUE;
+    else if (type[0] == 'w')
+        is_read = FALSE;
+    else
+        return NULL;
+
+    // Allocate tracking entry
+    entry = _popen_alloc();
+    if (!entry) {
+        errno = EMFILE;
+        return NULL;
+    }
+
+    // Create pipe
+    if (PosixPipe(pipefd) < 0)
+        return NULL;
+
+    // Fork
+    pid = PosixFork();
+    if (pid < 0) {
+        PosixClose(pipefd[0]);
+        PosixClose(pipefd[1]);
+        return NULL;
+    }
+
+    if (pid == 0) {
+        // Child process
+        if (is_read) {
+            // Parent reads, child writes to stdout
+            PosixClose(pipefd[0]);  // Close read end
+            PosixFDDup2(posix_current, pipefd[1], STDOUT_FILENO);
+            PosixClose(pipefd[1]);
+        } else {
+            // Parent writes, child reads from stdin
+            PosixClose(pipefd[1]);  // Close write end
+            PosixFDDup2(posix_current, pipefd[0], STDIN_FILENO);
+            PosixClose(pipefd[0]);
+        }
+
+        // Execute command via shell
+        PosixExecl("/bin/sh", "sh", "-c", command, NULL);
+
+        // If exec fails, try our POSIX shell
+        // Build argv for shell
+        U8 *argv[4];
+        argv[0] = "sh";
+        argv[1] = "-c";
+        argv[2] = command;
+        argv[3] = NULL;
+
+        // Use our shell's command execution
+        extern I64 ShellRun(U0 *sh, U8 *cmd);
+        extern U0 *ShellNew();
+        U0 *sh = ShellNew();
+        if (sh) {
+            I64 status = ShellRun(sh, command);
+            extern U0 ShellFree(U0 *sh);
+            ShellFree(sh);
+            _exit(status);
+        }
+
+        _exit(127);
+    }
+
+    // Parent process
+    if (is_read) {
+        PosixClose(pipefd[1]);  // Close write end
+        fp = fdopen(pipefd[0], "r");
+    } else {
+        PosixClose(pipefd[0]);  // Close read end
+        fp = fdopen(pipefd[1], "w");
+    }
+
+    if (!fp) {
+        if (is_read)
+            PosixClose(pipefd[0]);
+        else
+            PosixClose(pipefd[1]);
+        return NULL;
+    }
+
+    // Record in table
+    entry->fp = fp;
+    entry->pid = pid;
+    entry->pipe_fd = is_read ? pipefd[0] : pipefd[1];
+    entry->is_read = is_read;
+
+    return fp;
+}
+
+I64 pclose(FILE *stream)
+{
+    CPopenEntry *entry;
+    I64 status = 0;
+
+    if (!stream)
+        return -1;
+
+    entry = _popen_find(stream);
+    if (!entry) {
+        errno = ECHILD;
+        return -1;
+    }
+
+    // Close the FILE
+    fclose(stream);
+
+    // Wait for child
+    PosixWaitPid(entry->pid, &status, 0);
+
+    // Clear entry
+    entry->fp = NULL;
+    entry->pid = 0;
+
+    return status;
+}
+
+// ============================================================================
+// SYSTEM() - Enhanced implementation
+// ============================================================================
+
+I64 system(U8 *command)
+{
+    I64 pid, status;
+
+    if (!command)
+        return 1;  // Shell is available
+
+    pid = PosixFork();
+    if (pid < 0)
+        return -1;
+
+    if (pid == 0) {
+        // Child - execute command
+        // Try external shell first
+        PosixExecl("/bin/sh", "sh", "-c", command, NULL);
+
+        // Fall back to our POSIX shell
+        extern I64 ShellRun(U0 *sh, U8 *cmd);
+        extern U0 *ShellNew();
+        extern U0 ShellFree(U0 *sh);
+
+        U0 *sh = ShellNew();
+        if (sh) {
+            status = ShellRun(sh, command);
+            ShellFree(sh);
+            _exit(status);
+        }
+
+        _exit(127);
+    }
+
+    // Parent - wait for child
+    if (PosixWaitPid(pid, &status, 0) < 0)
+        return -1;
+
+    return status;
+}
+
+// ============================================================================
+// POSIX_SPAWN - Lightweight process creation
+// ============================================================================
+
+// Spawn file actions
+#define POSIX_SPAWN_CLOSE       0
+#define POSIX_SPAWN_DUP2        1
+#define POSIX_SPAWN_OPEN        2
+
+class CSpawnAction {
+    U8      type;
+    I64     fd;
+    I64     newfd;          // For dup2
+    U8      *path;          // For open
+    I64     oflag;
+    I64     mode;
+    CSpawnAction *next;
+};
+
+class posix_spawn_file_actions_t {
+    CSpawnAction *head;
+    CSpawnAction *tail;
+};
+
+class posix_spawnattr_t {
+    I64     flags;
+    sigset_t sigmask;
+    sigset_t sigdefault;
+    pid_t   pgroup;
+};
+
+I64 posix_spawn_file_actions_init(posix_spawn_file_actions_t *fa)
+{
+    fa->head = NULL;
+    fa->tail = NULL;
+    return 0;
+}
+
+I64 posix_spawn_file_actions_destroy(posix_spawn_file_actions_t *fa)
+{
+    CSpawnAction *act = fa->head;
+    while (act) {
+        CSpawnAction *next = act->next;
+        if (act->path)
+            Free(act->path);
+        Free(act);
+        act = next;
+    }
+    fa->head = NULL;
+    fa->tail = NULL;
+    return 0;
+}
+
+I64 posix_spawn_file_actions_addclose(posix_spawn_file_actions_t *fa, I64 fd)
+{
+    CSpawnAction *act = MAlloc(sizeof(CSpawnAction));
+    MemSet(act, 0, sizeof(CSpawnAction));
+    act->type = POSIX_SPAWN_CLOSE;
+    act->fd = fd;
+
+    if (fa->tail)
+        fa->tail->next = act;
+    else
+        fa->head = act;
+    fa->tail = act;
+    return 0;
+}
+
+I64 posix_spawn_file_actions_adddup2(posix_spawn_file_actions_t *fa, I64 fd, I64 newfd)
+{
+    CSpawnAction *act = MAlloc(sizeof(CSpawnAction));
+    MemSet(act, 0, sizeof(CSpawnAction));
+    act->type = POSIX_SPAWN_DUP2;
+    act->fd = fd;
+    act->newfd = newfd;
+
+    if (fa->tail)
+        fa->tail->next = act;
+    else
+        fa->head = act;
+    fa->tail = act;
+    return 0;
+}
+
+I64 posix_spawn_file_actions_addopen(posix_spawn_file_actions_t *fa,
+                                      I64 fd, U8 *path, I64 oflag, I64 mode)
+{
+    CSpawnAction *act = MAlloc(sizeof(CSpawnAction));
+    MemSet(act, 0, sizeof(CSpawnAction));
+    act->type = POSIX_SPAWN_OPEN;
+    act->fd = fd;
+    act->path = StrNew(path);
+    act->oflag = oflag;
+    act->mode = mode;
+
+    if (fa->tail)
+        fa->tail->next = act;
+    else
+        fa->head = act;
+    fa->tail = act;
+    return 0;
+}
+
+I64 posix_spawnattr_init(posix_spawnattr_t *attr)
+{
+    MemSet(attr, 0, sizeof(posix_spawnattr_t));
+    return 0;
+}
+
+I64 posix_spawnattr_destroy(posix_spawnattr_t *attr)
+{
+    return 0;
+}
+
+// Main spawn function
+I64 posix_spawn(pid_t *pid, U8 *path,
+                posix_spawn_file_actions_t *file_actions,
+                posix_spawnattr_t *attrp,
+                U8 **argv, U8 **envp)
+{
+    I64 child_pid = PosixFork();
+
+    if (child_pid < 0)
+        return errno;
+
+    if (child_pid == 0) {
+        // Child process
+
+        // Apply file actions
+        if (file_actions) {
+            CSpawnAction *act = file_actions->head;
+            while (act) {
+                switch (act->type) {
+                    case POSIX_SPAWN_CLOSE:
+                        PosixClose(act->fd);
+                        break;
+                    case POSIX_SPAWN_DUP2:
+                        PosixFDDup2(posix_current, act->fd, act->newfd);
+                        break;
+                    case POSIX_SPAWN_OPEN: {
+                        I64 fd = PosixOpen(act->path, act->oflag, act->mode);
+                        if (fd >= 0 && fd != act->fd) {
+                            PosixFDDup2(posix_current, fd, act->fd);
+                            PosixClose(fd);
+                        }
+                        break;
+                    }
+                }
+                act = act->next;
+            }
+        }
+
+        // Execute
+        if (envp)
+            PosixExecve(path, argv, envp);
+        else
+            PosixExecv(path, argv);
+
+        _exit(127);
+    }
+
+    // Parent
+    if (pid)
+        *pid = child_pid;
+
+    return 0;
+}
+
+I64 posix_spawnp(pid_t *pid, U8 *file,
+                 posix_spawn_file_actions_t *file_actions,
+                 posix_spawnattr_t *attrp,
+                 U8 **argv, U8 **envp)
+{
+    // Search PATH for file
+    if (strchr(file, '/'))
+        return posix_spawn(pid, file, file_actions, attrp, argv, envp);
+
+    U8 *path_env = getenv("PATH");
+    if (!path_env)
+        path_env = "/bin:/usr/bin";
+
+    U8 path_copy[1024];
+    StrCpy(path_copy, path_env);
+
+    U8 full_path[PATH_MAX];
+    U8 *dir = strtok(path_copy, ":");
+
+    while (dir) {
+        snprintf(full_path, PATH_MAX, "%s/%s", dir, file);
+        if (access(full_path, X_OK) == 0)
+            return posix_spawn(pid, full_path, file_actions, attrp, argv, envp);
+        dir = strtok(NULL, ":");
+    }
+
+    return ENOENT;
+}
+
+// ============================================================================
+// WAIT FUNCTIONS
+// ============================================================================
+
+pid_t wait(I64 *status)
+{
+    return PosixWait(status);
+}
+
+pid_t waitpid(pid_t pid, I64 *status, I64 options)
+{
+    return PosixWaitPid(pid, status, options);
+}
+
+// wait3/wait4 - simplified versions
+pid_t wait3(I64 *status, I64 options, U0 *rusage)
+{
+    return waitpid(-1, status, options);
+}
+
+pid_t wait4(pid_t pid, I64 *status, I64 options, U0 *rusage)
+{
+    return waitpid(pid, status, options);
+}

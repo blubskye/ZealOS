@@ -1,0 +1,584 @@
+// poll.ZC - I/O multiplexing for ZealOS
+// Part of the POSIX compatibility layer
+//
+// Implements poll(), select(), and related functions for monitoring
+// multiple file descriptors for I/O readiness.
+
+// ============================================================================
+// POLL CONSTANTS
+// ============================================================================
+
+// Events to request
+#define POLLIN          0x0001      // Data to read
+#define POLLPRI         0x0002      // Urgent data to read
+#define POLLOUT         0x0004      // Writing will not block
+#define POLLRDNORM      0x0040      // Normal data to read
+#define POLLRDBAND      0x0080      // Priority data to read
+#define POLLWRNORM      0x0100      // Normal data may be written
+#define POLLWRBAND      0x0200      // Priority data may be written
+
+// Events returned
+#define POLLERR         0x0008      // Error condition
+#define POLLHUP         0x0010      // Hung up
+#define POLLNVAL        0x0020      // Invalid request
+
+// ============================================================================
+// POLL STRUCTURES
+// ============================================================================
+
+class pollfd {
+    I64     fd;             // File descriptor
+    I16     events;         // Requested events
+    I16     revents;        // Returned events
+};
+
+typedef U64 nfds_t;
+
+// ============================================================================
+// SELECT STRUCTURES
+// ============================================================================
+
+#define FD_SETSIZE      1024
+
+// File descriptor set (bitmap)
+class fd_set {
+    U64     fds_bits[FD_SETSIZE / 64];
+};
+
+// Macros for fd_set manipulation
+#define FD_ZERO(set)        MemSet(set, 0, sizeof(fd_set))
+#define FD_SET(fd, set)     ((set)->fds_bits[(fd) / 64] |= (1ULL << ((fd) % 64)))
+#define FD_CLR(fd, set)     ((set)->fds_bits[(fd) / 64] &= ~(1ULL << ((fd) % 64)))
+#define FD_ISSET(fd, set)   (((set)->fds_bits[(fd) / 64] >> ((fd) % 64)) & 1)
+
+// ============================================================================
+// POLL IMPLEMENTATION
+// ============================================================================
+
+// Check if a file descriptor is readable
+Bool PollCheckReadable(I64 fd)
+{
+    CPosixProcess *proc = PosixGetCurrent();
+    if (!proc)
+        return FALSE;
+
+    CPosixFD *pfd = PosixFDGet(proc, fd);
+    if (!pfd)
+        return FALSE;
+
+    switch (pfd->type) {
+        case FD_TYPE_FILE:
+            // Files are always readable (may return 0 at EOF)
+            return TRUE;
+
+        case FD_TYPE_PIPE:
+            // Pipe is readable if there's data or writer closed
+            if (pfd->pipe) {
+                if (pfd->pipe->count > 0)
+                    return TRUE;
+                if (pfd->pipe->write_closed)
+                    return TRUE;  // EOF
+            }
+            return FALSE;
+
+        case FD_TYPE_TTY:
+            // TTY is always readable (may block, but we say yes)
+            return TRUE;
+
+        default:
+            return TRUE;
+    }
+}
+
+// Check if a file descriptor is writable
+Bool PollCheckWritable(I64 fd)
+{
+    CPosixProcess *proc = PosixGetCurrent();
+    if (!proc)
+        return FALSE;
+
+    CPosixFD *pfd = PosixFDGet(proc, fd);
+    if (!pfd)
+        return FALSE;
+
+    switch (pfd->type) {
+        case FD_TYPE_FILE:
+            // Files are always writable
+            return TRUE;
+
+        case FD_TYPE_PIPE:
+            // Pipe is writable if there's space and reader alive
+            if (pfd->pipe) {
+                if (pfd->pipe->read_closed)
+                    return FALSE;  // Would SIGPIPE
+                if (pfd->pipe->count < pfd->pipe->size)
+                    return TRUE;
+            }
+            return FALSE;
+
+        case FD_TYPE_TTY:
+            return TRUE;
+
+        default:
+            return TRUE;
+    }
+}
+
+// Check if a file descriptor has an error
+Bool PollCheckError(I64 fd)
+{
+    CPosixProcess *proc = PosixGetCurrent();
+    if (!proc)
+        return TRUE;
+
+    CPosixFD *pfd = PosixFDGet(proc, fd);
+    if (!pfd)
+        return TRUE;  // Invalid FD is an error
+
+    // Check for pipe errors
+    if (pfd->type == FD_TYPE_PIPE && pfd->pipe) {
+        if (pfd->is_read_end && pfd->pipe->write_closed && pfd->pipe->count == 0)
+            return FALSE;  // EOF, not error
+        if (!pfd->is_read_end && pfd->pipe->read_closed)
+            return TRUE;  // EPIPE
+    }
+
+    return FALSE;
+}
+
+// Check if a file descriptor has hungup
+Bool PollCheckHangup(I64 fd)
+{
+    CPosixProcess *proc = PosixGetCurrent();
+    if (!proc)
+        return FALSE;
+
+    CPosixFD *pfd = PosixFDGet(proc, fd);
+    if (!pfd)
+        return FALSE;
+
+    // Pipe hangup when other end closes
+    if (pfd->type == FD_TYPE_PIPE && pfd->pipe) {
+        if (pfd->is_read_end && pfd->pipe->write_closed)
+            return TRUE;
+        if (!pfd->is_read_end && pfd->pipe->read_closed)
+            return TRUE;
+    }
+
+    return FALSE;
+}
+
+// Poll file descriptors
+I64 poll(pollfd *fds, nfds_t nfds, I64 timeout)
+{
+    if (!fds && nfds > 0) {
+        posix_errno = EFAULT;
+        return -1;
+    }
+
+    CPosixProcess *proc = PosixGetCurrent();
+    if (!proc) {
+        posix_errno = EINVAL;
+        return -1;
+    }
+
+    U64 start_time = tS * 1000;
+    U64 end_time = (timeout < 0) ? 0xFFFFFFFFFFFFFFFF : start_time + timeout;
+    I64 ready = 0;
+
+    do {
+        ready = 0;
+
+        for (I64 i = 0; i < nfds; i++) {
+            fds[i].revents = 0;
+
+            if (fds[i].fd < 0)
+                continue;
+
+            CPosixFD *pfd = PosixFDGet(proc, fds[i].fd);
+            if (!pfd) {
+                fds[i].revents = POLLNVAL;
+                ready++;
+                continue;
+            }
+
+            // Check requested events
+            if ((fds[i].events & (POLLIN | POLLRDNORM)) && PollCheckReadable(fds[i].fd))
+                fds[i].revents |= (fds[i].events & (POLLIN | POLLRDNORM));
+
+            if ((fds[i].events & (POLLOUT | POLLWRNORM)) && PollCheckWritable(fds[i].fd))
+                fds[i].revents |= (fds[i].events & (POLLOUT | POLLWRNORM));
+
+            // Check error conditions (always reported)
+            if (PollCheckError(fds[i].fd))
+                fds[i].revents |= POLLERR;
+
+            if (PollCheckHangup(fds[i].fd))
+                fds[i].revents |= POLLHUP;
+
+            if (fds[i].revents)
+                ready++;
+        }
+
+        if (ready > 0 || timeout == 0)
+            break;
+
+        // Yield and check timeout
+        Yield;
+
+    } while ((tS * 1000)(U64) < end_time);
+
+    return ready;
+}
+
+// ppoll - poll with signal mask (simplified)
+I64 ppoll(pollfd *fds, nfds_t nfds, timespec *timeout_ts, CPosixSigSet *sigmask)
+{
+    I64 timeout;
+
+    if (timeout_ts) {
+        timeout = timeout_ts->tv_sec * 1000 + timeout_ts->tv_nsec / 1000000;
+    } else {
+        timeout = -1;  // Infinite
+    }
+
+    // Signal mask handling would go here
+    // For simplicity, we ignore it
+
+    return poll(fds, nfds, timeout);
+}
+
+// ============================================================================
+// SELECT IMPLEMENTATION
+// ============================================================================
+
+I64 select(I64 nfds, fd_set *readfds, fd_set *writefds, fd_set *exceptfds,
+           timeval *timeout)
+{
+    if (nfds < 0 || nfds > FD_SETSIZE) {
+        posix_errno = EINVAL;
+        return -1;
+    }
+
+    CPosixProcess *proc = PosixGetCurrent();
+    if (!proc) {
+        posix_errno = EINVAL;
+        return -1;
+    }
+
+    I64 timeout_ms;
+    if (timeout) {
+        timeout_ms = timeout->tv_sec * 1000 + timeout->tv_usec / 1000;
+    } else {
+        timeout_ms = -1;  // Infinite
+    }
+
+    U64 start_time = tS * 1000;
+    U64 end_time = (timeout_ms < 0) ? 0xFFFFFFFFFFFFFFFF : start_time + timeout_ms;
+
+    // Create result sets
+    fd_set result_read, result_write, result_except;
+    FD_ZERO(&result_read);
+    FD_ZERO(&result_write);
+    FD_ZERO(&result_except);
+
+    I64 ready = 0;
+
+    do {
+        ready = 0;
+        FD_ZERO(&result_read);
+        FD_ZERO(&result_write);
+        FD_ZERO(&result_except);
+
+        for (I64 fd = 0; fd < nfds; fd++) {
+            // Check read
+            if (readfds && FD_ISSET(fd, readfds)) {
+                if (PollCheckReadable(fd)) {
+                    FD_SET(fd, &result_read);
+                    ready++;
+                }
+            }
+
+            // Check write
+            if (writefds && FD_ISSET(fd, writefds)) {
+                if (PollCheckWritable(fd)) {
+                    FD_SET(fd, &result_write);
+                    ready++;
+                }
+            }
+
+            // Check exception
+            if (exceptfds && FD_ISSET(fd, exceptfds)) {
+                if (PollCheckError(fd)) {
+                    FD_SET(fd, &result_except);
+                    ready++;
+                }
+            }
+        }
+
+        if (ready > 0 || timeout_ms == 0)
+            break;
+
+        Yield;
+
+    } while ((tS * 1000)(U64) < end_time);
+
+    // Copy results back
+    if (readfds)
+        MemCpy(readfds, &result_read, sizeof(fd_set));
+    if (writefds)
+        MemCpy(writefds, &result_write, sizeof(fd_set));
+    if (exceptfds)
+        MemCpy(exceptfds, &result_except, sizeof(fd_set));
+
+    // Update timeout with remaining time
+    if (timeout && timeout_ms > 0) {
+        U64 elapsed = (tS * 1000)(U64) - start_time;
+        if (elapsed < timeout_ms) {
+            I64 remaining = timeout_ms - elapsed;
+            timeout->tv_sec = remaining / 1000;
+            timeout->tv_usec = (remaining % 1000) * 1000;
+        } else {
+            timeout->tv_sec = 0;
+            timeout->tv_usec = 0;
+        }
+    }
+
+    return ready;
+}
+
+// pselect - select with signal mask and timespec
+I64 pselect(I64 nfds, fd_set *readfds, fd_set *writefds, fd_set *exceptfds,
+            timespec *timeout, CPosixSigSet *sigmask)
+{
+    timeval tv;
+    timeval *tvp = NULL;
+
+    if (timeout) {
+        tv.tv_sec = timeout->tv_sec;
+        tv.tv_usec = timeout->tv_nsec / 1000;
+        tvp = &tv;
+    }
+
+    // Signal mask handling would go here
+
+    return select(nfds, readfds, writefds, exceptfds, tvp);
+}
+
+// ============================================================================
+// EPOLL (Linux-specific, but commonly used)
+// ============================================================================
+
+#define EPOLL_CTL_ADD   1
+#define EPOLL_CTL_DEL   2
+#define EPOLL_CTL_MOD   3
+
+#define EPOLLIN         POLLIN
+#define EPOLLOUT        POLLOUT
+#define EPOLLERR        POLLERR
+#define EPOLLHUP        POLLHUP
+#define EPOLLPRI        POLLPRI
+#define EPOLLRDHUP      0x2000
+#define EPOLLET         0x80000000  // Edge-triggered
+#define EPOLLONESHOT    0x40000000
+
+class epoll_event {
+    U32     events;
+    U64     data;       // User data (often fd or pointer)
+};
+
+#define EPOLL_MAX_FDS   256
+
+class CEpollInstance {
+    Bool        in_use;
+    epoll_event entries[EPOLL_MAX_FDS];
+    I64         count;
+};
+
+CEpollInstance epoll_instances[64];
+Bool epoll_initialized = FALSE;
+
+U0 EpollInit()
+{
+    if (epoll_initialized)
+        return;
+
+    MemSet(epoll_instances, 0, sizeof(epoll_instances));
+    epoll_initialized = TRUE;
+}
+
+// Create epoll instance
+I64 epoll_create(I64 size)
+{
+    return epoll_create1(0);
+}
+
+I64 epoll_create1(I64 flags)
+{
+    EpollInit();
+
+    // Find free slot
+    for (I64 i = 0; i < 64; i++) {
+        if (!epoll_instances[i].in_use) {
+            epoll_instances[i].in_use = TRUE;
+            epoll_instances[i].count = 0;
+            // Return pseudo-fd (negative to distinguish)
+            return -(i + 100);
+        }
+    }
+
+    posix_errno = EMFILE;
+    return -1;
+}
+
+// Control epoll instance
+I64 epoll_ctl(I64 epfd, I64 op, I64 fd, epoll_event *event)
+{
+    EpollInit();
+
+    // Get epoll instance
+    I64 idx = -(epfd + 100);
+    if (idx < 0 || idx >= 64 || !epoll_instances[idx].in_use) {
+        posix_errno = EBADF;
+        return -1;
+    }
+
+    CEpollInstance *ep = &epoll_instances[idx];
+
+    switch (op) {
+        case EPOLL_CTL_ADD:
+            if (ep->count >= EPOLL_MAX_FDS) {
+                posix_errno = ENOMEM;
+                return -1;
+            }
+            // Check if already exists
+            for (I64 i = 0; i < ep->count; i++) {
+                if ((ep->entries[i].data & 0xFFFFFFFF) == fd) {
+                    posix_errno = EEXIST;
+                    return -1;
+                }
+            }
+            ep->entries[ep->count].events = event->events;
+            ep->entries[ep->count].data = fd;  // Store fd in data
+            ep->count++;
+            break;
+
+        case EPOLL_CTL_DEL:
+            for (I64 i = 0; i < ep->count; i++) {
+                if ((ep->entries[i].data & 0xFFFFFFFF) == fd) {
+                    // Remove by shifting
+                    for (I64 j = i; j < ep->count - 1; j++)
+                        ep->entries[j] = ep->entries[j + 1];
+                    ep->count--;
+                    return 0;
+                }
+            }
+            posix_errno = ENOENT;
+            return -1;
+
+        case EPOLL_CTL_MOD:
+            for (I64 i = 0; i < ep->count; i++) {
+                if ((ep->entries[i].data & 0xFFFFFFFF) == fd) {
+                    ep->entries[i].events = event->events;
+                    return 0;
+                }
+            }
+            posix_errno = ENOENT;
+            return -1;
+
+        default:
+            posix_errno = EINVAL;
+            return -1;
+    }
+
+    return 0;
+}
+
+// Wait for events
+I64 epoll_wait(I64 epfd, epoll_event *events, I64 maxevents, I64 timeout)
+{
+    EpollInit();
+
+    I64 idx = -(epfd + 100);
+    if (idx < 0 || idx >= 64 || !epoll_instances[idx].in_use) {
+        posix_errno = EBADF;
+        return -1;
+    }
+
+    if (!events || maxevents <= 0) {
+        posix_errno = EINVAL;
+        return -1;
+    }
+
+    CEpollInstance *ep = &epoll_instances[idx];
+
+    U64 start_time = tS * 1000;
+    U64 end_time = (timeout < 0) ? 0xFFFFFFFFFFFFFFFF : start_time + timeout;
+
+    I64 ready = 0;
+
+    do {
+        ready = 0;
+
+        for (I64 i = 0; i < ep->count && ready < maxevents; i++) {
+            I64 fd = ep->entries[i].data & 0xFFFFFFFF;
+            U32 revents = 0;
+
+            if ((ep->entries[i].events & EPOLLIN) && PollCheckReadable(fd))
+                revents |= EPOLLIN;
+
+            if ((ep->entries[i].events & EPOLLOUT) && PollCheckWritable(fd))
+                revents |= EPOLLOUT;
+
+            if (PollCheckError(fd))
+                revents |= EPOLLERR;
+
+            if (PollCheckHangup(fd))
+                revents |= EPOLLHUP;
+
+            if (revents) {
+                events[ready].events = revents;
+                events[ready].data = ep->entries[i].data;
+                ready++;
+            }
+        }
+
+        if (ready > 0 || timeout == 0)
+            break;
+
+        Yield;
+
+    } while ((tS * 1000)(U64) < end_time);
+
+    return ready;
+}
+
+I64 epoll_pwait(I64 epfd, epoll_event *events, I64 maxevents, I64 timeout,
+                CPosixSigSet *sigmask)
+{
+    // Signal mask handling would go here
+    return epoll_wait(epfd, events, maxevents, timeout);
+}
+
+// Close epoll instance
+I64 epoll_close(I64 epfd)
+{
+    EpollInit();
+
+    I64 idx = -(epfd + 100);
+    if (idx < 0 || idx >= 64 || !epoll_instances[idx].in_use) {
+        posix_errno = EBADF;
+        return -1;
+    }
+
+    epoll_instances[idx].in_use = FALSE;
+    epoll_instances[idx].count = 0;
+
+    return 0;
+}
+
+// ============================================================================
+// INITIALIZATION
+// ============================================================================
+
+"poll/select/epoll loaded\n";

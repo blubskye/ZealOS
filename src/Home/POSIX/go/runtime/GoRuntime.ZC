@@ -1,0 +1,678 @@
+// GoRuntime.ZC - Go Runtime Implementation for ZealOS
+// Part of the POSIX compatibility layer
+//
+// This implements the core Go runtime: M-P-G scheduler, memory management,
+// and OS thread management.
+
+#include "../Go.HH"
+#include "../Futex.ZC"
+
+// ============================================================================
+// GLOBAL STATE
+// ============================================================================
+
+CGoSched gosched;
+CGoMemStats go_memstats;
+
+// CPU feature flags
+Bool go_has_sse2 = TRUE;    // x86-64 always has SSE2
+Bool go_has_sse3 = FALSE;
+Bool go_has_ssse3 = FALSE;
+Bool go_has_sse41 = FALSE;
+Bool go_has_sse42 = FALSE;
+Bool go_has_avx = FALSE;
+Bool go_has_avx2 = FALSE;
+
+// Thread-local storage key for current G
+I64 go_tls_g_key = -1;
+
+// Preallocated structures
+CGoG go_g_pool[1024];
+CGoM go_m_pool[GO_MAX_THREADS];
+CGoP go_p_pool[GO_MAX_PROCS];
+
+I64 go_g_pool_next = 0;
+I64 go_m_pool_next = 0;
+
+Bool go_runtime_initialized = FALSE;
+
+// ============================================================================
+// CPU FEATURE DETECTION
+// ============================================================================
+
+U0 GoDetectCPU()
+{
+    // Use CPUID to detect features
+    U32 eax, ebx, ecx, edx;
+
+    // Basic CPUID
+    eax = 1;
+    asm {
+        MOV EAX, [eax]
+        CPUID
+        MOV [eax], EAX
+        MOV [ebx], EBX
+        MOV [ecx], ECX
+        MOV [edx], EDX
+    }
+
+    go_has_sse3 = (ecx & (1 << 0)) != 0;
+    go_has_ssse3 = (ecx & (1 << 9)) != 0;
+    go_has_sse41 = (ecx & (1 << 19)) != 0;
+    go_has_sse42 = (ecx & (1 << 20)) != 0;
+    go_has_avx = (ecx & (1 << 28)) != 0;
+
+    // Extended CPUID for AVX2
+    eax = 7;
+    ecx = 0;
+    asm {
+        MOV EAX, [eax]
+        MOV ECX, [ecx]
+        CPUID
+        MOV [ebx], EBX
+    }
+
+    go_has_avx2 = (ebx & (1 << 5)) != 0;
+}
+
+// ============================================================================
+// TIME FUNCTIONS
+// ============================================================================
+
+I64 GoNanotime()
+{
+    // Get time in nanoseconds since some epoch
+    // Use ZealOS ticks and convert
+    I64 ticks = GetTicks();
+    // Assume ~1000 ticks per second (adjust based on actual tick rate)
+    return ticks * 1000000;  // Convert to nanoseconds
+}
+
+I64 GoWalltime(I64 *sec, I64 *nsec)
+{
+    // Get wall clock time
+    CDateStruct ds;
+    Now(&ds);
+
+    // Convert to Unix timestamp
+    I64 unix_sec = 0;
+
+    // Days since 1970
+    // Simplified calculation
+    I64 year = ds.year;
+    I64 days = 0;
+
+    for (I64 y = 1970; y < year; y++) {
+        if ((y % 4 == 0 && y % 100 != 0) || y % 400 == 0)
+            days += 366;
+        else
+            days += 365;
+    }
+
+    // Days in current year
+    I64 mdays[12] = {31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31};
+    if ((year % 4 == 0 && year % 100 != 0) || year % 400 == 0)
+        mdays[1] = 29;
+
+    for (I64 m = 0; m < ds.mon - 1; m++)
+        days += mdays[m];
+    days += ds.day_of_mon - 1;
+
+    unix_sec = days * 86400 + ds.hour * 3600 + ds.min * 60 + ds.sec;
+
+    if (sec)
+        *sec = unix_sec;
+    if (nsec)
+        *nsec = 0;  // No sub-second precision available
+
+    return unix_sec;
+}
+
+U0 GoSleep(I64 ns)
+{
+    if (ns <= 0)
+        return;
+
+    // Convert to milliseconds and sleep
+    I64 ms = ns / 1000000;
+    if (ms < 1)
+        ms = 1;
+
+    Sleep(ms);
+}
+
+// ============================================================================
+// MEMORY MANAGEMENT
+// ============================================================================
+
+void *GoSysAlloc(I64 size)
+{
+    void *p = MAlloc(size);
+    if (p) {
+        go_memstats.sys += size;
+        go_memstats.mallocs++;
+    }
+    return p;
+}
+
+U0 GoSysFree(void *addr, I64 size)
+{
+    if (addr) {
+        Free(addr);
+        go_memstats.sys -= size;
+        go_memstats.frees++;
+    }
+}
+
+void *GoSysMmap(void *addr, I64 size, I64 prot, I64 flags)
+{
+    // Use our mmap implementation
+    void *p = mmap(addr, size, prot, flags, -1, 0);
+    if (p != MAP_FAILED) {
+        go_memstats.sys += size;
+        return p;
+    }
+    return NULL;
+}
+
+U0 GoSysMunmap(void *addr, I64 size)
+{
+    if (addr) {
+        munmap(addr, size);
+        go_memstats.sys -= size;
+    }
+}
+
+// ============================================================================
+// GOROUTINE MANAGEMENT
+// ============================================================================
+
+// Allocate a new G
+CGoG *GoAllocG()
+{
+    if (go_g_pool_next >= 1024)
+        return NULL;
+
+    CGoG *g = &go_g_pool[go_g_pool_next++];
+    MemSet(g, 0, sizeof(CGoG));
+
+    gosched.g_count++;
+    g->goid = gosched.next_goid++;
+
+    return g;
+}
+
+// Create new goroutine
+CGoG *GoNewG(void *fn, void *arg, I64 stack_size)
+{
+    if (stack_size < GO_STACK_MIN)
+        stack_size = GO_STACK_MIN;
+
+    CGoG *g = GoAllocG();
+    if (!g)
+        return NULL;
+
+    // Allocate stack
+    g->stack_lo = GoSysAlloc(stack_size);
+    if (!g->stack_lo) {
+        // Return G to pool
+        go_g_pool_next--;
+        gosched.g_count--;
+        return NULL;
+    }
+
+    g->stack_hi = g->stack_lo + stack_size;
+    g->stack_guard = g->stack_lo + GO_STACK_GUARD;
+
+    g->fn = fn;
+    g->fn_arg = arg;
+    g->status = GO_GRUNNABLE;
+
+    go_memstats.stack_inuse += stack_size;
+    go_memstats.stack_sys += stack_size;
+
+    return g;
+}
+
+// Free goroutine
+U0 GoFreeG(CGoG *g)
+{
+    if (g->stack_lo) {
+        I64 stack_size = g->stack_hi - g->stack_lo;
+        GoSysFree(g->stack_lo, stack_size);
+        go_memstats.stack_inuse -= stack_size;
+    }
+
+    g->status = GO_GDEAD;
+    gosched.g_count--;
+}
+
+// ============================================================================
+// M (MACHINE/THREAD) MANAGEMENT
+// ============================================================================
+
+// Allocate a new M
+CGoM *GoAllocM()
+{
+    if (go_m_pool_next >= GO_MAX_THREADS)
+        return NULL;
+
+    CGoM *m = &go_m_pool[go_m_pool_next++];
+    MemSet(m, 0, sizeof(CGoM));
+
+    m->id = gosched.next_mid++;
+    gosched.m_count++;
+
+    return m;
+}
+
+// Thread entry point wrapper
+U0 GoMStartWrapper()
+{
+    // Get M from TLS
+    CGoM *m = GoGetM();
+    if (m)
+        GoMStart(m);
+}
+
+// Create new OS thread (M)
+CGoM *GoNewM(CGoP *p, Bool spinning)
+{
+    CGoM *m = GoAllocM();
+    if (!m)
+        return NULL;
+
+    // Create g0 (scheduler stack)
+    m->g0 = GoNewG(NULL, NULL, GO_STACK_SYSTEM);
+    if (!m->g0) {
+        go_m_pool_next--;
+        gosched.m_count--;
+        return NULL;
+    }
+
+    m->g0->m = m;
+    m->p = p;
+    m->spinning = spinning;
+    m->status = GO_MIDLE;
+
+    // Create ZealOS task
+    m->task = Spawn(&GoMStartWrapper, NULL, "GoM");
+    if (!m->task) {
+        GoFreeG(m->g0);
+        go_m_pool_next--;
+        gosched.m_count--;
+        return NULL;
+    }
+
+    m->thread_id = m->task->task_num;
+
+    return m;
+}
+
+// M entry point
+U0 GoMStart(CGoM *m)
+{
+    // Set TLS
+    m->tls[0] = m->g0;  // Current G = g0
+
+    // Set signal stack (simplified)
+    // sigaltstack would go here
+
+    m->status = GO_MRUNNING;
+
+    // Run scheduler
+    GoSchedRun();
+}
+
+// ============================================================================
+// P (PROCESSOR) MANAGEMENT
+// ============================================================================
+
+// Initialize P
+U0 GoPInit(CGoP *p, I64 id)
+{
+    MemSet(p, 0, sizeof(CGoP));
+    p->id = id;
+    p->status = GO_PIDLE;
+}
+
+// Add G to P's local run queue
+Bool GoPRunQueuePut(CGoP *p, CGoG *g, Bool next)
+{
+    if (p->run_queue_len >= GO_RUN_QUEUE_SIZE)
+        return FALSE;
+
+    I64 tail = p->run_queue_tail;
+    p->run_queue[tail & (GO_RUN_QUEUE_SIZE - 1)] = g;
+    p->run_queue_tail = tail + 1;
+    p->run_queue_len++;
+
+    return TRUE;
+}
+
+// Get G from P's local run queue
+CGoG *GoPRunQueueGet(CGoP *p)
+{
+    if (p->run_queue_len == 0)
+        return NULL;
+
+    I64 head = p->run_queue_head;
+    CGoG *g = p->run_queue[head & (GO_RUN_QUEUE_SIZE - 1)];
+    p->run_queue_head = head + 1;
+    p->run_queue_len--;
+
+    return g;
+}
+
+// ============================================================================
+// SCHEDULER
+// ============================================================================
+
+// Global run queue lock
+CGoMutex gosched_lock;
+
+// Add G to global run queue
+U0 GoSchedPutG(CGoG *g)
+{
+    GoMutexLock(&gosched_lock);
+
+    g->sched_link = NULL;
+    if (gosched.run_queue_tail) {
+        gosched.run_queue_tail->sched_link = g;
+        gosched.run_queue_tail = g;
+    } else {
+        gosched.run_queue_head = gosched.run_queue_tail = g;
+    }
+    gosched.run_queue_size++;
+
+    GoMutexUnlock(&gosched_lock);
+}
+
+// Get G from global run queue
+CGoG *GoSchedGetG()
+{
+    GoMutexLock(&gosched_lock);
+
+    CGoG *g = gosched.run_queue_head;
+    if (g) {
+        gosched.run_queue_head = g->sched_link;
+        if (!gosched.run_queue_head)
+            gosched.run_queue_tail = NULL;
+        gosched.run_queue_size--;
+        g->sched_link = NULL;
+    }
+
+    GoMutexUnlock(&gosched_lock);
+    return g;
+}
+
+// Schedule goroutine for execution
+U0 GoSchedule(CGoG *g)
+{
+    g->status = GO_GRUNNABLE;
+
+    // Try local P first
+    CGoM *m = GoGetM();
+    if (m && m->p) {
+        if (GoPRunQueuePut(m->p, g, FALSE))
+            return;
+    }
+
+    // Fall back to global queue
+    GoSchedPutG(g);
+}
+
+// Find runnable goroutine
+CGoG *GoFindRunnable(CGoP *p)
+{
+    CGoG *g;
+
+    // Check local queue first
+    g = GoPRunQueueGet(p);
+    if (g)
+        return g;
+
+    // Check global queue
+    g = GoSchedGetG();
+    if (g)
+        return g;
+
+    // TODO: Work stealing from other P's
+
+    return NULL;
+}
+
+// Main scheduler loop
+U0 GoSchedRun()
+{
+    CGoM *m = GoGetM();
+    if (!m || !m->p)
+        return;
+
+    CGoP *p = m->p;
+
+    while (TRUE) {
+        // Find runnable goroutine
+        CGoG *g = GoFindRunnable(p);
+
+        if (g) {
+            // Execute goroutine
+            g->status = GO_GRUNNING;
+            g->m = m;
+            m->curg = g;
+            p->schedtick++;
+
+            // Call goroutine function
+            if (g->fn) {
+                I64 (*fn)(void*) = g->fn;
+                fn(g->fn_arg);
+            }
+
+            // Goroutine finished
+            g->status = GO_GDEAD;
+            m->curg = NULL;
+
+            // Reuse G structure
+            g->fn = NULL;
+            g->fn_arg = NULL;
+        } else {
+            // No work - yield
+            Yield();
+        }
+    }
+}
+
+// Yield current goroutine
+U0 GoYield()
+{
+    CGoG *g = GoGetG();
+    if (g && g->status == GO_GRUNNING) {
+        g->status = GO_GRUNNABLE;
+        GoSchedule(g);
+    }
+    Yield();
+}
+
+// Park current goroutine
+U0 GoPark(void *lock, U8 *reason)
+{
+    CGoG *g = GoGetG();
+    if (!g)
+        return;
+
+    g->status = GO_GWAITING;
+    g->wait_lock = lock;
+    g->waiting_label = reason;
+
+    // Yield control
+    Yield();
+}
+
+// Make goroutine runnable
+U0 GoReady(CGoG *g)
+{
+    if (!g || g->status != GO_GWAITING)
+        return;
+
+    g->status = GO_GRUNNABLE;
+    g->wait_lock = NULL;
+    g->waiting_label = NULL;
+
+    GoSchedule(g);
+}
+
+// Exit current goroutine
+U0 GoExit()
+{
+    CGoG *g = GoGetG();
+    if (g) {
+        g->status = GO_GDEAD;
+    }
+    // Return to scheduler
+}
+
+// ============================================================================
+// TLS (Thread Local Storage)
+// ============================================================================
+
+U0 GoSetTLS(void *tls)
+{
+    // Use ZealOS task-local storage
+    Fs->user_data = tls;
+}
+
+void *GoGetTLS()
+{
+    return Fs->user_data;
+}
+
+CGoG *GoGetG()
+{
+    CGoM *m = GoGetM();
+    if (m)
+        return m->curg ? m->curg : m->g0;
+    return NULL;
+}
+
+CGoM *GoGetM()
+{
+    // Find M for current task
+    for (I64 i = 0; i < go_m_pool_next; i++) {
+        if (go_m_pool[i].task == Fs)
+            return &go_m_pool[i];
+    }
+    return NULL;
+}
+
+// ============================================================================
+// SYSCALL SUPPORT
+// ============================================================================
+
+U0 GoEnterSyscall()
+{
+    CGoG *g = GoGetG();
+    CGoM *m = GoGetM();
+
+    if (g && m) {
+        g->status = GO_GSYSCALL;
+        m->status = GO_MSYSCALL;
+
+        // Detach P from M
+        if (m->p) {
+            m->oldp = m->p;
+            m->p->m = NULL;
+            m->p->status = GO_PSYSCALL;
+            m->p = NULL;
+        }
+    }
+}
+
+U0 GoExitSyscall()
+{
+    CGoG *g = GoGetG();
+    CGoM *m = GoGetM();
+
+    if (g && m) {
+        g->status = GO_GRUNNING;
+        m->status = GO_MRUNNING;
+
+        // Try to reacquire old P
+        if (m->oldp) {
+            m->p = m->oldp;
+            m->p->m = m;
+            m->p->status = GO_PRUNNING;
+            m->oldp = NULL;
+        }
+    }
+}
+
+// ============================================================================
+// RUNTIME INITIALIZATION
+// ============================================================================
+
+U0 GoRuntimeInit()
+{
+    if (go_runtime_initialized)
+        return;
+
+    // Initialize state
+    MemSet(&gosched, 0, sizeof(CGoSched));
+    MemSet(&go_memstats, 0, sizeof(CGoMemStats));
+    MemSet(go_g_pool, 0, sizeof(go_g_pool));
+    MemSet(go_m_pool, 0, sizeof(go_m_pool));
+    MemSet(go_p_pool, 0, sizeof(go_p_pool));
+
+    // Detect CPU
+    GoDetectCPU();
+
+    // Initialize scheduler lock
+    GoMutexInit(&gosched_lock);
+
+    // Initialize P's
+    gosched.gomaxprocs = GO_MAX_PROCS;
+    for (I64 i = 0; i < GO_MAX_PROCS; i++) {
+        GoPInit(&go_p_pool[i], i);
+        gosched.all_p[i] = &go_p_pool[i];
+    }
+
+    // Create initial M (m0) for current thread
+    CGoM *m0 = GoAllocM();
+    if (!m0) {
+        "Go runtime: failed to create m0\n";
+        return;
+    }
+
+    m0->task = Fs;
+    m0->thread_id = Fs->task_num;
+    m0->status = GO_MRUNNING;
+
+    // Create g0 for m0
+    m0->g0 = GoNewG(NULL, NULL, GO_STACK_SYSTEM);
+    if (!m0->g0) {
+        "Go runtime: failed to create g0\n";
+        return;
+    }
+    m0->g0->m = m0;
+
+    // Attach P to M
+    m0->p = &go_p_pool[0];
+    go_p_pool[0].m = m0;
+    go_p_pool[0].status = GO_PRUNNING;
+
+    // Initialize memory stats
+    go_memstats.enable_gc = TRUE;
+    go_memstats.next_gc = GO_HEAP_ARENA_SIZE;
+
+    go_runtime_initialized = TRUE;
+
+    "Go runtime initialized\n";
+    "  GOMAXPROCS: %d\n", GO_MAX_PROCS;
+    "  CPU: SSE2=%d SSE3=%d AVX=%d AVX2=%d\n",
+        go_has_sse2, go_has_sse3, go_has_avx, go_has_avx2;
+}
+
+// ============================================================================
+// INITIALIZATION
+// ============================================================================
+
+"GoRuntime loaded - Go runtime for ZealOS\n";

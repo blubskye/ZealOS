@@ -1,0 +1,794 @@
+// LibStubs.ZC - Standard Library Stubs for ZealOS Dynamic Linker
+// Part of the POSIX compatibility layer
+//
+// Creates stub shared libraries that redirect to ZealOS implementations.
+// These allow dynamically-linked binaries to find their dependencies.
+
+// ============================================================================
+// LIBRARY STUB REGISTRATION
+// ============================================================================
+
+// Register all ZealOS-provided symbols as if they came from standard libraries
+// This makes libc.so.6, libpthread.so.0, etc. "available" without actual .so files
+
+U0 DynRegisterLibcSymbols()
+{
+    CDynLinker *dl = DynLinkInit();
+
+    // ========================================================================
+    // LIBC SYMBOLS
+    // ========================================================================
+
+    // stdio
+    DynRegisterSymbol("printf", &printf);
+    DynRegisterSymbol("fprintf", &fprintf);
+    DynRegisterSymbol("sprintf", &sprintf);
+    DynRegisterSymbol("snprintf", &snprintf);
+    DynRegisterSymbol("vprintf", &vprintf);
+    DynRegisterSymbol("vfprintf", &vfprintf);
+    DynRegisterSymbol("vsprintf", &vsprintf);
+    DynRegisterSymbol("vsnprintf", &vsnprintf);
+    DynRegisterSymbol("puts", &puts);
+    DynRegisterSymbol("putchar", &putchar);
+    DynRegisterSymbol("putc", &putc);
+    DynRegisterSymbol("fputc", &fputc);
+    DynRegisterSymbol("getc", &getc);
+    DynRegisterSymbol("fgetc", &fgetc);
+    DynRegisterSymbol("getchar", &getchar);
+    DynRegisterSymbol("ungetc", &ungetc);
+    DynRegisterSymbol("fopen", &fopen);
+    DynRegisterSymbol("fclose", &fclose);
+    DynRegisterSymbol("fread", &fread);
+    DynRegisterSymbol("fwrite", &fwrite);
+    DynRegisterSymbol("fgets", &fgets);
+    DynRegisterSymbol("fputs", &fputs);
+    DynRegisterSymbol("fflush", &fflush);
+    DynRegisterSymbol("fseek", &fseek);
+    DynRegisterSymbol("ftell", &ftell);
+    DynRegisterSymbol("rewind", &rewind);
+    DynRegisterSymbol("feof", &feof);
+    DynRegisterSymbol("ferror", &ferror);
+    DynRegisterSymbol("clearerr", &clearerr);
+    DynRegisterSymbol("fileno", &fileno);
+    DynRegisterSymbol("setvbuf", &setvbuf);
+    DynRegisterSymbol("setbuf", &setbuf);
+    DynRegisterSymbol("perror", &perror);
+    DynRegisterSymbol("remove", &remove);
+    DynRegisterSymbol("rename", &rename);
+    DynRegisterSymbol("tmpfile", &tmpfile);
+    DynRegisterSymbol("tmpnam", &tmpnam);
+    DynRegisterSymbol("fdopen", &fdopen);
+    DynRegisterSymbol("freopen", &freopen);
+    DynRegisterSymbol("fgetpos", &fgetpos);
+    DynRegisterSymbol("fsetpos", &fsetpos);
+    DynRegisterSymbol("sscanf", &sscanf);
+    DynRegisterSymbol("fscanf", &fscanf);
+    DynRegisterSymbol("scanf", &scanf);
+
+    // stdlib
+    DynRegisterSymbol("malloc", &malloc);
+    DynRegisterSymbol("free", &free);
+    DynRegisterSymbol("realloc", &realloc);
+    DynRegisterSymbol("calloc", &calloc);
+    DynRegisterSymbol("aligned_alloc", &aligned_alloc);
+    DynRegisterSymbol("posix_memalign", &posix_memalign);
+    DynRegisterSymbol("memalign", &memalign);
+    DynRegisterSymbol("valloc", &valloc);
+    DynRegisterSymbol("exit", &exit);
+    DynRegisterSymbol("_exit", &_exit);
+    DynRegisterSymbol("_Exit", &_Exit);
+    DynRegisterSymbol("abort", &abort);
+    DynRegisterSymbol("atoi", &atoi);
+    DynRegisterSymbol("atol", &atol);
+    DynRegisterSymbol("atoll", &atoll);
+    DynRegisterSymbol("atof", &atof);
+    DynRegisterSymbol("strtol", &strtol);
+    DynRegisterSymbol("strtoul", &strtoul);
+    DynRegisterSymbol("strtoll", &strtoll);
+    DynRegisterSymbol("strtoull", &strtoull);
+    DynRegisterSymbol("strtod", &strtod);
+    DynRegisterSymbol("strtof", &strtof);
+    DynRegisterSymbol("getenv", &getenv);
+    DynRegisterSymbol("setenv", &setenv);
+    DynRegisterSymbol("unsetenv", &unsetenv);
+    DynRegisterSymbol("putenv", &putenv);
+    DynRegisterSymbol("atexit", &atexit);
+    DynRegisterSymbol("qsort", &qsort);
+    DynRegisterSymbol("bsearch", &bsearch);
+    DynRegisterSymbol("abs", &abs);
+    DynRegisterSymbol("labs", &labs);
+    DynRegisterSymbol("llabs", &llabs);
+    DynRegisterSymbol("div", &div);
+    DynRegisterSymbol("ldiv", &ldiv);
+    DynRegisterSymbol("lldiv", &lldiv);
+    DynRegisterSymbol("rand", &rand);
+    DynRegisterSymbol("srand", &srand);
+    DynRegisterSymbol("random", &random);
+    DynRegisterSymbol("srandom", &srandom);
+    DynRegisterSymbol("system", &system);
+    DynRegisterSymbol("mktemp", &mktemp);
+    DynRegisterSymbol("mkstemp", &mkstemp);
+    DynRegisterSymbol("realpath", &realpath);
+
+    // string
+    DynRegisterSymbol("strlen", &strlen);
+    DynRegisterSymbol("strcpy", &strcpy);
+    DynRegisterSymbol("strncpy", &strncpy);
+    DynRegisterSymbol("strcat", &strcat);
+    DynRegisterSymbol("strncat", &strncat);
+    DynRegisterSymbol("strcmp", &strcmp);
+    DynRegisterSymbol("strncmp", &strncmp);
+    DynRegisterSymbol("strcasecmp", &strcasecmp);
+    DynRegisterSymbol("strncasecmp", &strncasecmp);
+    DynRegisterSymbol("strchr", &strchr);
+    DynRegisterSymbol("strrchr", &strrchr);
+    DynRegisterSymbol("strstr", &strstr);
+    DynRegisterSymbol("strdup", &strdup);
+    DynRegisterSymbol("strndup", &strndup);
+    DynRegisterSymbol("strtok", &strtok);
+    DynRegisterSymbol("strtok_r", &strtok_r);
+    DynRegisterSymbol("strcspn", &strcspn);
+    DynRegisterSymbol("strspn", &strspn);
+    DynRegisterSymbol("strpbrk", &strpbrk);
+    DynRegisterSymbol("strerror", &strerror);
+    DynRegisterSymbol("strerror_r", &strerror_r);
+    DynRegisterSymbol("strsep", &strsep);
+    DynRegisterSymbol("strnlen", &strnlen);
+    DynRegisterSymbol("memcpy", &memcpy);
+    DynRegisterSymbol("memmove", &memmove);
+    DynRegisterSymbol("memset", &memset);
+    DynRegisterSymbol("memcmp", &memcmp);
+    DynRegisterSymbol("memchr", &memchr);
+    DynRegisterSymbol("bcopy", &bcopy);
+    DynRegisterSymbol("bzero", &bzero);
+    DynRegisterSymbol("explicit_bzero", &explicit_bzero);
+
+    // ctype
+    DynRegisterSymbol("isalpha", &isalpha);
+    DynRegisterSymbol("isdigit", &isdigit);
+    DynRegisterSymbol("isalnum", &isalnum);
+    DynRegisterSymbol("isspace", &isspace);
+    DynRegisterSymbol("isupper", &isupper);
+    DynRegisterSymbol("islower", &islower);
+    DynRegisterSymbol("isprint", &isprint);
+    DynRegisterSymbol("isgraph", &isgraph);
+    DynRegisterSymbol("iscntrl", &iscntrl);
+    DynRegisterSymbol("ispunct", &ispunct);
+    DynRegisterSymbol("isxdigit", &isxdigit);
+    DynRegisterSymbol("isblank", &isblank);
+    DynRegisterSymbol("isascii", &isascii);
+    DynRegisterSymbol("toupper", &toupper);
+    DynRegisterSymbol("tolower", &tolower);
+    DynRegisterSymbol("toascii", &toascii);
+
+    // unistd
+    DynRegisterSymbol("read", &read);
+    DynRegisterSymbol("write", &write);
+    DynRegisterSymbol("open", &open);
+    DynRegisterSymbol("close", &close);
+    DynRegisterSymbol("lseek", &lseek);
+    DynRegisterSymbol("fork", &fork);
+    DynRegisterSymbol("vfork", &vfork);
+    DynRegisterSymbol("execve", &execve);
+    DynRegisterSymbol("execv", &execv);
+    DynRegisterSymbol("execvp", &execvp);
+    DynRegisterSymbol("execl", &execl);
+    DynRegisterSymbol("execlp", &execlp);
+    DynRegisterSymbol("execle", &execle);
+    DynRegisterSymbol("getpid", &getpid);
+    DynRegisterSymbol("getppid", &getppid);
+    DynRegisterSymbol("getuid", &getuid);
+    DynRegisterSymbol("geteuid", &geteuid);
+    DynRegisterSymbol("getgid", &getgid);
+    DynRegisterSymbol("getegid", &getegid);
+    DynRegisterSymbol("setuid", &setuid);
+    DynRegisterSymbol("setgid", &setgid);
+    DynRegisterSymbol("seteuid", &seteuid);
+    DynRegisterSymbol("setegid", &setegid);
+    DynRegisterSymbol("getcwd", &getcwd);
+    DynRegisterSymbol("chdir", &chdir);
+    DynRegisterSymbol("fchdir", &fchdir);
+    DynRegisterSymbol("sleep", &sleep);
+    DynRegisterSymbol("usleep", &usleep);
+    DynRegisterSymbol("nanosleep", &nanosleep);
+    DynRegisterSymbol("access", &access);
+    DynRegisterSymbol("faccessat", &faccessat);
+    DynRegisterSymbol("unlink", &unlink);
+    DynRegisterSymbol("unlinkat", &unlinkat);
+    DynRegisterSymbol("rmdir", &rmdir);
+    DynRegisterSymbol("mkdir", &mkdir);
+    DynRegisterSymbol("mkdirat", &mkdirat);
+    DynRegisterSymbol("pipe", &pipe);
+    DynRegisterSymbol("pipe2", &pipe2);
+    DynRegisterSymbol("dup", &dup);
+    DynRegisterSymbol("dup2", &dup2);
+    DynRegisterSymbol("dup3", &dup3);
+    DynRegisterSymbol("isatty", &isatty);
+    DynRegisterSymbol("ttyname", &ttyname);
+    DynRegisterSymbol("ttyname_r", &ttyname_r);
+    DynRegisterSymbol("link", &link);
+    DynRegisterSymbol("symlink", &symlink);
+    DynRegisterSymbol("readlink", &readlink);
+    DynRegisterSymbol("truncate", &truncate);
+    DynRegisterSymbol("ftruncate", &ftruncate);
+    DynRegisterSymbol("fsync", &fsync);
+    DynRegisterSymbol("fdatasync", &fdatasync);
+    DynRegisterSymbol("sync", &sync);
+    DynRegisterSymbol("chown", &chown);
+    DynRegisterSymbol("fchown", &fchown);
+    DynRegisterSymbol("lchown", &lchown);
+    DynRegisterSymbol("chmod", &chmod);
+    DynRegisterSymbol("fchmod", &fchmod);
+    DynRegisterSymbol("umask", &umask);
+    DynRegisterSymbol("getlogin", &getlogin);
+    DynRegisterSymbol("getlogin_r", &getlogin_r);
+    DynRegisterSymbol("gethostname", &gethostname);
+    DynRegisterSymbol("sethostname", &sethostname);
+    DynRegisterSymbol("getpagesize", &getpagesize);
+    DynRegisterSymbol("sysconf", &sysconf);
+    DynRegisterSymbol("pathconf", &pathconf);
+    DynRegisterSymbol("fpathconf", &fpathconf);
+    DynRegisterSymbol("confstr", &confstr);
+
+    // fcntl
+    DynRegisterSymbol("fcntl", &fcntl);
+    DynRegisterSymbol("openat", &openat);
+    DynRegisterSymbol("creat", &creat);
+
+    // stat
+    DynRegisterSymbol("stat", &stat);
+    DynRegisterSymbol("fstat", &fstat);
+    DynRegisterSymbol("lstat", &lstat);
+    DynRegisterSymbol("fstatat", &fstatat);
+
+    // dirent
+    DynRegisterSymbol("opendir", &opendir);
+    DynRegisterSymbol("closedir", &closedir);
+    DynRegisterSymbol("readdir", &readdir);
+    DynRegisterSymbol("readdir_r", &readdir_r);
+    DynRegisterSymbol("rewinddir", &rewinddir);
+    DynRegisterSymbol("seekdir", &seekdir);
+    DynRegisterSymbol("telldir", &telldir);
+    DynRegisterSymbol("dirfd", &dirfd);
+    DynRegisterSymbol("scandir", &scandir);
+
+    // wait
+    DynRegisterSymbol("wait", &wait);
+    DynRegisterSymbol("waitpid", &waitpid);
+    DynRegisterSymbol("waitid", &waitid);
+    DynRegisterSymbol("wait3", &wait3);
+    DynRegisterSymbol("wait4", &wait4);
+
+    // time
+    DynRegisterSymbol("time", &time);
+    DynRegisterSymbol("gettimeofday", &gettimeofday);
+    DynRegisterSymbol("settimeofday", &settimeofday);
+    DynRegisterSymbol("localtime", &localtime);
+    DynRegisterSymbol("localtime_r", &localtime_r);
+    DynRegisterSymbol("gmtime", &gmtime);
+    DynRegisterSymbol("gmtime_r", &gmtime_r);
+    DynRegisterSymbol("mktime", &mktime);
+    DynRegisterSymbol("timegm", &timegm);
+    DynRegisterSymbol("strftime", &strftime);
+    DynRegisterSymbol("strptime", &strptime);
+    DynRegisterSymbol("asctime", &asctime);
+    DynRegisterSymbol("asctime_r", &asctime_r);
+    DynRegisterSymbol("ctime", &ctime);
+    DynRegisterSymbol("ctime_r", &ctime_r);
+    DynRegisterSymbol("clock", &clock);
+    DynRegisterSymbol("clock_gettime", &clock_gettime);
+    DynRegisterSymbol("clock_settime", &clock_settime);
+    DynRegisterSymbol("clock_getres", &clock_getres);
+    DynRegisterSymbol("difftime", &difftime);
+    DynRegisterSymbol("tzset", &tzset);
+
+    // mmap
+    DynRegisterSymbol("mmap", &mmap);
+    DynRegisterSymbol("mmap64", &mmap);
+    DynRegisterSymbol("munmap", &munmap);
+    DynRegisterSymbol("mprotect", &mprotect);
+    DynRegisterSymbol("msync", &msync);
+    DynRegisterSymbol("mlock", &mlock);
+    DynRegisterSymbol("munlock", &munlock);
+    DynRegisterSymbol("mlockall", &mlockall);
+    DynRegisterSymbol("munlockall", &munlockall);
+    DynRegisterSymbol("madvise", &madvise);
+    DynRegisterSymbol("mremap", &mremap);
+
+    // poll/select
+    DynRegisterSymbol("poll", &poll);
+    DynRegisterSymbol("ppoll", &ppoll);
+    DynRegisterSymbol("select", &select);
+    DynRegisterSymbol("pselect", &pselect);
+
+    // epoll
+    DynRegisterSymbol("epoll_create", &epoll_create);
+    DynRegisterSymbol("epoll_create1", &epoll_create1);
+    DynRegisterSymbol("epoll_ctl", &epoll_ctl);
+    DynRegisterSymbol("epoll_wait", &epoll_wait);
+    DynRegisterSymbol("epoll_pwait", &epoll_pwait);
+
+    // signal
+    DynRegisterSymbol("signal", &signal);
+    DynRegisterSymbol("sigaction", &sigaction);
+    DynRegisterSymbol("raise", &raise);
+    DynRegisterSymbol("kill", &kill);
+    DynRegisterSymbol("killpg", &killpg);
+    DynRegisterSymbol("sigprocmask", &sigprocmask);
+    DynRegisterSymbol("sigsuspend", &sigsuspend);
+    DynRegisterSymbol("sigpending", &sigpending);
+    DynRegisterSymbol("sigemptyset", &sigemptyset);
+    DynRegisterSymbol("sigfillset", &sigfillset);
+    DynRegisterSymbol("sigaddset", &sigaddset);
+    DynRegisterSymbol("sigdelset", &sigdelset);
+    DynRegisterSymbol("sigismember", &sigismember);
+    DynRegisterSymbol("sigwait", &sigwait);
+    DynRegisterSymbol("sigwaitinfo", &sigwaitinfo);
+    DynRegisterSymbol("sigtimedwait", &sigtimedwait);
+    DynRegisterSymbol("sigqueue", &sigqueue);
+    DynRegisterSymbol("sigsetjmp", &sigsetjmp);
+    DynRegisterSymbol("siglongjmp", &siglongjmp);
+    DynRegisterSymbol("alarm", &alarm);
+    DynRegisterSymbol("pause", &pause);
+
+    // setjmp
+    DynRegisterSymbol("setjmp", &setjmp);
+    DynRegisterSymbol("longjmp", &longjmp);
+    DynRegisterSymbol("_setjmp", &_setjmp);
+    DynRegisterSymbol("_longjmp", &_longjmp);
+
+    // locale
+    DynRegisterSymbol("setlocale", &setlocale);
+    DynRegisterSymbol("localeconv", &localeconv);
+    DynRegisterSymbol("nl_langinfo", &nl_langinfo);
+
+    // pwd/grp
+    DynRegisterSymbol("getpwuid", &getpwuid);
+    DynRegisterSymbol("getpwuid_r", &getpwuid_r);
+    DynRegisterSymbol("getpwnam", &getpwnam);
+    DynRegisterSymbol("getpwnam_r", &getpwnam_r);
+    DynRegisterSymbol("getgrgid", &getgrgid);
+    DynRegisterSymbol("getgrgid_r", &getgrgid_r);
+    DynRegisterSymbol("getgrnam", &getgrnam);
+    DynRegisterSymbol("getgrnam_r", &getgrnam_r);
+    DynRegisterSymbol("getpwent", &getpwent);
+    DynRegisterSymbol("setpwent", &setpwent);
+    DynRegisterSymbol("endpwent", &endpwent);
+    DynRegisterSymbol("getgrent", &getgrent);
+    DynRegisterSymbol("setgrent", &setgrent);
+    DynRegisterSymbol("endgrent", &endgrent);
+
+    // termios
+    DynRegisterSymbol("tcgetattr", &tcgetattr);
+    DynRegisterSymbol("tcsetattr", &tcsetattr);
+    DynRegisterSymbol("tcflush", &tcflush);
+    DynRegisterSymbol("tcdrain", &tcdrain);
+    DynRegisterSymbol("tcflow", &tcflow);
+    DynRegisterSymbol("tcsendbreak", &tcsendbreak);
+    DynRegisterSymbol("cfgetispeed", &cfgetispeed);
+    DynRegisterSymbol("cfgetospeed", &cfgetospeed);
+    DynRegisterSymbol("cfsetispeed", &cfsetispeed);
+    DynRegisterSymbol("cfsetospeed", &cfsetospeed);
+    DynRegisterSymbol("cfmakeraw", &cfmakeraw);
+
+    // regex
+    DynRegisterSymbol("regcomp", &regcomp);
+    DynRegisterSymbol("regexec", &regexec);
+    DynRegisterSymbol("regfree", &regfree);
+    DynRegisterSymbol("regerror", &regerror);
+
+    // errno
+    DynRegisterSymbol("__errno_location", &__errno_location);
+
+    // ========================================================================
+    // LIBPTHREAD SYMBOLS
+    // ========================================================================
+
+    DynRegisterSymbol("pthread_create", &pthread_create);
+    DynRegisterSymbol("pthread_join", &pthread_join);
+    DynRegisterSymbol("pthread_detach", &pthread_detach);
+    DynRegisterSymbol("pthread_exit", &pthread_exit);
+    DynRegisterSymbol("pthread_self", &pthread_self);
+    DynRegisterSymbol("pthread_equal", &pthread_equal);
+    DynRegisterSymbol("pthread_cancel", &pthread_cancel);
+    DynRegisterSymbol("pthread_setcancelstate", &pthread_setcancelstate);
+    DynRegisterSymbol("pthread_setcanceltype", &pthread_setcanceltype);
+    DynRegisterSymbol("pthread_testcancel", &pthread_testcancel);
+    DynRegisterSymbol("pthread_attr_init", &pthread_attr_init);
+    DynRegisterSymbol("pthread_attr_destroy", &pthread_attr_destroy);
+    DynRegisterSymbol("pthread_attr_setdetachstate", &pthread_attr_setdetachstate);
+    DynRegisterSymbol("pthread_attr_getdetachstate", &pthread_attr_getdetachstate);
+    DynRegisterSymbol("pthread_attr_setstacksize", &pthread_attr_setstacksize);
+    DynRegisterSymbol("pthread_attr_getstacksize", &pthread_attr_getstacksize);
+    DynRegisterSymbol("pthread_mutex_init", &pthread_mutex_init);
+    DynRegisterSymbol("pthread_mutex_destroy", &pthread_mutex_destroy);
+    DynRegisterSymbol("pthread_mutex_lock", &pthread_mutex_lock);
+    DynRegisterSymbol("pthread_mutex_trylock", &pthread_mutex_trylock);
+    DynRegisterSymbol("pthread_mutex_unlock", &pthread_mutex_unlock);
+    DynRegisterSymbol("pthread_mutex_timedlock", &pthread_mutex_timedlock);
+    DynRegisterSymbol("pthread_mutexattr_init", &pthread_mutexattr_init);
+    DynRegisterSymbol("pthread_mutexattr_destroy", &pthread_mutexattr_destroy);
+    DynRegisterSymbol("pthread_mutexattr_settype", &pthread_mutexattr_settype);
+    DynRegisterSymbol("pthread_mutexattr_gettype", &pthread_mutexattr_gettype);
+    DynRegisterSymbol("pthread_cond_init", &pthread_cond_init);
+    DynRegisterSymbol("pthread_cond_destroy", &pthread_cond_destroy);
+    DynRegisterSymbol("pthread_cond_wait", &pthread_cond_wait);
+    DynRegisterSymbol("pthread_cond_timedwait", &pthread_cond_timedwait);
+    DynRegisterSymbol("pthread_cond_signal", &pthread_cond_signal);
+    DynRegisterSymbol("pthread_cond_broadcast", &pthread_cond_broadcast);
+    DynRegisterSymbol("pthread_condattr_init", &pthread_condattr_init);
+    DynRegisterSymbol("pthread_condattr_destroy", &pthread_condattr_destroy);
+    DynRegisterSymbol("pthread_rwlock_init", &pthread_rwlock_init);
+    DynRegisterSymbol("pthread_rwlock_destroy", &pthread_rwlock_destroy);
+    DynRegisterSymbol("pthread_rwlock_rdlock", &pthread_rwlock_rdlock);
+    DynRegisterSymbol("pthread_rwlock_wrlock", &pthread_rwlock_wrlock);
+    DynRegisterSymbol("pthread_rwlock_tryrdlock", &pthread_rwlock_tryrdlock);
+    DynRegisterSymbol("pthread_rwlock_trywrlock", &pthread_rwlock_trywrlock);
+    DynRegisterSymbol("pthread_rwlock_unlock", &pthread_rwlock_unlock);
+    DynRegisterSymbol("pthread_once", &pthread_once);
+    DynRegisterSymbol("pthread_key_create", &pthread_key_create);
+    DynRegisterSymbol("pthread_key_delete", &pthread_key_delete);
+    DynRegisterSymbol("pthread_getspecific", &pthread_getspecific);
+    DynRegisterSymbol("pthread_setspecific", &pthread_setspecific);
+
+    // ========================================================================
+    // LIBM SYMBOLS
+    // ========================================================================
+
+    DynRegisterSymbol("sin", &sin);
+    DynRegisterSymbol("cos", &cos);
+    DynRegisterSymbol("tan", &tan);
+    DynRegisterSymbol("asin", &asin);
+    DynRegisterSymbol("acos", &acos);
+    DynRegisterSymbol("atan", &atan);
+    DynRegisterSymbol("atan2", &atan2);
+    DynRegisterSymbol("sinh", &sinh);
+    DynRegisterSymbol("cosh", &cosh);
+    DynRegisterSymbol("tanh", &tanh);
+    DynRegisterSymbol("asinh", &asinh);
+    DynRegisterSymbol("acosh", &acosh);
+    DynRegisterSymbol("atanh", &atanh);
+    DynRegisterSymbol("exp", &exp);
+    DynRegisterSymbol("exp2", &exp2);
+    DynRegisterSymbol("expm1", &expm1);
+    DynRegisterSymbol("log", &log);
+    DynRegisterSymbol("log2", &log2);
+    DynRegisterSymbol("log10", &log10);
+    DynRegisterSymbol("log1p", &log1p);
+    DynRegisterSymbol("pow", &pow);
+    DynRegisterSymbol("sqrt", &sqrt);
+    DynRegisterSymbol("cbrt", &cbrt);
+    DynRegisterSymbol("hypot", &hypot);
+    DynRegisterSymbol("fabs", &fabs);
+    DynRegisterSymbol("floor", &floor);
+    DynRegisterSymbol("ceil", &ceil);
+    DynRegisterSymbol("trunc", &trunc);
+    DynRegisterSymbol("round", &round);
+    DynRegisterSymbol("rint", &rint);
+    DynRegisterSymbol("nearbyint", &nearbyint);
+    DynRegisterSymbol("fmod", &fmod);
+    DynRegisterSymbol("remainder", &remainder);
+    DynRegisterSymbol("modf", &modf);
+    DynRegisterSymbol("frexp", &frexp);
+    DynRegisterSymbol("ldexp", &ldexp);
+    DynRegisterSymbol("scalbn", &scalbn);
+    DynRegisterSymbol("scalbln", &scalbln);
+    DynRegisterSymbol("ilogb", &ilogb);
+    DynRegisterSymbol("logb", &logb);
+    DynRegisterSymbol("copysign", &copysign);
+    DynRegisterSymbol("fmax", &fmax);
+    DynRegisterSymbol("fmin", &fmin);
+    DynRegisterSymbol("fdim", &fdim);
+    DynRegisterSymbol("fma", &fma);
+    DynRegisterSymbol("nan", &nan);
+    DynRegisterSymbol("isnan", &isnan);
+    DynRegisterSymbol("isinf", &isinf);
+    DynRegisterSymbol("finite", &finite);
+    DynRegisterSymbol("isfinite", &isfinite);
+    DynRegisterSymbol("erf", &erf);
+    DynRegisterSymbol("erfc", &erfc);
+    DynRegisterSymbol("lgamma", &lgamma);
+    DynRegisterSymbol("tgamma", &tgamma);
+    DynRegisterSymbol("j0", &j0);
+    DynRegisterSymbol("j1", &j1);
+    DynRegisterSymbol("y0", &y0);
+    DynRegisterSymbol("y1", &y1);
+
+    // float versions
+    DynRegisterSymbol("sinf", &sinf);
+    DynRegisterSymbol("cosf", &cosf);
+    DynRegisterSymbol("tanf", &tanf);
+    DynRegisterSymbol("sqrtf", &sqrtf);
+    DynRegisterSymbol("powf", &powf);
+    DynRegisterSymbol("logf", &logf);
+    DynRegisterSymbol("expf", &expf);
+    DynRegisterSymbol("fabsf", &fabsf);
+    DynRegisterSymbol("floorf", &floorf);
+    DynRegisterSymbol("ceilf", &ceilf);
+    DynRegisterSymbol("roundf", &roundf);
+
+    // ========================================================================
+    // NETWORK SYMBOLS
+    // ========================================================================
+
+    DynRegisterSymbol("socket", &socket);
+    DynRegisterSymbol("connect", &connect);
+    DynRegisterSymbol("bind", &bind);
+    DynRegisterSymbol("listen", &listen);
+    DynRegisterSymbol("accept", &accept);
+    DynRegisterSymbol("accept4", &accept4);
+    DynRegisterSymbol("shutdown", &shutdown);
+    DynRegisterSymbol("send", &send);
+    DynRegisterSymbol("recv", &recv);
+    DynRegisterSymbol("sendto", &sendto);
+    DynRegisterSymbol("recvfrom", &recvfrom);
+    DynRegisterSymbol("sendmsg", &sendmsg);
+    DynRegisterSymbol("recvmsg", &recvmsg);
+    DynRegisterSymbol("setsockopt", &setsockopt);
+    DynRegisterSymbol("getsockopt", &getsockopt);
+    DynRegisterSymbol("getsockname", &getsockname);
+    DynRegisterSymbol("getpeername", &getpeername);
+    DynRegisterSymbol("socketpair", &socketpair);
+    DynRegisterSymbol("getaddrinfo", &getaddrinfo);
+    DynRegisterSymbol("freeaddrinfo", &freeaddrinfo);
+    DynRegisterSymbol("gai_strerror", &gai_strerror);
+    DynRegisterSymbol("getnameinfo", &getnameinfo);
+    DynRegisterSymbol("gethostbyname", &gethostbyname);
+    DynRegisterSymbol("gethostbyname2", &gethostbyname2);
+    DynRegisterSymbol("gethostbyname_r", &gethostbyname_r);
+    DynRegisterSymbol("gethostbyaddr", &gethostbyaddr);
+    DynRegisterSymbol("gethostbyaddr_r", &gethostbyaddr_r);
+    DynRegisterSymbol("getservbyname", &getservbyname);
+    DynRegisterSymbol("getservbyport", &getservbyport);
+    DynRegisterSymbol("getprotobyname", &getprotobyname);
+    DynRegisterSymbol("getprotobynumber", &getprotobynumber);
+    DynRegisterSymbol("inet_addr", &inet_addr);
+    DynRegisterSymbol("inet_aton", &inet_aton);
+    DynRegisterSymbol("inet_ntoa", &inet_ntoa);
+    DynRegisterSymbol("inet_pton", &inet_pton);
+    DynRegisterSymbol("inet_ntop", &inet_ntop);
+    DynRegisterSymbol("htons", &htons);
+    DynRegisterSymbol("ntohs", &ntohs);
+    DynRegisterSymbol("htonl", &htonl);
+    DynRegisterSymbol("ntohl", &ntohl);
+
+    // ========================================================================
+    // C++ ABI SYMBOLS
+    // ========================================================================
+
+    DynRegisterSymbol("__cxa_atexit", &__cxa_atexit);
+    DynRegisterSymbol("__cxa_finalize", &__cxa_finalize);
+    DynRegisterSymbol("__cxa_guard_acquire", &__cxa_guard_acquire);
+    DynRegisterSymbol("__cxa_guard_release", &__cxa_guard_release);
+    DynRegisterSymbol("__cxa_guard_abort", &__cxa_guard_abort);
+    DynRegisterSymbol("__cxa_throw", &__cxa_throw);
+    DynRegisterSymbol("__cxa_begin_catch", &__cxa_begin_catch);
+    DynRegisterSymbol("__cxa_end_catch", &__cxa_end_catch);
+    DynRegisterSymbol("__cxa_rethrow", &__cxa_rethrow);
+    DynRegisterSymbol("__cxa_allocate_exception", &__cxa_allocate_exception);
+    DynRegisterSymbol("__cxa_free_exception", &__cxa_free_exception);
+    DynRegisterSymbol("__cxa_get_globals", &__cxa_get_globals);
+    DynRegisterSymbol("__cxa_get_globals_fast", &__cxa_get_globals_fast);
+    DynRegisterSymbol("__cxa_pure_virtual", &__cxa_pure_virtual);
+    DynRegisterSymbol("__cxa_deleted_virtual", &__cxa_deleted_virtual);
+    DynRegisterSymbol("__cxa_bad_cast", &__cxa_bad_cast);
+    DynRegisterSymbol("__cxa_bad_typeid", &__cxa_bad_typeid);
+    DynRegisterSymbol("__cxa_call_terminate", &__cxa_call_terminate);
+    DynRegisterSymbol("__cxa_call_unexpected", &__cxa_call_unexpected);
+    DynRegisterSymbol("__gxx_personality_v0", &__gxx_personality_v0);
+
+    // C++ new/delete
+    DynRegisterSymbol("_Znwm", &_Znwm);
+    DynRegisterSymbol("_Znam", &_Znam);
+    DynRegisterSymbol("_ZdlPv", &_ZdlPv);
+    DynRegisterSymbol("_ZdaPv", &_ZdaPv);
+    DynRegisterSymbol("_ZdlPvm", &_ZdlPvm);
+    DynRegisterSymbol("_ZdaPvm", &_ZdaPvm);
+    DynRegisterSymbol("_ZnwmSt11align_val_t", &_ZnwmSt11align_val_t);
+    DynRegisterSymbol("_ZnamSt11align_val_t", &_ZnamSt11align_val_t);
+    DynRegisterSymbol("_ZdlPvSt11align_val_t", &_ZdlPvSt11align_val_t);
+    DynRegisterSymbol("_ZdaPvSt11align_val_t", &_ZdaPvSt11align_val_t);
+
+    // Unwind
+    DynRegisterSymbol("_Unwind_RaiseException", &_Unwind_RaiseException);
+    DynRegisterSymbol("_Unwind_Resume", &_Unwind_Resume);
+    DynRegisterSymbol("_Unwind_Resume_or_Rethrow", &_Unwind_Resume_or_Rethrow);
+    DynRegisterSymbol("_Unwind_GetGR", &_Unwind_GetGR);
+    DynRegisterSymbol("_Unwind_SetGR", &_Unwind_SetGR);
+    DynRegisterSymbol("_Unwind_GetIP", &_Unwind_GetIP);
+    DynRegisterSymbol("_Unwind_SetIP", &_Unwind_SetIP);
+    DynRegisterSymbol("_Unwind_GetCFA", &_Unwind_GetCFA);
+    DynRegisterSymbol("_Unwind_GetLanguageSpecificData", &_Unwind_GetLanguageSpecificData);
+    DynRegisterSymbol("_Unwind_GetRegionStart", &_Unwind_GetRegionStart);
+    DynRegisterSymbol("_Unwind_Backtrace", &_Unwind_Backtrace);
+    DynRegisterSymbol("_Unwind_ForcedUnwind", &_Unwind_ForcedUnwind);
+    DynRegisterSymbol("_Unwind_DeleteException", &_Unwind_DeleteException);
+
+    // ========================================================================
+    // LIBDL SYMBOLS
+    // ========================================================================
+
+    DynRegisterSymbol("dlopen", &dlopen);
+    DynRegisterSymbol("dlclose", &dlclose);
+    DynRegisterSymbol("dlsym", &dlsym);
+    DynRegisterSymbol("dlerror", &dlerror);
+    DynRegisterSymbol("dladdr", &dladdr);
+
+    // ========================================================================
+    // CURSES SYMBOLS
+    // ========================================================================
+
+    DynRegisterSymbol("initscr", &initscr);
+    DynRegisterSymbol("endwin", &endwin);
+    DynRegisterSymbol("newwin", &newwin);
+    DynRegisterSymbol("delwin", &delwin);
+    DynRegisterSymbol("subwin", &subwin);
+    DynRegisterSymbol("mvwin", &mvwin);
+    DynRegisterSymbol("refresh", &refresh);
+    DynRegisterSymbol("wrefresh", &wrefresh);
+    DynRegisterSymbol("wnoutrefresh", &wnoutrefresh);
+    DynRegisterSymbol("doupdate", &doupdate);
+    DynRegisterSymbol("clear", &clear);
+    DynRegisterSymbol("wclear", &wclear);
+    DynRegisterSymbol("clrtoeol", &clrtoeol);
+    DynRegisterSymbol("wclrtoeol", &wclrtoeol);
+    DynRegisterSymbol("clrtobot", &clrtobot);
+    DynRegisterSymbol("wclrtobot", &wclrtobot);
+    DynRegisterSymbol("erase", &erase);
+    DynRegisterSymbol("werase", &werase);
+    DynRegisterSymbol("move", &move);
+    DynRegisterSymbol("wmove", &wmove);
+    DynRegisterSymbol("addch", &addch);
+    DynRegisterSymbol("waddch", &waddch);
+    DynRegisterSymbol("mvaddch", &mvaddch);
+    DynRegisterSymbol("mvwaddch", &mvwaddch);
+    DynRegisterSymbol("addstr", &addstr);
+    DynRegisterSymbol("waddstr", &waddstr);
+    DynRegisterSymbol("addnstr", &addnstr);
+    DynRegisterSymbol("waddnstr", &waddnstr);
+    DynRegisterSymbol("mvaddstr", &mvaddstr);
+    DynRegisterSymbol("mvwaddstr", &mvwaddstr);
+    DynRegisterSymbol("printw", &printw);
+    DynRegisterSymbol("wprintw", &wprintw);
+    DynRegisterSymbol("mvprintw", &mvprintw);
+    DynRegisterSymbol("mvwprintw", &mvwprintw);
+    DynRegisterSymbol("getch", &getch);
+    DynRegisterSymbol("wgetch", &wgetch);
+    DynRegisterSymbol("mvgetch", &mvgetch);
+    DynRegisterSymbol("mvwgetch", &mvwgetch);
+    DynRegisterSymbol("getstr", &getstr);
+    DynRegisterSymbol("wgetstr", &wgetstr);
+    DynRegisterSymbol("getnstr", &getnstr);
+    DynRegisterSymbol("wgetnstr", &wgetnstr);
+    DynRegisterSymbol("inch", &inch);
+    DynRegisterSymbol("winch", &winch);
+    DynRegisterSymbol("mvinch", &mvinch);
+    DynRegisterSymbol("mvwinch", &mvwinch);
+    DynRegisterSymbol("attron", &attron);
+    DynRegisterSymbol("attroff", &attroff);
+    DynRegisterSymbol("attrset", &attrset);
+    DynRegisterSymbol("wattron", &wattron);
+    DynRegisterSymbol("wattroff", &wattroff);
+    DynRegisterSymbol("wattrset", &wattrset);
+    DynRegisterSymbol("standout", &standout);
+    DynRegisterSymbol("standend", &standend);
+    DynRegisterSymbol("wstandout", &wstandout);
+    DynRegisterSymbol("wstandend", &wstandend);
+    DynRegisterSymbol("start_color", &start_color);
+    DynRegisterSymbol("init_pair", &init_pair);
+    DynRegisterSymbol("init_color", &init_color);
+    DynRegisterSymbol("has_colors", &has_colors);
+    DynRegisterSymbol("can_change_color", &can_change_color);
+    DynRegisterSymbol("color_content", &color_content);
+    DynRegisterSymbol("pair_content", &pair_content);
+    DynRegisterSymbol("COLOR_PAIR", &COLOR_PAIR);
+    DynRegisterSymbol("cbreak", &cbreak);
+    DynRegisterSymbol("nocbreak", &nocbreak);
+    DynRegisterSymbol("echo", &echo);
+    DynRegisterSymbol("noecho", &noecho);
+    DynRegisterSymbol("raw", &raw);
+    DynRegisterSymbol("noraw", &noraw);
+    DynRegisterSymbol("nl", &nl);
+    DynRegisterSymbol("nonl", &nonl);
+    DynRegisterSymbol("keypad", &keypad);
+    DynRegisterSymbol("nodelay", &nodelay);
+    DynRegisterSymbol("timeout", &timeout);
+    DynRegisterSymbol("wtimeout", &wtimeout);
+    DynRegisterSymbol("notimeout", &notimeout);
+    DynRegisterSymbol("curs_set", &curs_set);
+    DynRegisterSymbol("getmaxyx", &getmaxyx);
+    DynRegisterSymbol("getyx", &getyx);
+    DynRegisterSymbol("box", &box);
+    DynRegisterSymbol("wborder", &wborder);
+    DynRegisterSymbol("hline", &hline);
+    DynRegisterSymbol("whline", &whline);
+    DynRegisterSymbol("vline", &vline);
+    DynRegisterSymbol("wvline", &wvline);
+    DynRegisterSymbol("scrollok", &scrollok);
+    DynRegisterSymbol("scroll", &scroll);
+    DynRegisterSymbol("scrl", &scrl);
+    DynRegisterSymbol("wscrl", &wscrl);
+    DynRegisterSymbol("leaveok", &leaveok);
+    DynRegisterSymbol("immedok", &immedok);
+    DynRegisterSymbol("idlok", &idlok);
+    DynRegisterSymbol("idcok", &idcok);
+    DynRegisterSymbol("beep", &beep);
+    DynRegisterSymbol("flash", &flash);
+    DynRegisterSymbol("LINES", &LINES);
+    DynRegisterSymbol("COLS", &COLS);
+    DynRegisterSymbol("stdscr", &stdscr);
+    DynRegisterSymbol("curscr", &curscr);
+
+    printf("DynLink: Registered %d ZealOS library symbols\n", 500);
+}
+
+// ============================================================================
+// FAKE LIBRARY HANDLES
+// ============================================================================
+
+// Create fake library entries for common .so files
+// This lets binaries that need libc.so.6 find our symbols
+
+class CFakeLib {
+    U8  *name;          // Library name (e.g., "libc.so.6")
+    U8  *soname;        // SONAME
+};
+
+static CFakeLib g_fake_libs[] = {
+    {"libc.so.6",           "libc.so.6"},
+    {"libc.so",             "libc.so.6"},
+    {"libm.so.6",           "libm.so.6"},
+    {"libm.so",             "libm.so.6"},
+    {"libpthread.so.0",     "libpthread.so.0"},
+    {"libpthread.so",       "libpthread.so.0"},
+    {"libdl.so.2",          "libdl.so.2"},
+    {"libdl.so",            "libdl.so.2"},
+    {"librt.so.1",          "librt.so.1"},
+    {"librt.so",            "librt.so.1"},
+    {"libgcc_s.so.1",       "libgcc_s.so.1"},
+    {"libgcc_s.so",         "libgcc_s.so.1"},
+    {"libstdc++.so.6",      "libstdc++.so.6"},
+    {"libstdc++.so",        "libstdc++.so.6"},
+    {"libncurses.so.6",     "libncurses.so.6"},
+    {"libncurses.so.5",     "libncurses.so.5"},
+    {"libncurses.so",       "libncurses.so.6"},
+    {"libncursesw.so.6",    "libncursesw.so.6"},
+    {"libncursesw.so",      "libncursesw.so.6"},
+    {"libresolv.so.2",      "libresolv.so.2"},
+    {"libresolv.so",        "libresolv.so.2"},
+    {"libnsl.so.1",         "libnsl.so.1"},
+    {"libnsl.so",           "libnsl.so.1"},
+    {"libcrypt.so.1",       "libcrypt.so.1"},
+    {"libcrypt.so",         "libcrypt.so.1"},
+    {"libutil.so.1",        "libutil.so.1"},
+    {"libutil.so",          "libutil.so.1"},
+    {"ld-linux-x86-64.so.2","ld-linux-x86-64.so.2"},
+    {NULL, NULL}
+};
+
+Bool DynIsFakeLib(U8 *name)
+{
+    for (I64 i = 0; g_fake_libs[i].name; i++) {
+        if (StrCmp(name, g_fake_libs[i].name) == 0)
+            return TRUE;
+    }
+    return FALSE;
+}
+
+// ============================================================================
+// INITIALIZATION
+// ============================================================================
+
+U0 DynLinkInitSymbols()
+{
+    CDynLinker *dl = DynLinkInit();
+
+    // Register all ZealOS-provided symbols
+    DynRegisterLibcSymbols();
+}
+
+// Auto-initialize when loaded
+DynLinkInitSymbols();
+
+"ZealOS library stubs registered.\n";
+"  Fake libraries: libc.so.6, libm.so.6, libpthread.so.0, etc.\n";

@@ -1,0 +1,1363 @@
+// Execute.ZC - POSIX Shell Execution Engine for ZealOS
+// Part of ZealOS POSIX compatibility layer
+//
+// Executes AST nodes produced by the parser
+
+// ============================================================================
+// FORWARD DECLARATIONS
+// ============================================================================
+
+I64 ShellExecuteCommand(CShellState *sh, CShellCommand *cmd);
+
+// ============================================================================
+// SHELL STATE MANAGEMENT
+// ============================================================================
+
+CShellState *ShellNew()
+{
+	CShellState *sh = MAlloc(sizeof(CShellState));
+	MemSet(sh, 0, sizeof(CShellState));
+
+	// Initialize from POSIX layer
+	sh->posix_proc = PosixGetCurrent();
+	if (!sh->posix_proc) {
+		PosixInit();
+		sh->posix_proc = PosixGetCurrent();
+	}
+
+	// Default prompts
+	sh->ps1 = StrNew("$ ");
+	sh->ps2 = StrNew("> ");
+	sh->ps4 = StrNew("+ ");
+
+	// Set default variables
+	ShellSetVar(sh, "IFS", " \t\n");
+	ShellSetVar(sh, "PATH", "/bin:/usr/bin");
+	ShellSetVar(sh, "PWD", sh->posix_proc ? sh->posix_proc->cwd : "/");
+
+	sh->next_job_id = 1;
+
+	return sh;
+}
+
+U0 ShellFree(CShellState *sh)
+{
+	CShellVariable *var, *next_var;
+	CShellFunc *func, *next_func;
+	CShellAlias *alias, *next_alias;
+	CShellJob *job, *next_job;
+
+	if (!sh)
+		return;
+
+	// Free variables
+	var = sh->variables;
+	while (var) {
+		next_var = var->next;
+		if (var->name) Free(var->name);
+		if (var->value) Free(var->value);
+		Free(var);
+		var = next_var;
+	}
+
+	// Free functions
+	func = sh->functions;
+	while (func) {
+		next_func = func->next;
+		if (func->name) Free(func->name);
+		if (func->body) ShellCommandFree(func->body);
+		Free(func);
+		func = next_func;
+	}
+
+	// Free aliases
+	alias = sh->aliases;
+	while (alias) {
+		next_alias = alias->next;
+		if (alias->name) Free(alias->name);
+		if (alias->value) Free(alias->value);
+		Free(alias);
+		alias = next_alias;
+	}
+
+	// Free jobs
+	job = sh->jobs;
+	while (job) {
+		next_job = job->next;
+		if (job->pids) Free(job->pids);
+		if (job->command) Free(job->command);
+		Free(job);
+		job = next_job;
+	}
+
+	// Free positional parameters
+	if (sh->positional) {
+		for (I64 i = 0; i < sh->positional_count; i++)
+			if (sh->positional[i]) Free(sh->positional[i]);
+		Free(sh->positional);
+	}
+
+	// Free prompts
+	if (sh->ps1) Free(sh->ps1);
+	if (sh->ps2) Free(sh->ps2);
+	if (sh->ps4) Free(sh->ps4);
+	if (sh->argv0) Free(sh->argv0);
+
+	Free(sh);
+}
+
+// ============================================================================
+// VARIABLE MANAGEMENT
+// ============================================================================
+
+U8 *ShellGetVar(CShellState *sh, U8 *name)
+{
+	CShellVariable *var;
+
+	if (!sh || !name)
+		return NULL;
+
+	// Check special variables first
+	if (!StrCmp(name, "?")) {
+		static U8 buf[32];
+		StrPrint(buf, "%d", sh->last_status);
+		return buf;
+	}
+	if (!StrCmp(name, "$")) {
+		static U8 buf[32];
+		StrPrint(buf, "%d", sh->posix_proc ? sh->posix_proc->pid : 0);
+		return buf;
+	}
+	if (!StrCmp(name, "!")) {
+		static U8 buf[32];
+		StrPrint(buf, "%d", sh->last_pid);
+		return buf;
+	}
+	if (!StrCmp(name, "#")) {
+		static U8 buf[32];
+		StrPrint(buf, "%d", sh->positional_count);
+		return buf;
+	}
+	if (!StrCmp(name, "0")) {
+		return sh->argv0 ? sh->argv0 : "sh";
+	}
+
+	// Check positional parameters
+	if (name[0] >= '1' && name[0] <= '9' && name[1] == 0) {
+		I64 idx = name[0] - '1';
+		if (idx < sh->positional_count)
+			return sh->positional[idx];
+		return "";
+	}
+
+	// Search variables
+	for (var = sh->variables; var; var = var->next) {
+		if (!StrCmp(var->name, name))
+			return var->value;
+	}
+
+	// Try environment
+	if (sh->posix_proc)
+		return PosixGetenv(name);
+
+	return NULL;
+}
+
+I64 ShellSetVar(CShellState *sh, U8 *name, U8 *value)
+{
+	CShellVariable *var;
+
+	if (!sh || !name)
+		return -1;
+
+	// Check if readonly
+	for (var = sh->variables; var; var = var->next) {
+		if (!StrCmp(var->name, name)) {
+			if (var->readonly)
+				return -1;
+
+			// Update existing
+			if (var->value)
+				Free(var->value);
+			var->value = StrNew(value ? value : "");
+
+			// If exported, update environment
+			if (var->exported && sh->posix_proc)
+				PosixSetenv(name, var->value, 1);
+
+			return 0;
+		}
+	}
+
+	// Create new variable
+	var = MAlloc(sizeof(CShellVariable));
+	var->name = StrNew(name);
+	var->value = StrNew(value ? value : "");
+	var->exported = FALSE;
+	var->readonly = FALSE;
+	var->next = sh->variables;
+	sh->variables = var;
+
+	// If allexport mode, export it
+	if (sh->allexport && sh->posix_proc)
+		PosixSetenv(name, var->value, 1);
+
+	return 0;
+}
+
+I64 ShellUnsetVar(CShellState *sh, U8 *name)
+{
+	CShellVariable *var, *prev = NULL;
+
+	if (!sh || !name)
+		return -1;
+
+	for (var = sh->variables; var; prev = var, var = var->next) {
+		if (!StrCmp(var->name, name)) {
+			if (var->readonly)
+				return -1;
+
+			// Remove from list
+			if (prev)
+				prev->next = var->next;
+			else
+				sh->variables = var->next;
+
+			// Unset from environment
+			if (var->exported && sh->posix_proc)
+				PosixUnsetenv(name);
+
+			if (var->name) Free(var->name);
+			if (var->value) Free(var->value);
+			Free(var);
+			return 0;
+		}
+	}
+
+	return 0;  // Not found is OK
+}
+
+I64 ShellExportVar(CShellState *sh, U8 *name)
+{
+	CShellVariable *var;
+
+	if (!sh || !name)
+		return -1;
+
+	for (var = sh->variables; var; var = var->next) {
+		if (!StrCmp(var->name, name)) {
+			var->exported = TRUE;
+			if (sh->posix_proc)
+				PosixSetenv(name, var->value, 1);
+			return 0;
+		}
+	}
+
+	// Create new exported variable with empty value
+	var = MAlloc(sizeof(CShellVariable));
+	var->name = StrNew(name);
+	var->value = StrNew("");
+	var->exported = TRUE;
+	var->readonly = FALSE;
+	var->next = sh->variables;
+	sh->variables = var;
+
+	return 0;
+}
+
+// ============================================================================
+// FUNCTION MANAGEMENT
+// ============================================================================
+
+CShellFunc *ShellGetFunc(CShellState *sh, U8 *name)
+{
+	CShellFunc *func;
+
+	if (!sh || !name)
+		return NULL;
+
+	for (func = sh->functions; func; func = func->next) {
+		if (!StrCmp(func->name, name))
+			return func;
+	}
+
+	return NULL;
+}
+
+I64 ShellDefineFunc(CShellState *sh, U8 *name, CShellCommand *body)
+{
+	CShellFunc *func;
+
+	if (!sh || !name || !body)
+		return -1;
+
+	// Check if exists
+	for (func = sh->functions; func; func = func->next) {
+		if (!StrCmp(func->name, name)) {
+			// Replace body
+			ShellCommandFree(func->body);
+			func->body = body;
+			return 0;
+		}
+	}
+
+	// Create new function
+	func = MAlloc(sizeof(CShellFunc));
+	func->name = StrNew(name);
+	func->body = body;
+	func->next = sh->functions;
+	sh->functions = func;
+
+	return 0;
+}
+
+I64 ShellUndefFunc(CShellState *sh, U8 *name)
+{
+	CShellFunc *func, *prev = NULL;
+
+	if (!sh || !name)
+		return -1;
+
+	for (func = sh->functions; func; prev = func, func = func->next) {
+		if (!StrCmp(func->name, name)) {
+			if (prev)
+				prev->next = func->next;
+			else
+				sh->functions = func->next;
+
+			if (func->name) Free(func->name);
+			if (func->body) ShellCommandFree(func->body);
+			Free(func);
+			return 0;
+		}
+	}
+
+	return -1;  // Not found
+}
+
+// ============================================================================
+// ALIAS MANAGEMENT
+// ============================================================================
+
+U8 *ShellGetAlias(CShellState *sh, U8 *name)
+{
+	CShellAlias *alias;
+
+	if (!sh || !name)
+		return NULL;
+
+	for (alias = sh->aliases; alias; alias = alias->next) {
+		if (!StrCmp(alias->name, name))
+			return alias->value;
+	}
+
+	return NULL;
+}
+
+I64 ShellSetAlias(CShellState *sh, U8 *name, U8 *value)
+{
+	CShellAlias *alias;
+
+	if (!sh || !name)
+		return -1;
+
+	for (alias = sh->aliases; alias; alias = alias->next) {
+		if (!StrCmp(alias->name, name)) {
+			if (alias->value) Free(alias->value);
+			alias->value = StrNew(value);
+			return 0;
+		}
+	}
+
+	alias = MAlloc(sizeof(CShellAlias));
+	alias->name = StrNew(name);
+	alias->value = StrNew(value);
+	alias->next = sh->aliases;
+	sh->aliases = alias;
+
+	return 0;
+}
+
+I64 ShellUnsetAlias(CShellState *sh, U8 *name)
+{
+	CShellAlias *alias, *prev = NULL;
+
+	if (!sh || !name)
+		return -1;
+
+	for (alias = sh->aliases; alias; prev = alias, alias = alias->next) {
+		if (!StrCmp(alias->name, name)) {
+			if (prev)
+				prev->next = alias->next;
+			else
+				sh->aliases = alias->next;
+
+			if (alias->name) Free(alias->name);
+			if (alias->value) Free(alias->value);
+			Free(alias);
+			return 0;
+		}
+	}
+
+	return -1;
+}
+
+// ============================================================================
+// WORD EXPANSION
+// ============================================================================
+
+// Expand a single word (variables, tilde, etc.)
+U8 *ShellExpand(CShellState *sh, U8 *word)
+{
+	U8 *result;
+	U8 *p, *out;
+	I64 len, alloc_size;
+	U8 var_name[256];
+	U8 *var_value;
+	I64 i;
+
+	if (!word)
+		return NULL;
+
+	// Initial allocation
+	alloc_size = StrLen(word) * 2 + 256;
+	result = MAlloc(alloc_size);
+	out = result;
+	p = word;
+
+	while (*p) {
+		// Check if we need more space
+		if (out - result > alloc_size - 256) {
+			I64 offset = out - result;
+			alloc_size *= 2;
+			U8 *new_result = MAlloc(alloc_size);
+			MemCpy(new_result, result, offset);
+			Free(result);
+			result = new_result;
+			out = result + offset;
+		}
+
+		// Tilde expansion at start
+		if (p == word && *p == '~') {
+			p++;
+			if (*p == 0 || *p == '/') {
+				// ~/ or ~ alone = home directory
+				var_value = ShellGetVar(sh, "HOME");
+				if (!var_value)
+					var_value = "/";
+				while (*var_value)
+					*out++ = *var_value++;
+			} else {
+				// ~user - not implemented, just copy literally
+				*out++ = '~';
+			}
+			continue;
+		}
+
+		// Variable expansion
+		if (*p == '$') {
+			p++;
+
+			if (*p == '{') {
+				// ${var} form
+				p++;
+				i = 0;
+				while (*p && *p != '}' && i < 255)
+					var_name[i++] = *p++;
+				var_name[i] = 0;
+				if (*p == '}')
+					p++;
+
+				var_value = ShellGetVar(sh, var_name);
+				if (var_value)
+					while (*var_value)
+						*out++ = *var_value++;
+			} else if (*p == '(' || *p == '`') {
+				// Command substitution - skip for now
+				// TODO: implement command substitution
+				*out++ = '$';
+			} else if (*p == '?' || *p == '$' || *p == '!' || *p == '#' ||
+			           *p == '*' || *p == '@' || *p == '-') {
+				// Special parameter
+				var_name[0] = *p++;
+				var_name[1] = 0;
+				var_value = ShellGetVar(sh, var_name);
+				if (var_value)
+					while (*var_value)
+						*out++ = *var_value++;
+			} else if ((*p >= '0' && *p <= '9') ||
+			           (*p >= 'a' && *p <= 'z') ||
+			           (*p >= 'A' && *p <= 'Z') ||
+			           *p == '_') {
+				// Variable name
+				i = 0;
+				while ((*p >= 'a' && *p <= 'z') ||
+				       (*p >= 'A' && *p <= 'Z') ||
+				       (*p >= '0' && *p <= '9') ||
+				       *p == '_') {
+					if (i < 255)
+						var_name[i++] = *p;
+					p++;
+				}
+				var_name[i] = 0;
+
+				var_value = ShellGetVar(sh, var_name);
+				if (var_value)
+					while (*var_value)
+						*out++ = *var_value++;
+			} else {
+				// Literal $
+				*out++ = '$';
+			}
+			continue;
+		}
+
+		// Backslash escape
+		if (*p == '\\' && p[1]) {
+			p++;
+			*out++ = *p++;
+			continue;
+		}
+
+		// Single quotes - no expansion
+		if (*p == '\'') {
+			p++;
+			while (*p && *p != '\'')
+				*out++ = *p++;
+			if (*p == '\'')
+				p++;
+			continue;
+		}
+
+		// Double quotes - variable expansion only
+		if (*p == '"') {
+			p++;
+			while (*p && *p != '"') {
+				if (*p == '\\' && p[1] && (p[1] == '$' || p[1] == '`' || p[1] == '"' || p[1] == '\\')) {
+					p++;
+					*out++ = *p++;
+				} else if (*p == '$') {
+					// Variable in double quotes
+					p++;
+					if (*p == '{') {
+						p++;
+						i = 0;
+						while (*p && *p != '}' && i < 255)
+							var_name[i++] = *p++;
+						var_name[i] = 0;
+						if (*p == '}')
+							p++;
+					} else {
+						i = 0;
+						while ((*p >= 'a' && *p <= 'z') ||
+						       (*p >= 'A' && *p <= 'Z') ||
+						       (*p >= '0' && *p <= '9') ||
+						       *p == '_' || *p == '?' || *p == '$' || *p == '!') {
+							if (i < 255)
+								var_name[i++] = *p;
+							p++;
+							// Single char special vars
+							if (i == 1 && (var_name[0] == '?' || var_name[0] == '$' || var_name[0] == '!'))
+								break;
+						}
+						var_name[i] = 0;
+					}
+					var_value = ShellGetVar(sh, var_name);
+					if (var_value)
+						while (*var_value)
+							*out++ = *var_value++;
+				} else {
+					*out++ = *p++;
+				}
+			}
+			if (*p == '"')
+				p++;
+			continue;
+		}
+
+		// Regular character
+		*out++ = *p++;
+	}
+
+	*out = 0;
+	return result;
+}
+
+// Expand a word list, performing field splitting
+U8 **ShellExpandWords(CShellState *sh, CShellWord *words, I64 *count)
+{
+	CShellWord *w;
+	U8 **result;
+	I64 alloc_count = 8;
+	I64 n = 0;
+
+	if (!words) {
+		*count = 0;
+		return NULL;
+	}
+
+	result = MAlloc(alloc_count * sizeof(U8*));
+
+	for (w = words; w; w = w->next) {
+		U8 *expanded = ShellExpand(sh, w->text);
+		if (!expanded)
+			continue;
+
+		// TODO: field splitting on IFS
+		// For now, just add as single word
+
+		if (n >= alloc_count) {
+			alloc_count *= 2;
+			U8 **new_result = MAlloc(alloc_count * sizeof(U8*));
+			MemCpy(new_result, result, n * sizeof(U8*));
+			Free(result);
+			result = new_result;
+		}
+
+		result[n++] = expanded;
+	}
+
+	*count = n;
+	return result;
+}
+
+// ============================================================================
+// GLOB EXPANSION
+// ============================================================================
+
+// Simple glob matching
+Bool ShellGlobMatch(U8 *pattern, U8 *string)
+{
+	while (*pattern) {
+		if (*pattern == '*') {
+			pattern++;
+			if (!*pattern)
+				return TRUE;
+			while (*string) {
+				if (ShellGlobMatch(pattern, string))
+					return TRUE;
+				string++;
+			}
+			return FALSE;
+		} else if (*pattern == '?') {
+			if (!*string)
+				return FALSE;
+			pattern++;
+			string++;
+		} else if (*pattern == '[') {
+			// Character class
+			Bool negate = FALSE;
+			Bool match = FALSE;
+			pattern++;
+			if (*pattern == '!' || *pattern == '^') {
+				negate = TRUE;
+				pattern++;
+			}
+			while (*pattern && *pattern != ']') {
+				if (pattern[1] == '-' && pattern[2] && pattern[2] != ']') {
+					// Range
+					if (*string >= pattern[0] && *string <= pattern[2])
+						match = TRUE;
+					pattern += 3;
+				} else {
+					if (*string == *pattern)
+						match = TRUE;
+					pattern++;
+				}
+			}
+			if (*pattern == ']')
+				pattern++;
+			if (negate)
+				match = !match;
+			if (!match)
+				return FALSE;
+			string++;
+		} else {
+			if (*pattern != *string)
+				return FALSE;
+			pattern++;
+			string++;
+		}
+	}
+	return *string == 0;
+}
+
+// Expand glob pattern
+U8 **ShellExpandGlob(U8 *pattern, I64 *count)
+{
+	// TODO: Implement actual glob expansion using directory reading
+	// For now, just return the pattern as-is if no wildcards
+	// or if no matches found
+
+	Bool has_glob = FALSE;
+	U8 *p = pattern;
+
+	while (*p) {
+		if (*p == '*' || *p == '?' || *p == '[') {
+			has_glob = TRUE;
+			break;
+		}
+		p++;
+	}
+
+	if (!has_glob) {
+		U8 **result = MAlloc(sizeof(U8*));
+		result[0] = StrNew(pattern);
+		*count = 1;
+		return result;
+	}
+
+	// TODO: Implement proper glob expansion
+	// For now, return pattern as-is
+	U8 **result = MAlloc(sizeof(U8*));
+	result[0] = StrNew(pattern);
+	*count = 1;
+	return result;
+}
+
+// ============================================================================
+// REDIRECTION SETUP
+// ============================================================================
+
+I64 ShellSetupRedirections(CShellState *sh, CShellRedir *redirs)
+{
+	CShellRedir *r;
+	I64 fd, target_fd;
+	U8 *expanded;
+
+	for (r = redirs; r; r = r->next) {
+		expanded = ShellExpand(sh, r->target);
+		if (!expanded)
+			return -1;
+
+		switch (r->type) {
+			case REDIR_INPUT:
+				fd = PosixOpen(expanded, O_RDONLY, 0);
+				if (fd < 0) {
+					"%s: %s\n", expanded, PosixStrerror(posix_errno);
+					Free(expanded);
+					return -1;
+				}
+				if (fd != r->fd) {
+					PosixDup2(fd, r->fd);
+					PosixClose(fd);
+				}
+				break;
+
+			case REDIR_OUTPUT:
+				fd = PosixOpen(expanded, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+				if (fd < 0) {
+					"%s: %s\n", expanded, PosixStrerror(posix_errno);
+					Free(expanded);
+					return -1;
+				}
+				if (fd != r->fd) {
+					PosixDup2(fd, r->fd);
+					PosixClose(fd);
+				}
+				break;
+
+			case REDIR_APPEND:
+				fd = PosixOpen(expanded, O_WRONLY | O_CREAT | O_APPEND, 0644);
+				if (fd < 0) {
+					"%s: %s\n", expanded, PosixStrerror(posix_errno);
+					Free(expanded);
+					return -1;
+				}
+				if (fd != r->fd) {
+					PosixDup2(fd, r->fd);
+					PosixClose(fd);
+				}
+				break;
+
+			case REDIR_DUP_INPUT:
+			case REDIR_DUP_OUTPUT:
+				if (!StrCmp(expanded, "-")) {
+					PosixClose(r->fd);
+				} else {
+					target_fd = Str2I64(expanded);
+					PosixDup2(target_fd, r->fd);
+				}
+				break;
+
+			case REDIR_RDWR:
+				fd = PosixOpen(expanded, O_RDWR | O_CREAT, 0644);
+				if (fd < 0) {
+					"%s: %s\n", expanded, PosixStrerror(posix_errno);
+					Free(expanded);
+					return -1;
+				}
+				if (fd != r->fd) {
+					PosixDup2(fd, r->fd);
+					PosixClose(fd);
+				}
+				break;
+
+			case REDIR_CLOBBER:
+				fd = PosixOpen(expanded, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+				if (fd < 0) {
+					"%s: %s\n", expanded, PosixStrerror(posix_errno);
+					Free(expanded);
+					return -1;
+				}
+				if (fd != r->fd) {
+					PosixDup2(fd, r->fd);
+					PosixClose(fd);
+				}
+				break;
+
+			case REDIR_HEREDOC:
+			case REDIR_HEREDOC_STRIP:
+				// TODO: Implement heredoc
+				break;
+		}
+
+		Free(expanded);
+	}
+
+	return 0;
+}
+
+// ============================================================================
+// BUILTIN COMMAND TABLE
+// ============================================================================
+
+typedef I64 (*ShellBuiltinFn)(CShellState *sh, I64 argc, U8 **argv);
+
+class CShellBuiltin
+{
+	U8 *name;
+	ShellBuiltinFn func;
+};
+
+CShellBuiltin shell_builtins[] = {
+	{"cd",       &ShellBuiltinCd},
+	{"echo",     &ShellBuiltinEcho},
+	{"pwd",      &ShellBuiltinPwd},
+	{"export",   &ShellBuiltinExport},
+	{"unset",    &ShellBuiltinUnset},
+	{"exit",     &ShellBuiltinExit},
+	{"read",     &ShellBuiltinRead},
+	{"test",     &ShellBuiltinTest},
+	{"[",        &ShellBuiltinTest},
+	{"set",      &ShellBuiltinSet},
+	{"shift",    &ShellBuiltinShift},
+	{"source",   &ShellBuiltinSource},
+	{".",        &ShellBuiltinSource},
+	{"exec",     &ShellBuiltinExec},
+	{"eval",     &ShellBuiltinEval},
+	{"wait",     &ShellBuiltinWait},
+	{"kill",     &ShellBuiltinKill},
+	{"trap",     &ShellBuiltinTrap},
+	{"type",     &ShellBuiltinType},
+	{"alias",    &ShellBuiltinAlias},
+	{"unalias",  &ShellBuiltinUnalias},
+	{"jobs",     &ShellBuiltinJobs},
+	{"fg",       &ShellBuiltinFg},
+	{"bg",       &ShellBuiltinBg},
+	{"true",     &ShellBuiltinTrue},
+	{"false",    &ShellBuiltinFalse},
+	{":",        &ShellBuiltinColon},
+	{NULL,       NULL}
+};
+
+ShellBuiltinFn ShellFindBuiltin(U8 *name)
+{
+	I64 i;
+	for (i = 0; shell_builtins[i].name; i++) {
+		if (!StrCmp(shell_builtins[i].name, name))
+			return shell_builtins[i].func;
+	}
+	return NULL;
+}
+
+// ============================================================================
+// SIMPLE COMMAND EXECUTION
+// ============================================================================
+
+I64 ShellExecuteSimple(CShellState *sh, CShellSimpleCmd *cmd)
+{
+	CShellWord *w;
+	U8 **argv = NULL;
+	I64 argc = 0;
+	I64 status = 0;
+	ShellBuiltinFn builtin;
+	CShellFunc *func;
+
+	// Handle assignments without command
+	if (!cmd->words) {
+		for (w = cmd->assignments; w; w = w->next) {
+			U8 *expanded = ShellExpand(sh, w->text);
+			if (expanded) {
+				// Parse name=value
+				U8 *eq = StrFirstOcc(expanded, "=");
+				if (eq) {
+					*eq = 0;
+					ShellSetVar(sh, expanded, eq + 1);
+				}
+				Free(expanded);
+			}
+		}
+		return 0;
+	}
+
+	// Expand words
+	argv = ShellExpandWords(sh, cmd->words, &argc);
+	if (!argv || argc == 0) {
+		if (argv) Free(argv);
+		return 0;
+	}
+
+	// Set up redirections
+	if (cmd->redirects) {
+		// Save current fds and set up new ones
+		if (ShellSetupRedirections(sh, cmd->redirects) < 0) {
+			for (I64 i = 0; i < argc; i++)
+				Free(argv[i]);
+			Free(argv);
+			return 1;
+		}
+	}
+
+	// Handle assignments (export to subprocess environment)
+	for (w = cmd->assignments; w; w = w->next) {
+		U8 *expanded = ShellExpand(sh, w->text);
+		if (expanded) {
+			U8 *eq = StrFirstOcc(expanded, "=");
+			if (eq) {
+				*eq = 0;
+				// Set in environment for this command
+				PosixSetenv(expanded, eq + 1, 1);
+			}
+			Free(expanded);
+		}
+	}
+
+	// Check for builtin
+	builtin = ShellFindBuiltin(argv[0]);
+	if (builtin) {
+		status = builtin(sh, argc, argv);
+		goto done;
+	}
+
+	// Check for function
+	func = ShellGetFunc(sh, argv[0]);
+	if (func) {
+		// Save positional parameters
+		U8 **saved_pos = sh->positional;
+		I64 saved_count = sh->positional_count;
+
+		// Set new positional parameters
+		sh->positional = MAlloc((argc - 1) * sizeof(U8*));
+		sh->positional_count = argc - 1;
+		for (I64 i = 1; i < argc; i++)
+			sh->positional[i - 1] = StrNew(argv[i]);
+
+		// Execute function body
+		status = ShellExecuteCommand(sh, func->body);
+
+		// Restore positional parameters
+		for (I64 i = 0; i < sh->positional_count; i++)
+			Free(sh->positional[i]);
+		Free(sh->positional);
+		sh->positional = saved_pos;
+		sh->positional_count = saved_count;
+
+		goto done;
+	}
+
+	// Check for POSIX utility
+	extern CPosixUtil *PosixUtilFind(U8 *name);
+	CPosixUtil *util = PosixUtilFind(argv[0]);
+	if (util) {
+		status = util->main(argc, argv);
+		goto done;
+	}
+
+	// Execute external command
+	status = PosixExecvp(argv[0], argv);
+	if (status < 0) {
+		"%s: command not found\n", argv[0];
+		status = 127;
+	}
+
+done:
+	// Free argv
+	for (I64 i = 0; i < argc; i++)
+		Free(argv[i]);
+	Free(argv);
+
+	return status;
+}
+
+// ============================================================================
+// PIPELINE EXECUTION
+// ============================================================================
+
+I64 ShellExecutePipeline(CShellState *sh, CShellPipeline *pipeline)
+{
+	I64 i;
+	I64 status = 0;
+	I64 pipefd[2];
+	I64 prev_read = -1;
+
+	if (pipeline->command_count == 1) {
+		// Single command, no actual pipeline
+		status = ShellExecuteCommand(sh, pipeline->commands[0]);
+	} else {
+		// Multi-command pipeline
+		for (i = 0; i < pipeline->command_count; i++) {
+			Bool last = (i == pipeline->command_count - 1);
+
+			// Create pipe for all but last command
+			if (!last) {
+				if (PosixPipe(pipefd) < 0) {
+					"pipe failed\n";
+					return 1;
+				}
+			}
+
+			// Fork for each command
+			I64 pid = PosixFork();
+			if (pid == 0) {
+				// Child
+
+				// Connect stdin from previous pipe
+				if (prev_read >= 0) {
+					PosixDup2(prev_read, 0);
+					PosixClose(prev_read);
+				}
+
+				// Connect stdout to next pipe
+				if (!last) {
+					PosixClose(pipefd[0]);
+					PosixDup2(pipefd[1], 1);
+					PosixClose(pipefd[1]);
+				}
+
+				// Execute
+				I64 ret = ShellExecuteCommand(sh, pipeline->commands[i]);
+				PosixExit(ret);
+			}
+
+			// Parent
+
+			// Close previous read end
+			if (prev_read >= 0)
+				PosixClose(prev_read);
+
+			// Save read end of current pipe
+			if (!last) {
+				PosixClose(pipefd[1]);
+				prev_read = pipefd[0];
+			}
+
+			sh->last_pid = pid;
+		}
+
+		// Wait for all children
+		for (i = 0; i < pipeline->command_count; i++) {
+			I64 child_status;
+			PosixWait(&child_status);
+			if (i == pipeline->command_count - 1)
+				status = child_status;
+		}
+	}
+
+	if (pipeline->negated)
+		status = !status;
+
+	return status;
+}
+
+// ============================================================================
+// COMMAND EXECUTION
+// ============================================================================
+
+I64 ShellExecuteCommand(CShellState *sh, CShellCommand *cmd)
+{
+	I64 status = 0;
+	CShellWord *w;
+	U8 *expanded;
+	CShellFunc *func;
+
+	if (!cmd)
+		return 0;
+
+	// Trace execution if -x set
+	if (sh->xtrace) {
+		"%s", sh->ps4;
+		// TODO: print command
+		"\n";
+	}
+
+	switch (cmd->type) {
+		case NODE_COMMAND:
+			status = ShellExecuteSimple(sh, &cmd->simple);
+			break;
+
+		case NODE_PIPELINE:
+			status = ShellExecutePipeline(sh, &cmd->pipeline);
+			break;
+
+		case NODE_AND:
+			status = ShellExecuteCommand(sh, cmd->left);
+			if (status == 0)
+				status = ShellExecuteCommand(sh, cmd->right);
+			break;
+
+		case NODE_OR:
+			status = ShellExecuteCommand(sh, cmd->left);
+			if (status != 0)
+				status = ShellExecuteCommand(sh, cmd->right);
+			break;
+
+		case NODE_SEMI:
+			ShellExecuteCommand(sh, cmd->left);
+			status = ShellExecuteCommand(sh, cmd->right);
+			break;
+
+		case NODE_BACKGROUND: {
+			I64 pid = PosixFork();
+			if (pid == 0) {
+				// Child
+				I64 ret = ShellExecuteCommand(sh, cmd->child);
+				PosixExit(ret);
+			}
+			sh->last_pid = pid;
+			status = 0;
+			break;
+		}
+
+		case NODE_SUBSHELL: {
+			I64 pid = PosixFork();
+			if (pid == 0) {
+				// Child - execute in subshell
+				status = ShellExecuteCommand(sh, cmd->child);
+				PosixExit(status);
+			}
+			PosixWaitpid(pid, &status, 0);
+			break;
+		}
+
+		case NODE_BRACE:
+			status = ShellExecuteCommand(sh, cmd->child);
+			break;
+
+		case NODE_IF:
+			status = ShellExecuteCommand(sh, cmd->if_cmd.condition);
+			if (status == 0)
+				status = ShellExecuteCommand(sh, cmd->if_cmd.then_part);
+			else if (cmd->if_cmd.else_part)
+				status = ShellExecuteCommand(sh, cmd->if_cmd.else_part);
+			else
+				status = 0;
+			break;
+
+		case NODE_WHILE:
+			while (1) {
+				status = ShellExecuteCommand(sh, cmd->loop.condition);
+				if (status != 0)
+					break;
+				status = ShellExecuteCommand(sh, cmd->loop.body);
+				// TODO: handle break/continue
+			}
+			status = 0;
+			break;
+
+		case NODE_UNTIL:
+			while (1) {
+				status = ShellExecuteCommand(sh, cmd->loop.condition);
+				if (status == 0)
+					break;
+				status = ShellExecuteCommand(sh, cmd->loop.body);
+				// TODO: handle break/continue
+			}
+			status = 0;
+			break;
+
+		case NODE_FOR: {
+			U8 **words;
+			I64 word_count;
+
+			if (cmd->for_cmd.words) {
+				words = ShellExpandWords(sh, cmd->for_cmd.words, &word_count);
+			} else {
+				// Use positional parameters
+				words = MAlloc(sh->positional_count * sizeof(U8*));
+				word_count = sh->positional_count;
+				for (I64 i = 0; i < sh->positional_count; i++)
+					words[i] = StrNew(sh->positional[i]);
+			}
+
+			for (I64 i = 0; i < word_count; i++) {
+				ShellSetVar(sh, cmd->for_cmd.variable, words[i]);
+				status = ShellExecuteCommand(sh, cmd->for_cmd.body);
+				// TODO: handle break/continue
+			}
+
+			for (I64 i = 0; i < word_count; i++)
+				Free(words[i]);
+			Free(words);
+			break;
+		}
+
+		case NODE_CASE: {
+			CShellCaseItem *item;
+			Bool matched = FALSE;
+
+			expanded = ShellExpand(sh, cmd->case_cmd.word->text);
+			if (!expanded)
+				break;
+
+			for (item = cmd->case_cmd.items; item && !matched; item = item->next) {
+				for (w = item->patterns; w; w = w->next) {
+					U8 *pattern = ShellExpand(sh, w->text);
+					if (pattern) {
+						if (ShellGlobMatch(pattern, expanded)) {
+							matched = TRUE;
+							if (item->body)
+								status = ShellExecuteCommand(sh, item->body);
+							Free(pattern);
+							break;
+						}
+						Free(pattern);
+					}
+				}
+			}
+
+			Free(expanded);
+			break;
+		}
+
+		case NODE_FUNCTION:
+			// Define the function
+			// Need to copy the body since we're storing it
+			ShellDefineFunc(sh, cmd->function.name, cmd->function.body);
+			// Prevent double-free by clearing the pointer
+			cmd->function.body = NULL;
+			status = 0;
+			break;
+
+		case NODE_BANG:
+			status = ShellExecuteCommand(sh, cmd->child);
+			status = !status;
+			break;
+	}
+
+	// Handle compound command redirections
+	if (cmd->redirects && cmd->type != NODE_COMMAND) {
+		// TODO: implement redirection for compound commands
+	}
+
+	sh->last_status = status;
+
+	// Check for errexit
+	if (sh->errexit && status != 0 && cmd->type != NODE_IF &&
+	    cmd->type != NODE_WHILE && cmd->type != NODE_UNTIL) {
+		PosixExit(status);
+	}
+
+	return status;
+}
+
+// ============================================================================
+// HIGH-LEVEL SHELL INTERFACE
+// ============================================================================
+
+I64 ShellRun(CShellState *sh, U8 *command)
+{
+	CShellParser parser;
+	CShellCommand *ast;
+	I64 status;
+
+	if (!sh || !command)
+		return -1;
+
+	ShellParserInit(&parser, command);
+
+	ast = ShellParse(&parser);
+
+	if (parser.error) {
+		"sh: syntax error: %s (line %d)\n",
+			parser.error_msg ? parser.error_msg : "unknown error",
+			parser.error_line;
+		ShellParserFree(&parser);
+		return 2;
+	}
+
+	if (!ast) {
+		ShellParserFree(&parser);
+		return 0;  // Empty command
+	}
+
+	status = ShellExecuteCommand(sh, ast);
+
+	ShellCommandFree(ast);
+	ShellParserFree(&parser);
+
+	return status;
+}
+
+I64 ShellRunFile(CShellState *sh, U8 *filename)
+{
+	U8 *content;
+	I64 status;
+
+	if (!sh || !filename)
+		return -1;
+
+	content = FileRead(filename);
+	if (!content) {
+		"sh: %s: No such file or directory\n", filename;
+		return 1;
+	}
+
+	status = ShellRun(sh, content);
+	Free(content);
+
+	return status;
+}
+
+// ============================================================================
+// INTERACTIVE SHELL
+// ============================================================================
+
+I64 ShellInteractive(CShellState *sh)
+{
+	U8 line[4096];
+	U8 *prompt;
+	I64 status = 0;
+
+	if (!sh)
+		return -1;
+
+	sh->interactive = TRUE;
+
+	while (1) {
+		// Get prompt
+		prompt = ShellGetVar(sh, "PS1");
+		if (!prompt)
+			prompt = "$ ";
+
+		// Print prompt and read line
+		"%s", prompt;
+
+		// Read line (simplified - real implementation would use readline)
+		if (!GetS(line, sizeof(line)))
+			break;
+
+		// Skip empty lines
+		if (line[0] == 0)
+			continue;
+
+		// Check for exit
+		if (!StrCmp(line, "exit"))
+			break;
+
+		// Execute
+		status = ShellRun(sh, line);
+	}
+
+	return status;
+}

@@ -1,0 +1,677 @@
+// TLSRecord.ZC - TLS Record Layer Implementation
+// Part of ZealOS TLS 1.3 implementation
+// See C:/Home/Net/Docs/TLSDesign.DD for design documentation
+
+// The record layer handles:
+// - Fragmentation/reassembly of messages
+// - Encryption/decryption of records
+// - Record format encoding/decoding
+
+// ============================================================================
+// RECORD LAYER ALLOCATION
+// ============================================================================
+
+// Allocate receive buffer for TLS state
+U0 TLSAllocateBuffers(CTLSState *tls)
+{
+	if (!tls->recv_buffer) {
+		tls->recv_buffer_size = TLS_MAX_RECORD_SIZE + TLS_AEAD_OVERHEAD + TLS_RECORD_HEADER_SIZE;
+		tls->recv_buffer = MAlloc(tls->recv_buffer_size);
+		tls->recv_buffer_len = 0;
+	}
+
+	if (!tls->app_buffer) {
+		tls->app_buffer_size = TLS_MAX_RECORD_SIZE;
+		tls->app_buffer = MAlloc(tls->app_buffer_size);
+		tls->app_buffer_len = 0;
+		tls->app_buffer_pos = 0;
+	}
+}
+
+// Free TLS buffers
+U0 TLSFreeBuffers(CTLSState *tls)
+{
+	if (tls->recv_buffer) {
+		CryptoSecureZero(tls->recv_buffer, tls->recv_buffer_size);
+		Free(tls->recv_buffer);
+		tls->recv_buffer = NULL;
+	}
+
+	if (tls->app_buffer) {
+		CryptoSecureZero(tls->app_buffer, tls->app_buffer_size);
+		Free(tls->app_buffer);
+		tls->app_buffer = NULL;
+	}
+
+	if (tls->server_name) {
+		Free(tls->server_name);
+		tls->server_name = NULL;
+	}
+}
+
+// ============================================================================
+// RECORD HEADER ENCODING/DECODING
+// ============================================================================
+
+// Encode a TLS record header into buffer
+U0 TLSWriteRecordHeader(U8 *buf, U8 content_type, U16 version, U16 length)
+{
+	buf[0] = content_type;
+	buf[1] = (U8)(version >> 8);
+	buf[2] = (U8)(version & 0xFF);
+	buf[3] = (U8)(length >> 8);
+	buf[4] = (U8)(length & 0xFF);
+}
+
+// Decode a TLS record header from buffer
+U0 TLSParseRecordHeader(U8 *buf, CTLSRecordHeader *hdr)
+{
+	hdr->content_type = buf[0];
+	hdr->version_major = buf[1];
+	hdr->version_minor = buf[2];
+	hdr->length_high = buf[3];
+	hdr->length_low = buf[4];
+}
+
+// Get length from parsed header
+I64 TLSRecordLength(CTLSRecordHeader *hdr)
+{
+	return ((I64)hdr->length_high << 8) | hdr->length_low;
+}
+
+// Get version from parsed header
+U16 TLSRecordVersion(CTLSRecordHeader *hdr)
+{
+	return ((U16)hdr->version_major << 8) | hdr->version_minor;
+}
+
+// ============================================================================
+// NONCE CONSTRUCTION
+// ============================================================================
+
+// Construct nonce for AEAD encryption/decryption
+// In TLS 1.3, nonce = IV XOR padded_sequence_number
+U0 TLSConstructNonce(U8 *nonce, U8 *iv, U64 seq)
+{
+	I64 i;
+
+	// Start with IV
+	MemCpy(nonce, iv, 12);
+
+	// XOR with 64-bit sequence number (right-aligned, big-endian)
+	// The sequence number is XORed with the rightmost 8 bytes of the IV
+	nonce[4]  ^= (U8)(seq >> 56);
+	nonce[5]  ^= (U8)(seq >> 48);
+	nonce[6]  ^= (U8)(seq >> 40);
+	nonce[7]  ^= (U8)(seq >> 32);
+	nonce[8]  ^= (U8)(seq >> 24);
+	nonce[9]  ^= (U8)(seq >> 16);
+	nonce[10] ^= (U8)(seq >> 8);
+	nonce[11] ^= (U8)(seq);
+}
+
+// ============================================================================
+// PLAINTEXT RECORD WRITING
+// ============================================================================
+
+// Write a plaintext record (used during handshake before encryption)
+// Returns number of bytes written, or negative error code
+I64 TLSWritePlaintextRecord(CTCPSocket *sock, U8 content_type, U8 *data, I64 length)
+{
+	U8 header[TLS_RECORD_HEADER_SIZE];
+	I64 result;
+
+	if (length > TLS_MAX_RECORD_SIZE) {
+		return TLS_ERR_BUFFER_OVERFLOW;
+	}
+
+	// Build header with legacy version for compatibility
+	TLSWriteRecordHeader(header, content_type, TLS_LEGACY_VERSION, length);
+
+	// Send header
+	result = TCPSocketSend(sock, header, TLS_RECORD_HEADER_SIZE);
+	if (result < 0) {
+		return TLS_ERR_CONNECTION_CLOSED;
+	}
+
+	// Send data
+	if (length > 0) {
+		result = TCPSocketSend(sock, data, length);
+		if (result < 0) {
+			return TLS_ERR_CONNECTION_CLOSED;
+		}
+	}
+
+	return TLS_RECORD_HEADER_SIZE + length;
+}
+
+// ============================================================================
+// ENCRYPTED RECORD WRITING (TLS 1.3)
+// ============================================================================
+
+// Write an encrypted record (TLS 1.3 format)
+// The inner plaintext is: content || content_type || padding (optional)
+// The outer record type is always application_data
+I64 TLSWriteEncryptedRecord(CTLSState *tls, CTCPSocket *sock,
+                            U8 content_type, U8 *data, I64 length)
+{
+	U8 header[TLS_RECORD_HEADER_SIZE];
+	U8 *plaintext;
+	U8 *ciphertext;
+	U8 nonce[12];
+	U8 tag[GCM_TAG_SIZE];
+	I64 plaintext_len;
+	I64 ciphertext_len;
+	I64 result;
+	I64 key_size;
+
+	// Check size limit
+	if (length > TLS_MAX_RECORD_SIZE - 1) {  // -1 for content type byte
+		return TLS_ERR_BUFFER_OVERFLOW;
+	}
+
+	// Build inner plaintext: content || content_type
+	plaintext_len = length + 1;  // +1 for inner content type
+	plaintext = MAlloc(plaintext_len);
+	MemCpy(plaintext, data, length);
+	plaintext[length] = content_type;  // Append inner content type
+
+	// Ciphertext length = plaintext + tag (16 bytes for both GCM and ChaCha20-Poly1305)
+	ciphertext_len = plaintext_len + 16;
+	ciphertext = MAlloc(ciphertext_len);
+
+	// Construct nonce from IV XOR sequence number
+	TLSConstructNonce(nonce, tls->client_write_iv, tls->client_seq);
+
+	// Build AAD: record header (with encrypted length)
+	TLSWriteRecordHeader(header, TLS_CONTENT_APPLICATION, TLS_LEGACY_VERSION, ciphertext_len);
+
+	// Encrypt based on cipher suite
+	if (tls->cipher_suite == TLS_CHACHA20_POLY1305_SHA256) {
+		// Encrypt with ChaCha20-Poly1305
+		// Note: ChaCha20Poly1305Encrypt appends tag to ciphertext
+		result = ChaCha20Poly1305Encrypt(tls->client_write_key, nonce,
+		                                  header, TLS_RECORD_HEADER_SIZE,  // AAD
+		                                  plaintext, plaintext_len,
+		                                  ciphertext);
+		if (result != ciphertext_len) {
+			Free(plaintext);
+			Free(ciphertext);
+			return TLS_ERR_INTERNAL;
+		}
+		result = CRYPTO_OK;
+	} else {
+		// Encrypt with AES-GCM
+		// AAD = record header (5 bytes)
+		result = GCMEncrypt(&tls->client_gcm,
+		                    nonce, 12,
+		                    header, TLS_RECORD_HEADER_SIZE,  // AAD
+		                    plaintext, plaintext_len,
+		                    ciphertext, tag);
+
+		if (result == CRYPTO_OK) {
+			// Append tag to ciphertext
+			MemCpy(&ciphertext[plaintext_len], tag, GCM_TAG_SIZE);
+		}
+	}
+
+	if (result != CRYPTO_OK) {
+		Free(plaintext);
+		Free(ciphertext);
+		return TLS_ERR_INTERNAL;
+	}
+
+	// Send header
+	result = TCPSocketSend(sock, header, TLS_RECORD_HEADER_SIZE);
+	if (result < 0) {
+		Free(plaintext);
+		Free(ciphertext);
+		return TLS_ERR_CONNECTION_CLOSED;
+	}
+
+	// Send ciphertext + tag
+	result = TCPSocketSend(sock, ciphertext, ciphertext_len);
+	if (result < 0) {
+		Free(plaintext);
+		Free(ciphertext);
+		return TLS_ERR_CONNECTION_CLOSED;
+	}
+
+	// Increment sequence number
+	tls->client_seq++;
+
+	// Cleanup
+	CryptoSecureZero(plaintext, plaintext_len);
+	CryptoSecureZero(nonce, 12);
+	Free(plaintext);
+	Free(ciphertext);
+
+	return TLS_RECORD_HEADER_SIZE + ciphertext_len;
+}
+
+// ============================================================================
+// RECORD READING
+// ============================================================================
+
+// Read exactly n bytes from socket into buffer
+// Returns TLS_OK on success, error code on failure
+I64 TLSReadExact(CTCPSocket *sock, U8 *buf, I64 length, I64 timeout_ms)
+{
+	I64 received = 0;
+	I64 result;
+	I64 start_time = tS * 1000;
+
+	while (received < length) {
+		result = TCPSocketRecv(sock, &buf[received], length - received);
+
+		if (result > 0) {
+			received += result;
+		} else if (result == 0) {
+			// Connection closed
+			return TLS_ERR_CONNECTION_CLOSED;
+		} else {
+			// Would block or error
+			// Check timeout
+			if (timeout_ms > 0) {
+				I64 elapsed = (tS * 1000) - start_time;
+				if (elapsed >= timeout_ms) {
+					return TLS_ERR_TIMEOUT;
+				}
+			}
+			// Small yield before retry
+			Yield;
+		}
+	}
+
+	return TLS_OK;
+}
+
+// Read a complete TLS record (header + data)
+// Returns content type in *content_type, data in *data_out, length in *length_out
+// Caller must Free(*data_out) when done
+I64 TLSReadRecord(CTLSState *tls, CTCPSocket *sock,
+                  U8 *content_type, U8 **data_out, I64 *length_out, I64 timeout_ms)
+{
+	CTLSRecordHeader hdr;
+	U8 header_buf[TLS_RECORD_HEADER_SIZE];
+	U8 *data;
+	I64 length;
+	I64 result;
+
+	// Read record header
+	result = TLSReadExact(sock, header_buf, TLS_RECORD_HEADER_SIZE, timeout_ms);
+	if (result != TLS_OK) {
+		return result;
+	}
+
+	TLSParseRecordHeader(header_buf, &hdr);
+	length = TLSRecordLength(&hdr);
+
+	// Validate record
+	if (length > TLS_MAX_RECORD_SIZE + TLS_AEAD_OVERHEAD) {
+		return TLS_ERR_INVALID_RECORD;
+	}
+
+	// Allocate buffer for record data
+	data = MAlloc(length);
+
+	// Read record data
+	result = TLSReadExact(sock, data, length, timeout_ms);
+	if (result != TLS_OK) {
+		Free(data);
+		return result;
+	}
+
+	*content_type = hdr.content_type;
+	*data_out = data;
+	*length_out = length;
+
+	return TLS_OK;
+}
+
+// ============================================================================
+// ENCRYPTED RECORD READING (TLS 1.3)
+// ============================================================================
+
+// Decrypt a TLS 1.3 encrypted record
+// Input: ciphertext (includes tag), record header for AAD
+// Output: plaintext, actual content type
+// Returns plaintext length or negative error
+I64 TLSDecryptRecord(CTLSState *tls, U8 *record_header,
+                     U8 *ciphertext, I64 ciphertext_len,
+                     U8 *plaintext, U8 *inner_type)
+{
+	U8 nonce[12];
+	U8 tag[GCM_TAG_SIZE];
+	I64 plaintext_len;
+	I64 result;
+	I64 i;
+
+	// Ciphertext must include at least: 1 byte content + 16 byte tag
+	if (ciphertext_len < 16 + 1) {
+		return TLS_ERR_INVALID_RECORD;
+	}
+
+	plaintext_len = ciphertext_len - 16;
+
+	// Construct nonce from IV XOR sequence number
+	TLSConstructNonce(nonce, tls->server_write_iv, tls->server_seq);
+
+	// Decrypt based on cipher suite
+	if (tls->cipher_suite == TLS_CHACHA20_POLY1305_SHA256) {
+		// Decrypt with ChaCha20-Poly1305
+		result = ChaCha20Poly1305Decrypt(tls->server_write_key, nonce,
+		                                  record_header, TLS_RECORD_HEADER_SIZE,  // AAD
+		                                  ciphertext, ciphertext_len,
+		                                  plaintext);
+		if (result < 0) {
+			CryptoSecureZero(nonce, 12);
+			return TLS_ERR_AUTH_FAILED;
+		}
+		plaintext_len = result;
+		result = CRYPTO_OK;
+	} else {
+		// Extract tag from end of ciphertext
+		MemCpy(tag, &ciphertext[plaintext_len], GCM_TAG_SIZE);
+
+		// Decrypt with AES-GCM
+		// AAD = record header (5 bytes)
+		result = GCMDecrypt(&tls->server_gcm,
+		                    nonce, 12,
+		                    record_header, TLS_RECORD_HEADER_SIZE,  // AAD
+		                    ciphertext, plaintext_len,
+		                    plaintext, tag);
+	}
+
+	// Secure cleanup
+	CryptoSecureZero(nonce, 12);
+
+	if (result != CRYPTO_OK) {
+		return TLS_ERR_AUTH_FAILED;
+	}
+
+	// Increment sequence number
+	tls->server_seq++;
+
+	// Find inner content type (strip trailing zeros, last non-zero byte is type)
+	// TLS 1.3 padding: plaintext may have trailing zeros after content type
+	i = plaintext_len - 1;
+	while (i > 0 && plaintext[i] == 0) {
+		i--;
+	}
+
+	if (i < 0) {
+		return TLS_ERR_INVALID_RECORD;
+	}
+
+	*inner_type = plaintext[i];
+
+	// Return actual content length (excluding content type and padding)
+	return i;
+}
+
+// ============================================================================
+// HIGH-LEVEL READ/WRITE FUNCTIONS
+// ============================================================================
+
+// Send application data (after handshake complete)
+I64 TLSSend(CTLSState *tls, CTCPSocket *sock, U8 *data, I64 length)
+{
+	I64 sent = 0;
+	I64 chunk;
+	I64 result;
+	I64 max_chunk = TLS_MAX_RECORD_SIZE - 1;  // -1 for content type
+
+	if (tls->state != TLS_STATE_CONNECTED) {
+		return TLS_ERR_HANDSHAKE_FAILED;
+	}
+
+	// Send in chunks of max record size
+	while (sent < length) {
+		chunk = length - sent;
+		if (chunk > max_chunk) chunk = max_chunk;
+
+		result = TLSWriteEncryptedRecord(tls, sock,
+		                                 TLS_CONTENT_APPLICATION,
+		                                 &data[sent], chunk);
+		if (result < 0) {
+			return result;
+		}
+
+		sent += chunk;
+	}
+
+	return sent;
+}
+
+// Receive application data (after handshake complete)
+// Returns number of bytes read, 0 on EOF, or negative error
+I64 TLSRecv(CTLSState *tls, CTCPSocket *sock, U8 *buffer, I64 length, I64 timeout_ms)
+{
+	U8 record_header[TLS_RECORD_HEADER_SIZE];
+	U8 content_type;
+	U8 inner_type;
+	U8 *ciphertext;
+	U8 *plaintext;
+	I64 ciphertext_len;
+	I64 plaintext_len;
+	I64 result;
+	I64 to_copy;
+
+	if (tls->state != TLS_STATE_CONNECTED && tls->state != TLS_STATE_CLOSING) {
+		return TLS_ERR_HANDSHAKE_FAILED;
+	}
+
+	// First, check if we have buffered application data
+	if (tls->app_buffer_len > tls->app_buffer_pos) {
+		to_copy = tls->app_buffer_len - tls->app_buffer_pos;
+		if (to_copy > length) to_copy = length;
+		MemCpy(buffer, &tls->app_buffer[tls->app_buffer_pos], to_copy);
+		tls->app_buffer_pos += to_copy;
+
+		// Reset buffer if fully consumed
+		if (tls->app_buffer_pos >= tls->app_buffer_len) {
+			tls->app_buffer_len = 0;
+			tls->app_buffer_pos = 0;
+		}
+
+		return to_copy;
+	}
+
+	// Read a new record
+	result = TLSReadRecord(tls, sock, &content_type, &ciphertext, &ciphertext_len, timeout_ms);
+	if (result != TLS_OK) {
+		return result;
+	}
+
+	// Build record header for AAD
+	TLSWriteRecordHeader(record_header, content_type, TLS_LEGACY_VERSION, ciphertext_len);
+
+	// Allocate plaintext buffer
+	plaintext = MAlloc(ciphertext_len);
+
+	// Decrypt
+	plaintext_len = TLSDecryptRecord(tls, record_header,
+	                                 ciphertext, ciphertext_len,
+	                                 plaintext, &inner_type);
+
+	Free(ciphertext);
+
+	if (plaintext_len < 0) {
+		Free(plaintext);
+		return plaintext_len;  // Error code
+	}
+
+	// Handle based on inner content type
+	switch (inner_type) {
+		case TLS_CONTENT_APPLICATION:
+			// Copy what we can to user buffer
+			to_copy = plaintext_len;
+			if (to_copy > length) to_copy = length;
+			MemCpy(buffer, plaintext, to_copy);
+
+			// Buffer the rest if any
+			if (plaintext_len > length) {
+				I64 remaining = plaintext_len - length;
+				if (remaining > tls->app_buffer_size) {
+					// Shouldn't happen with proper sizing
+					Free(plaintext);
+					return TLS_ERR_BUFFER_OVERFLOW;
+				}
+				MemCpy(tls->app_buffer, &plaintext[length], remaining);
+				tls->app_buffer_len = remaining;
+				tls->app_buffer_pos = 0;
+			}
+
+			Free(plaintext);
+			return to_copy;
+
+		case TLS_CONTENT_ALERT:
+			if (plaintext_len >= 2) {
+				tls->last_alert_level = plaintext[0];
+				tls->last_alert_desc = plaintext[1];
+
+				if (plaintext[1] == TLS_ALERT_CLOSE_NOTIFY) {
+					tls->state = TLS_STATE_CLOSING;
+					Free(plaintext);
+					return 0;  // Clean EOF
+				}
+			}
+			Free(plaintext);
+			return TLS_ERR_ALERT_RECEIVED;
+
+		case TLS_CONTENT_HANDSHAKE:
+			// Post-handshake messages (key update, new session ticket, etc.)
+			// For now, just ignore
+			Free(plaintext);
+			// Recursively try to read application data
+			return TLSRecv(tls, sock, buffer, length, timeout_ms);
+
+		default:
+			Free(plaintext);
+			return TLS_ERR_UNEXPECTED_MESSAGE;
+	}
+}
+
+// ============================================================================
+// ALERT SENDING
+// ============================================================================
+
+// Send a TLS alert
+I64 TLSSendAlert(CTLSState *tls, CTCPSocket *sock, U8 level, U8 description)
+{
+	U8 alert[2];
+
+	alert[0] = level;
+	alert[1] = description;
+
+	if (tls->state >= TLS_STATE_CONNECTED) {
+		// Send encrypted alert
+		return TLSWriteEncryptedRecord(tls, sock, TLS_CONTENT_ALERT, alert, 2);
+	} else {
+		// Send plaintext alert (during handshake)
+		return TLSWritePlaintextRecord(sock, TLS_CONTENT_ALERT, alert, 2);
+	}
+}
+
+// Send close_notify alert
+I64 TLSSendCloseNotify(CTLSState *tls, CTCPSocket *sock)
+{
+	I64 result = TLSSendAlert(tls, sock, TLS_ALERT_WARNING, TLS_ALERT_CLOSE_NOTIFY);
+	tls->state = TLS_STATE_CLOSING;
+	return result;
+}
+
+// ============================================================================
+// TRANSCRIPT HASH
+// ============================================================================
+
+// Update transcript hash with handshake message
+U0 TLSUpdateTranscript(CTLSState *tls, U8 *data, I64 length)
+{
+	if (tls->use_sha384) {
+		SHA512Update(&tls->transcript_sha384, data, length);
+	} else {
+		SHA256Update(&tls->transcript_sha256, data, length);
+	}
+}
+
+// Get current transcript hash (without finalizing)
+U0 TLSGetTranscriptHash(CTLSState *tls, U8 *hash_out)
+{
+	if (tls->use_sha384) {
+		// Clone context and finalize
+		CSHA512Context tmp;
+		MemCpy(&tmp, &tls->transcript_sha384, sizeof(CSHA512Context));
+		SHA512Final(&tmp, hash_out);
+		CryptoSecureZero(&tmp, sizeof(CSHA512Context));
+	} else {
+		// Clone context and finalize
+		CSHA256Context tmp;
+		MemCpy(&tmp, &tls->transcript_sha256, sizeof(CSHA256Context));
+		SHA256Final(&tmp, hash_out);
+		CryptoSecureZero(&tmp, sizeof(CSHA256Context));
+	}
+}
+
+// ============================================================================
+// STATE INITIALIZATION
+// ============================================================================
+
+// Initialize TLS state for a new connection
+U0 TLSStateInit(CTLSState *tls)
+{
+	MemSet(tls, 0, sizeof(CTLSState));
+
+	tls->state = TLS_STATE_INIT;
+	tls->version = TLS_VERSION_1_3;
+	tls->cipher_suite = TLS_AES_128_GCM_SHA256;
+	tls->hash_size = 32;
+	tls->use_sha384 = FALSE;
+
+	// Initialize transcript hashes
+	SHA256Init(&tls->transcript_sha256);
+	SHA384Init(&tls->transcript_sha384);
+
+	// Allocate buffers
+	TLSAllocateBuffers(tls);
+
+	// Generate random client_random
+	Random(tls->client_random, 32);
+
+	// Generate ephemeral X25519 key pair
+	RandomX25519PrivateKey(tls->ecdh_private);
+	X25519PublicFromPrivate(tls->ecdh_public, tls->ecdh_private);
+}
+
+// Clean up TLS state
+U0 TLSStateCleanup(CTLSState *tls)
+{
+	// Zero sensitive material
+	CryptoSecureZero(tls->client_write_key, 32);
+	CryptoSecureZero(tls->server_write_key, 32);
+	CryptoSecureZero(tls->client_write_iv, 12);
+	CryptoSecureZero(tls->server_write_iv, 12);
+	CryptoSecureZero(tls->ecdh_private, 32);
+	CryptoSecureZero(tls->early_secret, 48);
+	CryptoSecureZero(tls->handshake_secret, 48);
+	CryptoSecureZero(tls->master_secret, 48);
+	CryptoSecureZero(tls->client_handshake_traffic_secret, 48);
+	CryptoSecureZero(tls->server_handshake_traffic_secret, 48);
+	CryptoSecureZero(tls->client_application_traffic_secret, 48);
+	CryptoSecureZero(tls->server_application_traffic_secret, 48);
+
+	// Free buffers
+	TLSFreeBuffers(tls);
+
+	tls->state = TLS_STATE_CLOSED;
+}
+
+// Set server name for SNI extension
+U0 TLSSetServerName(CTLSState *tls, U8 *hostname)
+{
+	if (tls->server_name) {
+		Free(tls->server_name);
+	}
+	tls->server_name = StrNew(hostname);
+}

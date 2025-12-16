@@ -1,0 +1,401 @@
+// termios.ZC - Terminal I/O interface for ZealOS
+// Part of the POSIX compatibility layer
+//
+// Provides terminal control similar to POSIX termios.
+
+// ============================================================================
+// TERMIOS CONSTANTS
+// ============================================================================
+
+// Input mode flags (c_iflag)
+#define IGNBRK   0x00001  // Ignore BREAK condition
+#define BRKINT   0x00002  // Signal interrupt on break
+#define IGNPAR   0x00004  // Ignore parity errors
+#define PARMRK   0x00008  // Mark parity errors
+#define INPCK    0x00010  // Enable input parity check
+#define ISTRIP   0x00020  // Strip high bit
+#define INLCR    0x00040  // Translate NL to CR
+#define IGNCR    0x00080  // Ignore CR
+#define ICRNL    0x00100  // Translate CR to NL
+#define IUCLC    0x00200  // Map uppercase to lowercase
+#define IXON     0x00400  // Enable start/stop output control
+#define IXANY    0x00800  // Enable any char to restart output
+#define IXOFF    0x01000  // Enable start/stop input control
+#define IMAXBEL  0x02000  // Ring bell when queue full
+
+// Output mode flags (c_oflag)
+#define OPOST    0x00001  // Post-process output
+#define OLCUC    0x00002  // Map lowercase to uppercase
+#define ONLCR    0x00004  // Map NL to CR-NL
+#define OCRNL    0x00008  // Map CR to NL
+#define ONOCR    0x00010  // No CR at column 0
+#define ONLRET   0x00020  // NL performs CR function
+#define OFILL    0x00040  // Use fill characters
+#define OFDEL    0x00080  // Fill is DEL
+#define NLDLY    0x00100  // NL delay
+#define CRDLY    0x00600  // CR delay
+#define TABDLY   0x01800  // TAB delay
+#define BSDLY    0x02000  // BS delay
+#define VTDLY    0x04000  // VT delay
+#define FFDLY    0x08000  // FF delay
+
+// Control mode flags (c_cflag)
+#define CSIZE    0x00030  // Character size mask
+#define CS5      0x00000  // 5 bits
+#define CS6      0x00010  // 6 bits
+#define CS7      0x00020  // 7 bits
+#define CS8      0x00030  // 8 bits
+#define CSTOPB   0x00040  // 2 stop bits
+#define CREAD    0x00080  // Enable receiver
+#define PARENB   0x00100  // Enable parity
+#define PARODD   0x00200  // Odd parity
+#define HUPCL    0x00400  // Hangup on close
+#define CLOCAL   0x00800  // Ignore modem status lines
+
+// Local mode flags (c_lflag)
+#define ISIG     0x00001  // Enable signals
+#define ICANON   0x00002  // Canonical input
+#define XCASE    0x00004  // Canonical upper/lower presentation
+#define ECHO     0x00008  // Enable echo
+#define ECHOE    0x00010  // Echo erase as backspace
+#define ECHOK    0x00020  // Echo NL after kill
+#define ECHONL   0x00040  // Echo NL
+#define NOFLSH   0x00080  // Disable flush after interrupt
+#define TOSTOP   0x00100  // Stop background jobs on write
+#define ECHOCTL  0x00200  // Echo control chars as ^X
+#define ECHOPRT  0x00400  // Echo erased chars
+#define ECHOKE   0x00800  // Visual erase for kill
+#define IEXTEN   0x08000  // Enable extended functions
+
+// Control characters array indices
+#define VINTR    0   // Interrupt
+#define VQUIT    1   // Quit
+#define VERASE   2   // Erase
+#define VKILL    3   // Kill
+#define VEOF     4   // End-of-file
+#define VTIME    5   // Time
+#define VMIN     6   // Min
+#define VSWTC    7   // Switch
+#define VSTART   8   // Start
+#define VSTOP    9   // Stop
+#define VSUSP    10  // Suspend
+#define VEOL     11  // End-of-line
+#define VREPRINT 12  // Reprint
+#define VDISCARD 13  // Discard
+#define VWERASE  14  // Word erase
+#define VLNEXT   15  // Literal next
+#define VEOL2    16  // End-of-line 2
+#define NCCS     17  // Size of c_cc array
+
+// Baud rates
+#define B0       0
+#define B50      1
+#define B75      2
+#define B110     3
+#define B134     4
+#define B150     5
+#define B200     6
+#define B300     7
+#define B600     8
+#define B1200    9
+#define B1800    10
+#define B2400    11
+#define B4800    12
+#define B9600    13
+#define B19200   14
+#define B38400   15
+#define B57600   0x1001
+#define B115200  0x1002
+#define B230400  0x1003
+
+// tcsetattr actions
+#define TCSANOW   0  // Change immediately
+#define TCSADRAIN 1  // Change after output complete
+#define TCSAFLUSH 2  // Flush input, change
+
+// tcflush queue selectors
+#define TCIFLUSH  0  // Flush input
+#define TCOFLUSH  1  // Flush output
+#define TCIOFLUSH 2  // Flush both
+
+// tcflow actions
+#define TCOOFF 0  // Suspend output
+#define TCOON  1  // Resume output
+#define TCIOFF 2  // Send STOP
+#define TCION  3  // Send START
+
+// ============================================================================
+// TERMIOS STRUCTURE
+// ============================================================================
+
+class termios {
+    U32 c_iflag;      // Input mode flags
+    U32 c_oflag;      // Output mode flags
+    U32 c_cflag;      // Control mode flags
+    U32 c_lflag;      // Local mode flags
+    U8  c_line;       // Line discipline
+    U8  c_cc[NCCS];   // Control characters
+    U32 c_ispeed;     // Input speed
+    U32 c_ospeed;     // Output speed
+};
+
+// ============================================================================
+// TERMINAL STATE
+// ============================================================================
+
+class CTermState {
+    termios orig_termios;     // Original settings
+    termios current_termios;  // Current settings
+    Bool raw_mode;            // In raw mode
+    Bool initialized;         // Is initialized
+    I64 rows;                 // Terminal height
+    I64 cols;                 // Terminal width
+};
+
+// Global terminal state
+CTermState g_term_state;
+
+// ============================================================================
+// TERMIOS FUNCTIONS
+// ============================================================================
+
+// Get terminal attributes
+I64 tcgetattr(I64 fd, termios *t)
+{
+    if (!t) {
+        errno = EINVAL;
+        return -1;
+    }
+
+    // Return current terminal state
+    MemCpy(t, &g_term_state.current_termios, sizeof(termios));
+    return 0;
+}
+
+// Set terminal attributes
+I64 tcsetattr(I64 fd, I64 actions, termios *t)
+{
+    if (!t) {
+        errno = EINVAL;
+        return -1;
+    }
+
+    // Save new settings
+    MemCpy(&g_term_state.current_termios, t, sizeof(termios));
+
+    // Update terminal mode based on flags
+    if (!(t->c_lflag & ICANON)) {
+        // Non-canonical mode (raw)
+        g_term_state.raw_mode = TRUE;
+    } else {
+        g_term_state.raw_mode = FALSE;
+    }
+
+    return 0;
+}
+
+// Get input speed
+I64 cfgetispeed(termios *t)
+{
+    return t ? t->c_ispeed : B0;
+}
+
+// Get output speed
+I64 cfgetospeed(termios *t)
+{
+    return t ? t->c_ospeed : B0;
+}
+
+// Set input speed
+I64 cfsetispeed(termios *t, I64 speed)
+{
+    if (!t) {
+        errno = EINVAL;
+        return -1;
+    }
+    t->c_ispeed = speed;
+    return 0;
+}
+
+// Set output speed
+I64 cfsetospeed(termios *t, I64 speed)
+{
+    if (!t) {
+        errno = EINVAL;
+        return -1;
+    }
+    t->c_ospeed = speed;
+    return 0;
+}
+
+// Set raw mode
+U0 cfmakeraw(termios *t)
+{
+    if (!t) return;
+
+    t->c_iflag &= ~(IGNBRK | BRKINT | PARMRK | ISTRIP | INLCR | IGNCR | ICRNL | IXON);
+    t->c_oflag &= ~OPOST;
+    t->c_lflag &= ~(ECHO | ECHONL | ICANON | ISIG | IEXTEN);
+    t->c_cflag &= ~(CSIZE | PARENB);
+    t->c_cflag |= CS8;
+    t->c_cc[VMIN] = 1;
+    t->c_cc[VTIME] = 0;
+}
+
+// Flush terminal data
+I64 tcflush(I64 fd, I64 queue_selector)
+{
+    // ZealOS doesn't buffer keyboard input the same way
+    return 0;
+}
+
+// Flow control
+I64 tcflow(I64 fd, I64 action)
+{
+    // Not implemented for ZealOS
+    return 0;
+}
+
+// Send break
+I64 tcsendbreak(I64 fd, I64 duration)
+{
+    return 0;
+}
+
+// Drain output
+I64 tcdrain(I64 fd)
+{
+    return 0;
+}
+
+// ============================================================================
+// WINDOW SIZE
+// ============================================================================
+
+class winsize {
+    U16 ws_row;     // Rows (in characters)
+    U16 ws_col;     // Columns (in characters)
+    U16 ws_xpixel;  // Horizontal size (pixels)
+    U16 ws_ypixel;  // Vertical size (pixels)
+};
+
+// IOCTL codes for window size
+#define TIOCGWINSZ 0x5413
+#define TIOCSWINSZ 0x5414
+
+// Terminal ioctl
+I64 term_ioctl(I64 fd, U64 request, U8 *argp)
+{
+    winsize *ws;
+
+    switch (request) {
+        case TIOCGWINSZ:
+            ws = argp;
+            if (ws) {
+                // Get ZealOS terminal size
+                ws->ws_row = g_term_state.rows > 0 ? g_term_state.rows : 25;
+                ws->ws_col = g_term_state.cols > 0 ? g_term_state.cols : 80;
+                ws->ws_xpixel = ws->ws_col * 8;
+                ws->ws_ypixel = ws->ws_row * 16;
+            }
+            return 0;
+
+        case TIOCSWINSZ:
+            ws = argp;
+            if (ws) {
+                g_term_state.rows = ws->ws_row;
+                g_term_state.cols = ws->ws_col;
+            }
+            return 0;
+
+        default:
+            errno = EINVAL;
+            return -1;
+    }
+}
+
+// ============================================================================
+// TERMINAL IDENTIFICATION
+// ============================================================================
+
+// Check if file descriptor is a terminal
+I64 isatty(I64 fd)
+{
+    // In ZealOS, stdin/stdout/stderr are always terminals
+    if (fd >= 0 && fd <= 2) {
+        return 1;
+    }
+    return 0;
+}
+
+// Get terminal name
+U8 *ttyname(I64 fd)
+{
+    if (isatty(fd)) {
+        return "/dev/tty";
+    }
+    return NULL;
+}
+
+// Get controlling terminal
+U8 *ctermid(U8 *s)
+{
+    U8 *name = "/dev/tty";
+    if (s) {
+        StrCpy(s, name);
+        return s;
+    }
+    return name;
+}
+
+// ============================================================================
+// INITIALIZATION
+// ============================================================================
+
+U0 TermiosInit()
+{
+    if (g_term_state.initialized) return;
+
+    // Set default terminal attributes
+    MemSet(&g_term_state, 0, sizeof(CTermState));
+
+    // Default input flags
+    g_term_state.current_termios.c_iflag = ICRNL | IXON;
+
+    // Default output flags
+    g_term_state.current_termios.c_oflag = OPOST | ONLCR;
+
+    // Default control flags (8 bits, no parity, 1 stop bit)
+    g_term_state.current_termios.c_cflag = CS8 | CREAD | CLOCAL;
+
+    // Default local flags (canonical, echo)
+    g_term_state.current_termios.c_lflag = ISIG | ICANON | ECHO | ECHOE | ECHOK | ECHOCTL | ECHOKE | IEXTEN;
+
+    // Default control characters
+    g_term_state.current_termios.c_cc[VINTR] = 0x03;    // Ctrl-C
+    g_term_state.current_termios.c_cc[VQUIT] = 0x1C;    // Ctrl-backslash
+    g_term_state.current_termios.c_cc[VERASE] = 0x7F;   // DEL
+    g_term_state.current_termios.c_cc[VKILL] = 0x15;    // Ctrl-U
+    g_term_state.current_termios.c_cc[VEOF] = 0x04;     // Ctrl-D
+    g_term_state.current_termios.c_cc[VSTART] = 0x11;   // Ctrl-Q
+    g_term_state.current_termios.c_cc[VSTOP] = 0x13;    // Ctrl-S
+    g_term_state.current_termios.c_cc[VSUSP] = 0x1A;    // Ctrl-Z
+    g_term_state.current_termios.c_cc[VMIN] = 1;
+    g_term_state.current_termios.c_cc[VTIME] = 0;
+
+    // Default speed
+    g_term_state.current_termios.c_ispeed = B115200;
+    g_term_state.current_termios.c_ospeed = B115200;
+
+    // Copy to original
+    MemCpy(&g_term_state.orig_termios, &g_term_state.current_termios, sizeof(termios));
+
+    // Get actual terminal size from ZealOS
+    g_term_state.rows = 25;  // Default
+    g_term_state.cols = 80;  // Default
+
+    g_term_state.initialized = TRUE;
+}
+
+// Call init
+TermiosInit();

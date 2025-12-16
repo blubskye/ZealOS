@@ -1,0 +1,449 @@
+// DiscordJSON.ZC - JSON Builder and Parser for Discord
+// Part of ZealOS Discord implementation
+//
+// This file contains:
+// - JSON Builder (for creating JSON payloads)
+// - Legacy simple parser (deprecated, for backward compatibility)
+//
+// For new code, use JSONParser.ZC which provides proper parsing with
+// array and nested object support.
+
+// ============================================================================
+// JSON BUILDER
+// ============================================================================
+
+// Initialize JSON builder
+U0 JSONBuilderInit(CJSONBuilder *json, I64 initial_capacity)
+{
+	json->capacity = initial_capacity;
+	json->buffer = MAlloc(json->capacity);
+	json->length = 0;
+	json->depth = 0;
+	json->need_comma = FALSE;
+	json->buffer[0] = 0;
+}
+
+// Free JSON builder
+U0 JSONBuilderFree(CJSONBuilder *json)
+{
+	if (json->buffer) {
+		Free(json->buffer);
+		json->buffer = NULL;
+	}
+}
+
+// Ensure capacity
+U0 JSONBuilderEnsure(CJSONBuilder *json, I64 needed)
+{
+	if (json->length + needed >= json->capacity) {
+		I64 new_cap = json->capacity * 2;
+		while (new_cap < json->length + needed) {
+			new_cap *= 2;
+		}
+		U8 *new_buf = MAlloc(new_cap);
+		MemCpy(new_buf, json->buffer, json->length);
+		Free(json->buffer);
+		json->buffer = new_buf;
+		json->capacity = new_cap;
+	}
+}
+
+// Append raw string
+U0 JSONBuilderAppend(CJSONBuilder *json, U8 *str)
+{
+	I64 len = StrLen(str);
+	JSONBuilderEnsure(json, len + 1);
+	MemCpy(&json->buffer[json->length], str, len);
+	json->length += len;
+	json->buffer[json->length] = 0;
+}
+
+// Append character
+U0 JSONBuilderAppendChar(CJSONBuilder *json, U8 c)
+{
+	JSONBuilderEnsure(json, 2);
+	json->buffer[json->length++] = c;
+	json->buffer[json->length] = 0;
+}
+
+// Start object
+U0 JSONBeginObject(CJSONBuilder *json)
+{
+	if (json->need_comma) {
+		JSONBuilderAppendChar(json, ',');
+	}
+	JSONBuilderAppendChar(json, '{');
+	json->depth++;
+	json->need_comma = FALSE;
+}
+
+// End object
+U0 JSONEndObject(CJSONBuilder *json)
+{
+	JSONBuilderAppendChar(json, '}');
+	json->depth--;
+	json->need_comma = TRUE;
+}
+
+// Start array
+U0 JSONBeginArray(CJSONBuilder *json)
+{
+	if (json->need_comma) {
+		JSONBuilderAppendChar(json, ',');
+	}
+	JSONBuilderAppendChar(json, '[');
+	json->depth++;
+	json->need_comma = FALSE;
+}
+
+// End array
+U0 JSONEndArray(CJSONBuilder *json)
+{
+	JSONBuilderAppendChar(json, ']');
+	json->depth--;
+	json->need_comma = TRUE;
+}
+
+// Write key
+U0 JSONKey(CJSONBuilder *json, U8 *key)
+{
+	if (json->need_comma) {
+		JSONBuilderAppendChar(json, ',');
+	}
+	JSONBuilderAppendChar(json, '"');
+	JSONBuilderAppend(json, key);
+	JSONBuilderAppend(json, "\":");
+	json->need_comma = FALSE;
+}
+
+// Escape and write string value
+U0 JSONEscapeString(CJSONBuilder *json, U8 *str)
+{
+	JSONBuilderAppendChar(json, '"');
+
+	while (*str) {
+		U8 c = *str++;
+		switch (c) {
+			case '"':  JSONBuilderAppend(json, "\\\""); break;
+			case '\\': JSONBuilderAppend(json, "\\\\"); break;
+			case '\n': JSONBuilderAppend(json, "\\n");  break;
+			case '\r': JSONBuilderAppend(json, "\\r");  break;
+			case '\t': JSONBuilderAppend(json, "\\t");  break;
+			default:
+				if (c >= 32) {
+					JSONBuilderAppendChar(json, c);
+				}
+				break;
+		}
+	}
+
+	JSONBuilderAppendChar(json, '"');
+}
+
+// Write string value
+U0 JSONString(CJSONBuilder *json, U8 *value)
+{
+	if (json->need_comma) {
+		JSONBuilderAppendChar(json, ',');
+	}
+	JSONEscapeString(json, value);
+	json->need_comma = TRUE;
+}
+
+// Write key-value pair (string)
+U0 JSONKeyString(CJSONBuilder *json, U8 *key, U8 *value)
+{
+	JSONKey(json, key);
+	JSONEscapeString(json, value);
+	json->need_comma = TRUE;
+}
+
+// Write integer value
+U0 JSONInt(CJSONBuilder *json, I64 value)
+{
+	U8 buf[32];
+	if (json->need_comma) {
+		JSONBuilderAppendChar(json, ',');
+	}
+	StrPrint(buf, "%d", value);
+	JSONBuilderAppend(json, buf);
+	json->need_comma = TRUE;
+}
+
+// Write key-value pair (integer)
+U0 JSONKeyInt(CJSONBuilder *json, U8 *key, I64 value)
+{
+	JSONKey(json, key);
+	U8 buf[32];
+	StrPrint(buf, "%d", value);
+	JSONBuilderAppend(json, buf);
+	json->need_comma = TRUE;
+}
+
+// Write boolean value
+U0 JSONBool(CJSONBuilder *json, Bool value)
+{
+	if (json->need_comma) {
+		JSONBuilderAppendChar(json, ',');
+	}
+	JSONBuilderAppend(json, value ? "true" : "false");
+	json->need_comma = TRUE;
+}
+
+// Write key-value pair (boolean)
+U0 JSONKeyBool(CJSONBuilder *json, U8 *key, Bool value)
+{
+	JSONKey(json, key);
+	JSONBuilderAppend(json, value ? "true" : "false");
+	json->need_comma = TRUE;
+}
+
+// Write null value
+U0 JSONNull(CJSONBuilder *json)
+{
+	if (json->need_comma) {
+		JSONBuilderAppendChar(json, ',');
+	}
+	JSONBuilderAppend(json, "null");
+	json->need_comma = TRUE;
+}
+
+// Write key-value pair (null)
+U0 JSONKeyNull(CJSONBuilder *json, U8 *key)
+{
+	JSONKey(json, key);
+	JSONBuilderAppend(json, "null");
+	json->need_comma = TRUE;
+}
+
+// Write key with object value
+U0 JSONKeyObject(CJSONBuilder *json, U8 *key)
+{
+	JSONKey(json, key);
+	JSONBuilderAppendChar(json, '{');
+	json->depth++;
+	json->need_comma = FALSE;
+}
+
+// Write key with array value
+U0 JSONKeyArray(CJSONBuilder *json, U8 *key)
+{
+	JSONKey(json, key);
+	JSONBuilderAppendChar(json, '[');
+	json->depth++;
+	json->need_comma = FALSE;
+}
+
+// Get the built JSON string
+U8 *JSONBuilderGet(CJSONBuilder *json)
+{
+	return json->buffer;
+}
+
+// ============================================================================
+// SIMPLE JSON PARSER
+// ============================================================================
+
+// Skip whitespace
+U8 *JSONSkipWhitespace(U8 *p)
+{
+	while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r') p++;
+	return p;
+}
+
+// Find key in JSON object (returns pointer to value or NULL)
+U8 *JSONFindKey(U8 *json, U8 *key)
+{
+	U8 *p = json;
+	I64 key_len = StrLen(key);
+	I64 depth = 0;
+
+	while (*p) {
+		p = JSONSkipWhitespace(p);
+
+		if (*p == '{' || *p == '[') {
+			depth++;
+			p++;
+		} else if (*p == '}' || *p == ']') {
+			depth--;
+			p++;
+			if (depth <= 0) break;
+		} else if (*p == '"' && depth == 1) {
+			// Check if this is our key
+			p++;  // Skip opening quote
+			if (StrNCmp(p, key, key_len) == 0 && p[key_len] == '"') {
+				// Found the key
+				p += key_len + 1;  // Skip key and closing quote
+				p = JSONSkipWhitespace(p);
+				if (*p == ':') {
+					p++;
+					return JSONSkipWhitespace(p);
+				}
+			}
+			// Skip to end of string
+			while (*p && *p != '"') {
+				if (*p == '\\' && p[1]) p++;
+				p++;
+			}
+			if (*p == '"') p++;
+		} else if (*p == '"') {
+			// Skip string value
+			p++;
+			while (*p && *p != '"') {
+				if (*p == '\\' && p[1]) p++;
+				p++;
+			}
+			if (*p == '"') p++;
+		} else {
+			p++;
+		}
+	}
+
+	return NULL;
+}
+
+// Extract string value from JSON (returns new allocated string or NULL)
+U8 *JSONGetString(U8 *json, U8 *key)
+{
+	U8 *p = JSONFindKey(json, key);
+	if (!p || *p != '"') return NULL;
+
+	p++;  // Skip opening quote
+
+	// Find end of string
+	U8 *start = p;
+	while (*p && *p != '"') {
+		if (*p == '\\' && p[1]) p++;
+		p++;
+	}
+
+	I64 len = p - start;
+	U8 *result = MAlloc(len + 1);
+
+	// Copy with unescape
+	I64 i = 0, j = 0;
+	while (i < len) {
+		if (start[i] == '\\' && i + 1 < len) {
+			i++;
+			switch (start[i]) {
+				case 'n':  result[j++] = '\n'; break;
+				case 'r':  result[j++] = '\r'; break;
+				case 't':  result[j++] = '\t'; break;
+				case '"':  result[j++] = '"';  break;
+				case '\\': result[j++] = '\\'; break;
+				default:   result[j++] = start[i]; break;
+			}
+		} else {
+			result[j++] = start[i];
+		}
+		i++;
+	}
+	result[j] = 0;
+
+	return result;
+}
+
+// Extract integer value from JSON
+I64 JSONGetInt(U8 *json, U8 *key)
+{
+	U8 *p = JSONFindKey(json, key);
+	if (!p) return 0;
+
+	return Str2I64(p);
+}
+
+// Extract boolean value from JSON
+Bool JSONGetBool(U8 *json, U8 *key)
+{
+	U8 *p = JSONFindKey(json, key);
+	if (!p) return FALSE;
+
+	return (StrNCmp(p, "true", 4) == 0);
+}
+
+// Get snowflake ID (as string, then parse)
+CDiscordSnowflake JSONGetSnowflake(U8 *json, U8 *key)
+{
+	U8 *str = JSONGetString(json, key);
+	if (!str) return 0;
+
+	CDiscordSnowflake id = 0;
+	U8 *p = str;
+	while (*p >= '0' && *p <= '9') {
+		id = id * 10 + (*p - '0');
+		p++;
+	}
+
+	Free(str);
+	return id;
+}
+
+// Find nested object (returns pointer to { or NULL)
+U8 *JSONFindObject(U8 *json, U8 *key)
+{
+	U8 *p = JSONFindKey(json, key);
+	if (!p || *p != '{') return NULL;
+	return p;
+}
+
+// ============================================================================
+// ADAPTER FUNCTIONS (Bridge old code to new parser)
+// ============================================================================
+// These functions use the new JSONParser.ZC for actual parsing
+// but maintain the old API for backward compatibility
+
+// Get string using new parser
+U8 *JSONGetStringNew(U8 *json, U8 *key)
+{
+	CJSONValue *root = JSONParse(json);
+	if (!root) return NULL;
+
+	CJSONValue *val = JSONObjectGet(root, key);
+	U8 *result = NULL;
+
+	if (val && val->type == JSON_STRING) {
+		result = StrNew(val->string_val);
+	}
+
+	JSONValueFree(root);
+	return result;
+}
+
+// Get integer using new parser
+I64 JSONGetIntNew(U8 *json, U8 *key)
+{
+	CJSONValue *root = JSONParse(json);
+	if (!root) return 0;
+
+	CJSONValue *val = JSONObjectGet(root, key);
+	I64 result = JSONAsInt(val);
+
+	JSONValueFree(root);
+	return result;
+}
+
+// Get boolean using new parser
+Bool JSONGetBoolNew(U8 *json, U8 *key)
+{
+	CJSONValue *root = JSONParse(json);
+	if (!root) return FALSE;
+
+	CJSONValue *val = JSONObjectGet(root, key);
+	Bool result = JSONAsBool(val);
+
+	JSONValueFree(root);
+	return result;
+}
+
+// Get snowflake using new parser
+CDiscordSnowflake JSONGetSnowflakeNew(U8 *json, U8 *key)
+{
+	CJSONValue *root = JSONParse(json);
+	if (!root) return 0;
+
+	CJSONValue *val = JSONObjectGet(root, key);
+	CDiscordSnowflake result = JSONAsSnowflake(val);
+
+	JSONValueFree(root);
+	return result;
+}

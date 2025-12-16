@@ -1,0 +1,494 @@
+// Futex.ZC - Fast Userspace Mutex Implementation for ZealOS
+// Part of the Go runtime support
+//
+// Futex is a Linux kernel feature for efficient thread synchronization.
+// This implements futex semantics using ZealOS task primitives.
+
+#include "Go.HH"
+
+// ============================================================================
+// FUTEX WAIT QUEUE
+// ============================================================================
+
+#define FUTEX_HASH_SIZE     256
+#define FUTEX_MAX_WAITERS   1024
+
+// Hash table of wait queues
+class CFutexBucket {
+    CFutexWaiter    *head;
+    CFutexWaiter    *tail;
+    I64             count;
+    I64             lock;       // Spinlock
+};
+
+CFutexBucket futex_buckets[FUTEX_HASH_SIZE];
+CFutexWaiter futex_waiter_pool[FUTEX_MAX_WAITERS];
+I64 futex_waiter_free_head = 0;
+Bool futex_initialized = FALSE;
+
+// ============================================================================
+// INITIALIZATION
+// ============================================================================
+
+U0 FutexInit()
+{
+    if (futex_initialized)
+        return;
+
+    MemSet(futex_buckets, 0, sizeof(futex_buckets));
+    MemSet(futex_waiter_pool, 0, sizeof(futex_waiter_pool));
+
+    // Initialize free list
+    for (I64 i = 0; i < FUTEX_MAX_WAITERS - 1; i++) {
+        futex_waiter_pool[i].next = &futex_waiter_pool[i + 1];
+    }
+    futex_waiter_pool[FUTEX_MAX_WAITERS - 1].next = NULL;
+    futex_waiter_free_head = 0;
+
+    futex_initialized = TRUE;
+}
+
+// Hash function for futex address
+I64 FutexHash(U32 *addr)
+{
+    U64 h = addr(U64);
+    h ^= h >> 17;
+    h *= 0xed5ad4bb;
+    h ^= h >> 11;
+    h *= 0xac4c1b51;
+    h ^= h >> 15;
+    return h & (FUTEX_HASH_SIZE - 1);
+}
+
+// Allocate waiter from pool
+CFutexWaiter *FutexWaiterAlloc()
+{
+    if (futex_waiter_free_head >= FUTEX_MAX_WAITERS)
+        return NULL;
+
+    CFutexWaiter *w = &futex_waiter_pool[futex_waiter_free_head];
+    if (w->next)
+        futex_waiter_free_head = (w->next - futex_waiter_pool)(I64);
+    else
+        futex_waiter_free_head = FUTEX_MAX_WAITERS;
+
+    return w;
+}
+
+// Return waiter to pool
+U0 FutexWaiterFree(CFutexWaiter *w)
+{
+    w->task = NULL;
+    w->addr = NULL;
+    w->next = (futex_waiter_free_head < FUTEX_MAX_WAITERS) ?
+              &futex_waiter_pool[futex_waiter_free_head] : NULL;
+    futex_waiter_free_head = (w - futex_waiter_pool)(I64);
+}
+
+// ============================================================================
+// SPINLOCK (for bucket protection)
+// ============================================================================
+
+U0 FutexBucketLock(CFutexBucket *b)
+{
+    while (LBts(&b->lock, 0))
+        Yield();
+}
+
+U0 FutexBucketUnlock(CFutexBucket *b)
+{
+    LBtr(&b->lock, 0);
+}
+
+// ============================================================================
+// FUTEX WAIT
+// ============================================================================
+
+// Wait on futex
+// Returns: 0 on success (woken), -ETIMEDOUT on timeout, -EAGAIN if value changed
+I64 futex_wait(U32 *addr, U32 val, I64 timeout_ns)
+{
+    FutexInit();
+
+    // Check if value has changed
+    if (*addr != val)
+        return -EAGAIN;
+
+    I64 hash = FutexHash(addr);
+    CFutexBucket *bucket = &futex_buckets[hash];
+
+    // Allocate waiter
+    CFutexWaiter *waiter = FutexWaiterAlloc();
+    if (!waiter)
+        return -ENOMEM;
+
+    waiter->task = Fs;
+    waiter->addr = addr;
+    waiter->next = NULL;
+
+    // Add to wait queue
+    FutexBucketLock(bucket);
+
+    // Recheck value under lock
+    if (*addr != val) {
+        FutexBucketUnlock(bucket);
+        FutexWaiterFree(waiter);
+        return -EAGAIN;
+    }
+
+    // Add to tail
+    if (bucket->tail) {
+        bucket->tail->next = waiter;
+        bucket->tail = waiter;
+    } else {
+        bucket->head = bucket->tail = waiter;
+    }
+    bucket->count++;
+
+    FutexBucketUnlock(bucket);
+
+    // Sleep until woken or timeout
+    if (timeout_ns > 0) {
+        // Convert to ticks (assuming ~1ms per tick)
+        I64 timeout_ticks = timeout_ns / 1000000;
+        if (timeout_ticks < 1)
+            timeout_ticks = 1;
+
+        I64 start = GetTicks();
+        while (waiter->task != NULL) {
+            if (GetTicks() - start > timeout_ticks) {
+                // Timeout - remove from queue
+                FutexBucketLock(bucket);
+
+                CFutexWaiter **pp = &bucket->head;
+                while (*pp) {
+                    if (*pp == waiter) {
+                        *pp = waiter->next;
+                        if (bucket->tail == waiter)
+                            bucket->tail = NULL;
+                        bucket->count--;
+                        break;
+                    }
+                    pp = &(*pp)->next;
+                }
+
+                FutexBucketUnlock(bucket);
+                FutexWaiterFree(waiter);
+                return -ETIMEDOUT;
+            }
+            Sleep(1);
+        }
+    } else if (timeout_ns == 0) {
+        // No timeout - wait forever
+        while (waiter->task != NULL)
+            Sleep(1);
+    } else {
+        // Negative timeout - return immediately
+        FutexBucketLock(bucket);
+        CFutexWaiter **pp = &bucket->head;
+        while (*pp) {
+            if (*pp == waiter) {
+                *pp = waiter->next;
+                if (bucket->tail == waiter)
+                    bucket->tail = NULL;
+                bucket->count--;
+                break;
+            }
+            pp = &(*pp)->next;
+        }
+        FutexBucketUnlock(bucket);
+        FutexWaiterFree(waiter);
+        return -EAGAIN;
+    }
+
+    FutexWaiterFree(waiter);
+    return 0;
+}
+
+// ============================================================================
+// FUTEX WAKE
+// ============================================================================
+
+// Wake waiters on futex
+// Returns: number of waiters woken
+I64 futex_wake(U32 *addr, I64 count)
+{
+    FutexInit();
+
+    if (count <= 0)
+        return 0;
+
+    I64 hash = FutexHash(addr);
+    CFutexBucket *bucket = &futex_buckets[hash];
+
+    FutexBucketLock(bucket);
+
+    I64 woken = 0;
+    CFutexWaiter **pp = &bucket->head;
+
+    while (*pp && woken < count) {
+        CFutexWaiter *w = *pp;
+
+        if (w->addr == addr) {
+            // Remove from queue
+            *pp = w->next;
+            if (bucket->tail == w) {
+                bucket->tail = NULL;
+                // Find new tail
+                CFutexWaiter *t = bucket->head;
+                while (t && t->next)
+                    t = t->next;
+                bucket->tail = t;
+            }
+            bucket->count--;
+
+            // Wake the task
+            if (w->task) {
+                // Signal wake by clearing task pointer
+                CTask *task = w->task;
+                w->task = NULL;
+                // Actually wake the task if it's sleeping
+                // (The task polls w->task in its sleep loop)
+            }
+            woken++;
+        } else {
+            pp = &(*pp)->next;
+        }
+    }
+
+    FutexBucketUnlock(bucket);
+    return woken;
+}
+
+// ============================================================================
+// FUTEX SYSCALL INTERFACE
+// ============================================================================
+
+// Main futex syscall
+I64 futex(U32 *uaddr, I64 op, U32 val, void *timeout, U32 *uaddr2, U32 val3)
+{
+    I64 cmd = op & ~FUTEX_PRIVATE_FLAG;
+
+    switch (cmd) {
+        case FUTEX_WAIT: {
+            I64 timeout_ns = -1;  // Wait forever by default
+            if (timeout) {
+                // timeout is pointer to timespec
+                struct timespec *ts = timeout;
+                timeout_ns = ts->tv_sec * 1000000000LL + ts->tv_nsec;
+            }
+            return futex_wait(uaddr, val, timeout_ns);
+        }
+
+        case FUTEX_WAKE:
+            return futex_wake(uaddr, val);
+
+        default:
+            posix_errno = ENOSYS;
+            return -1;
+    }
+}
+
+// ============================================================================
+// GO NOTE IMPLEMENTATION (Uses futex)
+// ============================================================================
+
+U0 GoNoteInit(CGoNote *n)
+{
+    n->key = GO_NOTE_CLEARED;
+}
+
+U0 GoNoteClear(CGoNote *n)
+{
+    n->key = GO_NOTE_CLEARED;
+}
+
+U0 GoNoteWakeup(CGoNote *n)
+{
+    U32 old = n->key;
+    n->key = GO_NOTE_SIGNALED;
+
+    // Wake one waiter
+    if (old == GO_NOTE_CLEARED)
+        futex_wake(&n->key, 1);
+}
+
+Bool GoNoteSleep(CGoNote *n, I64 timeout_ns)
+{
+    // Fast path - already signaled
+    if (n->key == GO_NOTE_SIGNALED)
+        return TRUE;
+
+    // Wait for signal
+    I64 ret = futex_wait(&n->key, GO_NOTE_CLEARED, timeout_ns);
+
+    return (n->key == GO_NOTE_SIGNALED);
+}
+
+// ============================================================================
+// SEMAPHORE IMPLEMENTATION (For Go runtime)
+// ============================================================================
+
+class CGoSema {
+    U32     value;
+    U32     waiters;
+};
+
+U0 GoSemaInit(CGoSema *s, U32 value)
+{
+    s->value = value;
+    s->waiters = 0;
+}
+
+// Acquire semaphore (decrement)
+U0 GoSemaAcquire(CGoSema *s)
+{
+    while (TRUE) {
+        U32 v = s->value;
+        if (v > 0) {
+            if (LXChgU32(&s->value, v - 1) == v)
+                return;
+        } else {
+            // Need to wait
+            s->waiters++;
+            futex_wait(&s->value, 0, -1);
+            s->waiters--;
+        }
+    }
+}
+
+// Release semaphore (increment)
+U0 GoSemaRelease(CGoSema *s)
+{
+    s->value++;
+    if (s->waiters > 0)
+        futex_wake(&s->value, 1);
+}
+
+// Try to acquire (non-blocking)
+Bool GoSemaTryAcquire(CGoSema *s)
+{
+    U32 v = s->value;
+    if (v > 0 && LXChgU32(&s->value, v - 1) == v)
+        return TRUE;
+    return FALSE;
+}
+
+// ============================================================================
+// MUTEX IMPLEMENTATION (For Go runtime)
+// ============================================================================
+
+#define GO_MUTEX_UNLOCKED   0
+#define GO_MUTEX_LOCKED     1
+#define GO_MUTEX_SLEEPING   2
+
+class CGoMutex {
+    U32     state;
+};
+
+U0 GoMutexInit(CGoMutex *m)
+{
+    m->state = GO_MUTEX_UNLOCKED;
+}
+
+U0 GoMutexLock(CGoMutex *m)
+{
+    // Fast path - try to acquire
+    if (LXChgU32(&m->state, GO_MUTEX_LOCKED) == GO_MUTEX_UNLOCKED)
+        return;
+
+    // Slow path - need to wait
+    while (TRUE) {
+        U32 old = LXChgU32(&m->state, GO_MUTEX_SLEEPING);
+        if (old == GO_MUTEX_UNLOCKED)
+            return;
+
+        futex_wait(&m->state, GO_MUTEX_SLEEPING, -1);
+    }
+}
+
+U0 GoMutexUnlock(CGoMutex *m)
+{
+    U32 old = LXChgU32(&m->state, GO_MUTEX_UNLOCKED);
+
+    // If there were waiters, wake one
+    if (old == GO_MUTEX_SLEEPING)
+        futex_wake(&m->state, 1);
+}
+
+Bool GoMutexTryLock(CGoMutex *m)
+{
+    return LXChgU32(&m->state, GO_MUTEX_LOCKED) == GO_MUTEX_UNLOCKED;
+}
+
+// ============================================================================
+// READ-WRITE MUTEX (For Go runtime)
+// ============================================================================
+
+class CGoRWMutex {
+    CGoMutex    w_mutex;        // Writer mutex
+    CGoSema     w_sema;         // Writer semaphore
+    CGoSema     r_sema;         // Reader semaphore
+    I32         reader_count;   // Active readers
+    I32         reader_wait;    // Readers waiting for writer
+};
+
+#define GO_RWMUTEX_MAX_READERS  (1 << 30)
+
+U0 GoRWMutexInit(CGoRWMutex *rw)
+{
+    GoMutexInit(&rw->w_mutex);
+    GoSemaInit(&rw->w_sema, 0);
+    GoSemaInit(&rw->r_sema, 0);
+    rw->reader_count = 0;
+    rw->reader_wait = 0;
+}
+
+U0 GoRWMutexRLock(CGoRWMutex *rw)
+{
+    I32 old = LAddI32(&rw->reader_count, 1);
+    if (old < 0) {
+        // Writer is active, wait
+        GoSemaAcquire(&rw->r_sema);
+    }
+}
+
+U0 GoRWMutexRUnlock(CGoRWMutex *rw)
+{
+    I32 old = LAddI32(&rw->reader_count, -1);
+    if (old < 0) {
+        // Writer waiting
+        if (LAddI32(&rw->reader_wait, -1) == 1) {
+            GoSemaRelease(&rw->w_sema);
+        }
+    }
+}
+
+U0 GoRWMutexLock(CGoRWMutex *rw)
+{
+    GoMutexLock(&rw->w_mutex);
+
+    I32 r = LAddI32(&rw->reader_count, -GO_RWMUTEX_MAX_READERS);
+    r += GO_RWMUTEX_MAX_READERS;
+
+    if (r != 0) {
+        rw->reader_wait = r;
+        GoSemaAcquire(&rw->w_sema);
+    }
+}
+
+U0 GoRWMutexUnlock(CGoRWMutex *rw)
+{
+    I32 r = LAddI32(&rw->reader_count, GO_RWMUTEX_MAX_READERS);
+
+    for (I64 i = 0; i < r; i++)
+        GoSemaRelease(&rw->r_sema);
+
+    GoMutexUnlock(&rw->w_mutex);
+}
+
+// ============================================================================
+// INITIALIZATION
+// ============================================================================
+
+"Futex loaded - Fast userspace mutex for ZealOS\n";

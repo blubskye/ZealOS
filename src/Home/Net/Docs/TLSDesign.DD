@@ -1,0 +1,738 @@
+$BG,0$$FG,15$ZealOS TLS Implementation Design Document$FG,0$$BG,15$
+
+Author: Claude Code Assistant
+Date: December 2025
+Status: Draft
+
+$BG,0$$FG,15$1. OVERVIEW$FG,0$$BG,15$
+
+This document describes the design for implementing TLS 1.3 (with TLS 1.2 fallback)
+in ZealC for the ZealOS networking stack. The primary goal is to enable HTTPS
+connections for accessing Discord's API.
+
+$BG,0$$FG,14$1.1 Goals$FG,0$$BG,15$
+
+- Implement TLS 1.3 client (RFC 8446)
+- Support TLS 1.2 fallback for compatibility
+- Minimal footprint suitable for ZealOS
+- Enable HTTPS and WSS (WebSocket Secure) connections
+- Self-contained implementation (no external dependencies)
+
+$BG,0$$FG,14$1.2 Non-Goals$FG,0$$BG,15$
+
+- TLS server implementation
+- Client certificate authentication
+- 0-RTT resumption (security trade-off)
+- All cipher suites (only essential ones)
+
+$BG,0$$FG,15$2. ARCHITECTURE$FG,0$$BG,15$
+
+$BG,0$$FG,14$2.1 File Organization$FG,0$$BG,15$
+
+C:/Home/Net/
++-- Crypto/
+|   +-- Crypto.HH          // Common crypto definitions
+|   +-- SHA256.ZC          // SHA-256 hash function
+|   +-- SHA384.ZC          // SHA-384 hash function (uses SHA-512 internally)
+|   +-- SHA512.ZC          // SHA-512 hash function
+|   +-- HMAC.ZC            // HMAC construction
+|   +-- HKDF.ZC            // HKDF key derivation (RFC 5869)
+|   +-- AES.ZC             // AES block cipher (128/256-bit keys)
+|   +-- GCM.ZC             // Galois/Counter Mode
+|   +-- X25519.ZC          // Curve25519 ECDH
+|   +-- BigInt.ZC          // Big integer arithmetic (for X25519)
+|   +-- Random.ZC          // Cryptographic random number generator
+|   +-- MakeCrypto.ZC      // Crypto module loader
+|
++-- TLS/
+|   +-- TLS.HH             // TLS definitions, constants, structures
+|   +-- TLSRecord.ZC       // TLS record layer
+|   +-- TLSHandshake.ZC    // TLS handshake protocol
+|   +-- TLSCrypto.ZC       // TLS-specific crypto operations
+|   +-- TLSSocket.ZC       // TLS socket wrapper (CTLSSocket)
+|   +-- X509.ZC            // X.509 certificate parsing (minimal)
+|   +-- MakeTLS.ZC         // TLS module loader
+|
++-- Protocols/
+|   +-- HTTP.ZC            // HTTP/1.1 client
+|   +-- WebSocket.ZC       // WebSocket client (RFC 6455)
+
+$BG,0$$FG,14$2.2 Module Dependencies$FG,0$$BG,15$
+
+                    +-------------+
+                    |  Discord    |
+                    |  API Client |
+                    +------+------+
+                           |
+              +------------+------------+
+              |                         |
+        +-----+-----+             +-----+-----+
+        |   HTTP    |             | WebSocket |
+        +-----+-----+             +-----+-----+
+              |                         |
+              +------------+------------+
+                           |
+                    +------+------+
+                    | TLSSocket   |
+                    +------+------+
+                           |
+    +----------+-----------+-----------+----------+
+    |          |           |           |          |
++---+---+ +----+----+ +----+----+ +----+----+ +---+---+
+|Record | |Handshake| |TLSCrypto| |  X509   | | Keys  |
++---+---+ +----+----+ +----+----+ +----+----+ +---+---+
+    |          |           |           |          |
+    +----------+-----------+-----------+----------+
+                           |
+    +----------+-----------+-----------+----------+
+    |          |           |           |          |
++---+---+ +----+----+ +----+----+ +----+----+ +---+---+
+| SHA2  | |AES-GCM  | | X25519  | |  HMAC   | | HKDF  |
++-------+ +---------+ +---------+ +---------+ +-------+
+                           |
+                    +------+------+
+                    | TCPSocket   |
+                    +-------------+
+
+$BG,0$$FG,15$3. CRYPTOGRAPHIC PRIMITIVES$FG,0$$BG,15$
+
+$BG,0$$FG,14$3.1 SHA-256 (C:/Home/Net/Crypto/SHA256.ZC)$FG,0$$BG,15$
+
+// SHA-256 produces a 256-bit (32-byte) hash
+// Used for: HMAC, HKDF, TLS transcript hash, certificate fingerprints
+
+#define SHA256_BLOCK_SIZE   64
+#define SHA256_DIGEST_SIZE  32
+
+class CSHA256Context
+{
+    U32  state[8];      // Hash state (A-H)
+    U64  count;         // Number of bits processed
+    U8   buffer[64];    // Input buffer
+};
+
+// Initialize SHA-256 context
+U0 SHA256Init(CSHA256Context *ctx);
+
+// Update hash with data
+U0 SHA256Update(CSHA256Context *ctx, U8 *data, I64 length);
+
+// Finalize and output digest
+U0 SHA256Final(CSHA256Context *ctx, U8 *digest);
+
+// One-shot hash function
+U0 SHA256(U8 *data, I64 length, U8 *digest);
+
+$BG,0$$FG,14$3.2 SHA-384/SHA-512 (C:/Home/Net/Crypto/SHA512.ZC)$FG,0$$BG,15$
+
+// SHA-384 is SHA-512 with different IVs and truncated output
+// Used for: TLS_AES_256_GCM_SHA384 cipher suite
+
+#define SHA384_BLOCK_SIZE   128
+#define SHA384_DIGEST_SIZE   48
+#define SHA512_BLOCK_SIZE   128
+#define SHA512_DIGEST_SIZE   64
+
+class CSHA512Context
+{
+    U64  state[8];      // Hash state
+    U64  count[2];      // Number of bits processed (128-bit)
+    U8   buffer[128];   // Input buffer
+};
+
+U0 SHA384Init(CSHA512Context *ctx);
+U0 SHA384Update(CSHA512Context *ctx, U8 *data, I64 length);
+U0 SHA384Final(CSHA512Context *ctx, U8 *digest);
+U0 SHA384(U8 *data, I64 length, U8 *digest);
+
+U0 SHA512Init(CSHA512Context *ctx);
+U0 SHA512Update(CSHA512Context *ctx, U8 *data, I64 length);
+U0 SHA512Final(CSHA512Context *ctx, U8 *digest);
+U0 SHA512(U8 *data, I64 length, U8 *digest);
+
+$BG,0$$FG,14$3.3 HMAC (C:/Home/Net/Crypto/HMAC.ZC)$FG,0$$BG,15$
+
+// HMAC: Keyed hash for message authentication
+// HMAC(K, m) = H((K' XOR opad) || H((K' XOR ipad) || m))
+
+#define HMAC_SHA256_SIZE  32
+#define HMAC_SHA384_SIZE  48
+
+class CHMACContext
+{
+    CSHA256Context  sha256;     // or CSHA512Context for SHA-384
+    U8              key[128];   // Padded key
+    I64             hash_type;  // HASH_SHA256 or HASH_SHA384
+};
+
+U0 HMACInit(CHMACContext *ctx, U8 *key, I64 key_len, I64 hash_type);
+U0 HMACUpdate(CHMACContext *ctx, U8 *data, I64 length);
+U0 HMACFinal(CHMACContext *ctx, U8 *mac);
+U0 HMAC(U8 *key, I64 key_len, U8 *data, I64 data_len, U8 *mac, I64 hash_type);
+
+$BG,0$$FG,14$3.4 HKDF (C:/Home/Net/Crypto/HKDF.ZC)$FG,0$$BG,15$
+
+// HKDF: HMAC-based Key Derivation Function (RFC 5869)
+// Used for TLS 1.3 key schedule
+
+// Extract: PRK = HMAC(salt, IKM)
+U0 HKDFExtract(U8 *salt, I64 salt_len, U8 *ikm, I64 ikm_len, U8 *prk, I64 hash_type);
+
+// Expand: OKM = HKDF-Expand(PRK, info, L)
+U0 HKDFExpand(U8 *prk, I64 prk_len, U8 *info, I64 info_len, U8 *okm, I64 okm_len, I64 hash_type);
+
+// Combined Extract-and-Expand
+U0 HKDF(U8 *salt, I64 salt_len, U8 *ikm, I64 ikm_len,
+        U8 *info, I64 info_len, U8 *okm, I64 okm_len, I64 hash_type);
+
+$BG,0$$FG,14$3.5 AES (C:/Home/Net/Crypto/AES.ZC)$FG,0$$BG,15$
+
+// AES: Advanced Encryption Standard (FIPS 197)
+// Block size: 128 bits (16 bytes)
+// Key sizes: 128 or 256 bits
+
+#define AES_BLOCK_SIZE   16
+#define AES_128_ROUNDS   10
+#define AES_256_ROUNDS   14
+
+class CAESContext
+{
+    U32  round_keys[60];    // Expanded key schedule (max for AES-256)
+    I64  rounds;            // 10 for AES-128, 14 for AES-256
+};
+
+U0 AESKeyExpand(CAESContext *ctx, U8 *key, I64 key_bits);
+U0 AESEncryptBlock(CAESContext *ctx, U8 *plaintext, U8 *ciphertext);
+U0 AESDecryptBlock(CAESContext *ctx, U8 *ciphertext, U8 *plaintext);
+
+$BG,0$$FG,14$3.6 GCM (C:/Home/Net/Crypto/GCM.ZC)$FG,0$$BG,15$
+
+// GCM: Galois/Counter Mode (NIST SP 800-38D)
+// Provides authenticated encryption with associated data (AEAD)
+
+#define GCM_NONCE_SIZE   12
+#define GCM_TAG_SIZE     16
+
+class CGCMContext
+{
+    CAESContext  aes;           // AES cipher context
+    U8           H[16];         // Hash subkey
+    U8           nonce[12];     // Current nonce
+    U64          counter;       // Block counter
+};
+
+// Initialize GCM with key
+U0 GCMInit(CGCMContext *ctx, U8 *key, I64 key_bits);
+
+// Set nonce for new message
+U0 GCMSetNonce(CGCMContext *ctx, U8 *nonce);
+
+// Encrypt and authenticate
+I64 GCMEncrypt(CGCMContext *ctx,
+               U8 *plaintext, I64 plaintext_len,
+               U8 *aad, I64 aad_len,
+               U8 *ciphertext,
+               U8 *tag);
+
+// Decrypt and verify
+I64 GCMDecrypt(CGCMContext *ctx,
+               U8 *ciphertext, I64 ciphertext_len,
+               U8 *aad, I64 aad_len,
+               U8 *tag,
+               U8 *plaintext);  // Returns -1 if tag verification fails
+
+$BG,0$$FG,14$3.7 X25519 (C:/Home/Net/Crypto/X25519.ZC)$FG,0$$BG,15$
+
+// X25519: Elliptic Curve Diffie-Hellman using Curve25519
+// Key size: 256 bits (32 bytes)
+
+#define X25519_KEY_SIZE  32
+
+// Generate a random private key
+U0 X25519GeneratePrivate(U8 *private_key);
+
+// Compute public key from private key
+// public_key = private_key * G (base point)
+U0 X25519PublicFromPrivate(U8 *private_key, U8 *public_key);
+
+// Compute shared secret
+// shared = private_key * peer_public_key
+U0 X25519SharedSecret(U8 *private_key, U8 *peer_public, U8 *shared);
+
+$BG,0$$FG,14$3.8 Random Number Generator (C:/Home/Net/Crypto/Random.ZC)$FG,0$$BG,15$
+
+// Cryptographic random number generation
+// Uses ZealOS timer/interrupt entropy + hash-based DRBG
+
+class CRandomContext
+{
+    U8   pool[64];      // Entropy pool
+    U64  counter;       // Reseed counter
+};
+
+U0 RandomInit();
+U0 RandomSeed(U8 *entropy, I64 length);
+U0 RandomBytes(U8 *buffer, I64 length);
+U64 RandomU64();
+
+$BG,0$$FG,15$4. TLS PROTOCOL$FG,0$$BG,15$
+
+$BG,0$$FG,14$4.1 Constants (C:/Home/Net/TLS/TLS.HH)$FG,0$$BG,15$
+
+// TLS Versions
+#define TLS_VERSION_1_2     0x0303
+#define TLS_VERSION_1_3     0x0304
+
+// Content Types
+#define TLS_CONTENT_CHANGE_CIPHER   20
+#define TLS_CONTENT_ALERT           21
+#define TLS_CONTENT_HANDSHAKE       22
+#define TLS_CONTENT_APPLICATION     23
+
+// Handshake Types
+#define TLS_HS_CLIENT_HELLO          1
+#define TLS_HS_SERVER_HELLO          2
+#define TLS_HS_NEW_SESSION_TICKET    4
+#define TLS_HS_ENCRYPTED_EXTENSIONS  8
+#define TLS_HS_CERTIFICATE          11
+#define TLS_HS_CERTIFICATE_VERIFY   15
+#define TLS_HS_FINISHED             20
+
+// Alert Levels
+#define TLS_ALERT_WARNING   1
+#define TLS_ALERT_FATAL     2
+
+// Alert Descriptions
+#define TLS_ALERT_CLOSE_NOTIFY               0
+#define TLS_ALERT_UNEXPECTED_MESSAGE        10
+#define TLS_ALERT_BAD_RECORD_MAC            20
+#define TLS_ALERT_HANDSHAKE_FAILURE         40
+#define TLS_ALERT_CERTIFICATE_UNKNOWN       46
+#define TLS_ALERT_DECODE_ERROR              50
+#define TLS_ALERT_DECRYPT_ERROR             51
+#define TLS_ALERT_PROTOCOL_VERSION          70
+
+// Cipher Suites (TLS 1.3)
+#define TLS_AES_128_GCM_SHA256      0x1301
+#define TLS_AES_256_GCM_SHA384      0x1302
+#define TLS_CHACHA20_POLY1305_SHA256 0x1303
+
+// Named Groups (for key exchange)
+#define TLS_GROUP_X25519            0x001D
+#define TLS_GROUP_SECP256R1         0x0017
+
+// Signature Algorithms
+#define TLS_SIG_RSA_PSS_SHA256      0x0804
+#define TLS_SIG_RSA_PSS_SHA384      0x0805
+#define TLS_SIG_ECDSA_SECP256R1_SHA256 0x0403
+
+// Extensions
+#define TLS_EXT_SERVER_NAME         0
+#define TLS_EXT_SUPPORTED_GROUPS   10
+#define TLS_EXT_SIGNATURE_ALGORITHMS 13
+#define TLS_EXT_SUPPORTED_VERSIONS  43
+#define TLS_EXT_KEY_SHARE           51
+
+// Maximum sizes
+#define TLS_MAX_RECORD_SIZE     16384
+#define TLS_MAX_HANDSHAKE_SIZE  65536
+
+$BG,0$$FG,14$4.2 TLS Structures$FG,0$$BG,15$
+
+// TLS Record Header (5 bytes)
+class CTLSRecordHeader
+{
+    U8   content_type;
+    U16  version;           // Big-endian
+    U16  length;            // Big-endian, max 16384
+};
+
+// TLS Connection State
+class CTLSState
+{
+    // Connection info
+    U8              state;              // TLS_STATE_* enum
+    U16             version;            // Negotiated TLS version
+    U16             cipher_suite;       // Negotiated cipher suite
+
+    // Key material
+    U8              client_write_key[32];
+    U8              server_write_key[32];
+    U8              client_write_iv[12];
+    U8              server_write_iv[12];
+
+    // Sequence numbers (for nonce construction)
+    U64             client_seq;
+    U64             server_seq;
+
+    // Crypto contexts
+    CGCMContext     client_gcm;
+    CGCMContext     server_gcm;
+
+    // Handshake transcript (for Finished verification)
+    CSHA256Context  transcript_sha256;
+    CSHA512Context  transcript_sha384;
+
+    // Handshake secrets
+    U8              handshake_secret[48];
+    U8              master_secret[48];
+    U8              client_handshake_traffic_secret[48];
+    U8              server_handshake_traffic_secret[48];
+    U8              client_application_traffic_secret[48];
+    U8              server_application_traffic_secret[48];
+
+    // X25519 key pair for key exchange
+    U8              ecdh_private[32];
+    U8              ecdh_public[32];
+
+    // Receive buffer for partial records
+    U8             *recv_buffer;
+    I64             recv_buffer_size;
+    I64             recv_buffer_len;
+
+    // Server name (for SNI)
+    U8             *server_name;
+};
+
+// TLS State Machine
+#define TLS_STATE_INIT              0
+#define TLS_STATE_CLIENT_HELLO_SENT 1
+#define TLS_STATE_SERVER_HELLO_RECV 2
+#define TLS_STATE_HANDSHAKE_KEYS    3
+#define TLS_STATE_ENCRYPTED_EXTS    4
+#define TLS_STATE_CERTIFICATE       5
+#define TLS_STATE_CERT_VERIFY       6
+#define TLS_STATE_FINISHED_RECV     7
+#define TLS_STATE_CONNECTED         8
+#define TLS_STATE_CLOSING           9
+#define TLS_STATE_CLOSED           10
+#define TLS_STATE_ERROR            11
+
+$BG,0$$FG,14$4.3 TLS Socket (C:/Home/Net/TLS/TLSSocket.ZC)$FG,0$$BG,15$
+
+// TLS Socket wraps CTCPSocket with TLS encryption
+
+class CTLSSocket
+{
+    CTCPSocket     *tcp_socket;     // Underlying TCP connection
+    CTLSState       tls_state;      // TLS protocol state
+    I64             timeout;        // Socket timeout (ms)
+};
+
+// Create new TLS socket
+CTLSSocket *TLSSocket(U16 domain=AF_INET);
+
+// Connect with TLS handshake
+// hostname is used for SNI extension
+I64 TLSSocketConnect(CTLSSocket *tls_socket, U8 *hostname, U16 port);
+
+// Send data (encrypts with TLS)
+I64 TLSSocketSend(CTLSSocket *tls_socket, U8 *buffer, I64 length);
+
+// Receive data (decrypts TLS records)
+I64 TLSSocketReceive(CTLSSocket *tls_socket, U8 *buffer, I64 length);
+
+// Close connection (sends close_notify alert)
+I64 TLSSocketClose(CTLSSocket *tls_socket);
+
+// Convenience: create connected TLS socket
+CTLSSocket *TLSConnectionCreate(U8 *hostname, U16 port);
+
+$BG,0$$FG,14$4.4 TLS Record Layer (C:/Home/Net/TLS/TLSRecord.ZC)$FG,0$$BG,15$
+
+// Send plaintext record (encrypts if handshake complete)
+I64 TLSRecordSend(CTLSSocket *tls, U8 content_type, U8 *data, I64 length);
+
+// Receive and decrypt record
+// Returns content type, data pointer, and length
+I64 TLSRecordReceive(CTLSSocket *tls, U8 *content_type_out, U8 **data_out, I64 *length_out);
+
+// Encrypt record with AES-GCM
+I64 TLSRecordEncrypt(CTLSState *state, U8 content_type, U8 *plaintext, I64 length, U8 *ciphertext);
+
+// Decrypt record with AES-GCM
+I64 TLSRecordDecrypt(CTLSState *state, U8 content_type, U8 *ciphertext, I64 length, U8 *plaintext);
+
+$BG,0$$FG,14$4.5 TLS Handshake (C:/Home/Net/TLS/TLSHandshake.ZC)$FG,0$$BG,15$
+
+// Perform full TLS 1.3 handshake
+I64 TLSHandshake(CTLSSocket *tls, U8 *hostname);
+
+// Build ClientHello message
+I64 TLSBuildClientHello(CTLSState *state, U8 *buffer, I64 *length_out);
+
+// Process ServerHello
+I64 TLSProcessServerHello(CTLSState *state, U8 *data, I64 length);
+
+// Process EncryptedExtensions
+I64 TLSProcessEncryptedExtensions(CTLSState *state, U8 *data, I64 length);
+
+// Process Certificate
+I64 TLSProcessCertificate(CTLSState *state, U8 *data, I64 length);
+
+// Process CertificateVerify
+I64 TLSProcessCertificateVerify(CTLSState *state, U8 *data, I64 length);
+
+// Process Finished
+I64 TLSProcessFinished(CTLSState *state, U8 *data, I64 length);
+
+// Build client Finished message
+I64 TLSBuildFinished(CTLSState *state, U8 *buffer, I64 *length_out);
+
+$BG,0$$FG,14$4.6 TLS Key Schedule (C:/Home/Net/TLS/TLSCrypto.ZC)$FG,0$$BG,15$
+
+// TLS 1.3 Key Schedule (RFC 8446 Section 7.1)
+//
+// PSK ->  HKDF-Extract = Early Secret
+//              |
+//              +-----> Derive-Secret(., "ext binder" | "res binder", "")
+//              |                     = binder_key
+//              |
+//              +-----> Derive-Secret(., "c e traffic", ClientHello)
+//              |                     = client_early_traffic_secret
+//              |
+//              v
+//        Derive-Secret(., "derived", "")
+//              |
+//              v
+// (EC)DHE -> HKDF-Extract = Handshake Secret
+//              |
+//              +-----> Derive-Secret(., "c hs traffic",
+//              |                     ClientHello...ServerHello)
+//              |                     = client_handshake_traffic_secret
+//              |
+//              +-----> Derive-Secret(., "s hs traffic",
+//              |                     ClientHello...ServerHello)
+//              |                     = server_handshake_traffic_secret
+//              |
+//              v
+//        Derive-Secret(., "derived", "")
+//              |
+//              v
+// 0 -> HKDF-Extract = Master Secret
+//              |
+//              +-----> Derive-Secret(., "c ap traffic",
+//              |                     ClientHello...server Finished)
+//              |                     = client_application_traffic_secret
+//              |
+//              +-----> Derive-Secret(., "s ap traffic",
+//              |                     ClientHello...server Finished)
+//              |                     = server_application_traffic_secret
+
+// Derive-Secret function
+U0 TLSDeriveSecret(U8 *secret, I64 secret_len,
+                   U8 *label, I64 label_len,
+                   U8 *transcript_hash, I64 hash_len,
+                   U8 *output, I64 output_len,
+                   I64 hash_type);
+
+// Derive handshake keys from shared secret
+U0 TLSDeriveHandshakeKeys(CTLSState *state, U8 *shared_secret);
+
+// Derive application keys from master secret
+U0 TLSDeriveApplicationKeys(CTLSState *state);
+
+// Expand traffic secret to key and IV
+U0 TLSExpandTrafficSecret(U8 *traffic_secret, I64 secret_len,
+                          U8 *key, I64 key_len,
+                          U8 *iv, I64 iv_len,
+                          I64 hash_type);
+
+// Compute verify_data for Finished message
+U0 TLSComputeFinishedVerifyData(U8 *base_key, I64 key_len,
+                                U8 *transcript_hash, I64 hash_len,
+                                U8 *verify_data,
+                                I64 hash_type);
+
+$BG,0$$FG,15$5. HTTP CLIENT$FG,0$$BG,15$
+
+$BG,0$$FG,14$5.1 HTTP Structures (C:/Home/Net/Protocols/HTTP.ZC)$FG,0$$BG,15$
+
+#define HTTP_METHOD_GET     0
+#define HTTP_METHOD_POST    1
+#define HTTP_METHOD_PUT     2
+#define HTTP_METHOD_PATCH   3
+#define HTTP_METHOD_DELETE  4
+
+#define HTTP_MAX_HEADERS    64
+#define HTTP_MAX_HEADER_SIZE 8192
+
+class CHTTPHeader
+{
+    U8  *name;
+    U8  *value;
+};
+
+class CHTTPRequest
+{
+    U8           method;
+    U8          *path;
+    U8          *host;
+    CHTTPHeader  headers[HTTP_MAX_HEADERS];
+    I64          header_count;
+    U8          *body;
+    I64          body_length;
+};
+
+class CHTTPResponse
+{
+    I64          status_code;
+    U8          *status_text;
+    CHTTPHeader  headers[HTTP_MAX_HEADERS];
+    I64          header_count;
+    U8          *body;
+    I64          body_length;
+    I64          content_length;
+    Bool         chunked;
+};
+
+// Send HTTP request over TLS socket
+I64 HTTPRequest(CTLSSocket *tls, CHTTPRequest *request, CHTTPResponse *response);
+
+// Simplified GET request
+I64 HTTPGet(U8 *url, U8 **body_out, I64 *length_out);
+
+// Simplified POST request
+I64 HTTPPost(U8 *url, U8 *body, I64 body_length,
+             U8 *content_type, U8 **response_body, I64 *response_length);
+
+// Parse URL into components
+I64 HTTPParseURL(U8 *url, U8 **scheme, U8 **host, U16 *port, U8 **path);
+
+// Helper to add header
+U0 HTTPAddHeader(CHTTPRequest *req, U8 *name, U8 *value);
+
+// Find header value
+U8 *HTTPGetHeader(CHTTPResponse *resp, U8 *name);
+
+$BG,0$$FG,15$6. WEBSOCKET CLIENT$FG,0$$BG,15$
+
+$BG,0$$FG,14$6.1 WebSocket Structures (C:/Home/Net/Protocols/WebSocket.ZC)$FG,0$$BG,15$
+
+// WebSocket opcodes
+#define WS_OPCODE_CONTINUATION  0x0
+#define WS_OPCODE_TEXT          0x1
+#define WS_OPCODE_BINARY        0x2
+#define WS_OPCODE_CLOSE         0x8
+#define WS_OPCODE_PING          0x9
+#define WS_OPCODE_PONG          0xA
+
+// WebSocket close codes
+#define WS_CLOSE_NORMAL         1000
+#define WS_CLOSE_GOING_AWAY     1001
+#define WS_CLOSE_PROTOCOL_ERROR 1002
+
+class CWebSocket
+{
+    CTLSSocket     *tls;            // Underlying TLS connection
+    U8              state;          // WS_STATE_* enum
+    U8             *recv_buffer;    // For fragmented messages
+    I64             recv_buffer_len;
+    U8              masking_key[4]; // Client frames must be masked
+};
+
+#define WS_STATE_INIT       0
+#define WS_STATE_CONNECTING 1
+#define WS_STATE_OPEN       2
+#define WS_STATE_CLOSING    3
+#define WS_STATE_CLOSED     4
+
+// Connect to WebSocket server
+CWebSocket *WebSocketConnect(U8 *url);
+
+// Send text frame
+I64 WebSocketSendText(CWebSocket *ws, U8 *text);
+
+// Send binary frame
+I64 WebSocketSendBinary(CWebSocket *ws, U8 *data, I64 length);
+
+// Send ping
+I64 WebSocketPing(CWebSocket *ws, U8 *data, I64 length);
+
+// Receive frame (blocks until frame received)
+I64 WebSocketReceive(CWebSocket *ws, U8 *opcode_out, U8 **data_out, I64 *length_out);
+
+// Close connection
+I64 WebSocketClose(CWebSocket *ws, U16 code, U8 *reason);
+
+// Internal: perform HTTP upgrade handshake
+I64 WebSocketUpgrade(CWebSocket *ws, U8 *host, U8 *path);
+
+// Internal: send frame with masking
+I64 WebSocketSendFrame(CWebSocket *ws, U8 opcode, U8 *data, I64 length, Bool fin);
+
+// Internal: receive and decode frame
+I64 WebSocketReceiveFrame(CWebSocket *ws, U8 *opcode_out, U8 **data_out, I64 *length_out);
+
+$BG,0$$FG,15$7. IMPLEMENTATION NOTES$FG,0$$BG,15$
+
+$BG,0$$FG,14$7.1 ZealC Considerations$FG,0$$BG,15$
+
+- Use U8, U16, U32, U64, I64 for portable integer types
+- Use 'class' instead of 'typedef struct'
+- No ternary operator (?:) - use if/else
+- No 'continue' - use 'goto'
+- Big-endian network byte order handled with EndianU16/EndianU32
+
+$BG,0$$FG,14$7.2 Memory Management$FG,0$$BG,15$
+
+- All allocated memory tracked with CAlloc/Free
+- Large buffers (receive buffers) should be reasonable sizes
+- Crypto contexts cleared after use (security)
+- No memory pools needed initially
+
+$BG,0$$FG,14$7.3 Error Handling$FG,0$$BG,15$
+
+- Functions return I64: 0 = success, negative = error code
+- Error codes defined per module
+- NetErr/NetLog used for debugging output
+
+$BG,0$$FG,14$7.4 Testing Strategy$FG,0$$BG,15$
+
+1. Test crypto primitives with known test vectors
+2. Test record encryption/decryption independently
+3. Test handshake against real TLS servers (badssl.com)
+4. Test HTTP client against httpbin.org
+5. Test WebSocket against echo.websocket.org
+6. Final: test against Discord API
+
+$BG,0$$FG,15$8. ESTIMATED LINES OF CODE$FG,0$$BG,15$
+
+Module              | Lines  | Complexity
+--------------------|--------|------------
+SHA-256             |   300  | Medium
+SHA-384/512         |   400  | Medium
+HMAC                |   150  | Easy
+HKDF                |   100  | Easy
+AES                 |   500  | Hard
+GCM                 |   400  | Hard
+X25519              |   600  | Hard
+BigInt (for X25519) |   400  | Medium
+Random              |   150  | Medium
+TLS.HH              |   200  | N/A
+TLS Record          |   400  | Medium
+TLS Handshake       |  1000  | Hard
+TLS Crypto/Keys     |   400  | Hard
+TLS Socket          |   300  | Medium
+X509 (minimal)      |   500  | Medium
+HTTP                |   600  | Medium
+WebSocket           |   500  | Medium
+--------------------|--------|------------
+TOTAL               | ~6500  |
+
+$BG,0$$FG,15$9. REFERENCES$FG,0$$BG,15$
+
+$LK,"RFC 8446: TLS 1.3",A="https://datatracker.ietf.org/doc/html/rfc8446"$
+$LK,"RFC 5869: HKDF",A="https://datatracker.ietf.org/doc/html/rfc5869"$
+$LK,"RFC 6455: WebSocket",A="https://datatracker.ietf.org/doc/html/rfc6455"$
+$LK,"FIPS 180-4: SHA-2",A="https://csrc.nist.gov/publications/detail/fips/180/4/final"$
+$LK,"FIPS 197: AES",A="https://csrc.nist.gov/publications/detail/fips/197/final"$
+$LK,"NIST SP 800-38D: GCM",A="https://csrc.nist.gov/publications/detail/sp/800-38d/final"$
+$LK,"RFC 7748: X25519",A="https://datatracker.ietf.org/doc/html/rfc7748"$
+$LK,"TLSe (reference)",A="https://github.com/eduardsui/tlse"$
+$LK,"BearSSL (reference)",A="https://www.bearssl.org/"$
+
+$BG,0$$FG,15$10. REVISION HISTORY$FG,0$$BG,15$
+
+2025-12-15: Initial design document created
+

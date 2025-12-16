@@ -1,0 +1,443 @@
+// HMAC.ZC - HMAC (Hash-based Message Authentication Code) for ZealOS
+// Implementation based on RFC 2104 / FIPS 198-1
+// https://datatracker.ietf.org/doc/html/rfc2104
+//
+// HMAC(K, m) = H((K' XOR opad) || H((K' XOR ipad) || m))
+// Where:
+//   K' = H(K) if len(K) > block_size, else K padded with zeros
+//   ipad = 0x36 repeated block_size times
+//   opad = 0x5C repeated block_size times
+
+// ============================================================================
+// HMAC CONSTANTS
+// ============================================================================
+
+#define HMAC_IPAD 0x36
+#define HMAC_OPAD 0x5C
+
+// ============================================================================
+// HMAC-SHA256
+// ============================================================================
+
+// Initialize HMAC-SHA256 context with key
+U0 HMAC_SHA256_Init(CHMACContext *ctx, U8 *key, I64 key_len)
+{
+	U8 key_block[SHA256_BLOCK_SIZE];
+	I64 i;
+
+	ctx->hash_type = HASH_SHA256;
+
+	// If key is longer than block size, hash it first
+	if (key_len > SHA256_BLOCK_SIZE)
+	{
+		SHA256(key, key_len, key_block);
+		key_len = SHA256_DIGEST_SIZE;
+	}
+	else
+	{
+		MemCopy(key_block, key, key_len);
+	}
+
+	// Pad key with zeros to block size
+	if (key_len < SHA256_BLOCK_SIZE)
+	{
+		MemSet(key_block + key_len, 0, SHA256_BLOCK_SIZE - key_len);
+	}
+
+	// Compute ipad_key = key XOR ipad
+	// Compute opad_key = key XOR opad
+	for (i = 0; i < SHA256_BLOCK_SIZE; i++)
+	{
+		ctx->ipad_key[i] = key_block[i] ^ HMAC_IPAD;
+		ctx->opad_key[i] = key_block[i] ^ HMAC_OPAD;
+	}
+
+	// Initialize inner hash: H(ipad_key || ...)
+	SHA256Init(&ctx->sha256);
+	SHA256Update(&ctx->sha256, ctx->ipad_key, SHA256_BLOCK_SIZE);
+
+	// Clear key material
+	CryptoSecureZero(key_block, SHA256_BLOCK_SIZE);
+}
+
+// Update HMAC-SHA256 with data
+U0 HMAC_SHA256_Update(CHMACContext *ctx, U8 *data, I64 length)
+{
+	SHA256Update(&ctx->sha256, data, length);
+}
+
+// Finalize HMAC-SHA256 and output MAC
+U0 HMAC_SHA256_Final(CHMACContext *ctx, U8 *mac)
+{
+	U8 inner_hash[SHA256_DIGEST_SIZE];
+	CSHA256Context outer_ctx;
+
+	// Compute inner hash
+	SHA256Final(&ctx->sha256, inner_hash);
+
+	// Compute outer hash: H(opad_key || inner_hash)
+	SHA256Init(&outer_ctx);
+	SHA256Update(&outer_ctx, ctx->opad_key, SHA256_BLOCK_SIZE);
+	SHA256Update(&outer_ctx, inner_hash, SHA256_DIGEST_SIZE);
+	SHA256Final(&outer_ctx, mac);
+
+	// Clear sensitive data
+	CryptoSecureZero(inner_hash, SHA256_DIGEST_SIZE);
+	CryptoSecureZero(ctx->ipad_key, SHA256_BLOCK_SIZE);
+	CryptoSecureZero(ctx->opad_key, SHA256_BLOCK_SIZE);
+}
+
+// One-shot HMAC-SHA256
+U0 HMAC_SHA256(U8 *key, I64 key_len, U8 *data, I64 data_len, U8 *mac)
+{
+	CHMACContext ctx;
+	HMAC_SHA256_Init(&ctx, key, key_len);
+	HMAC_SHA256_Update(&ctx, data, data_len);
+	HMAC_SHA256_Final(&ctx, mac);
+}
+
+// ============================================================================
+// HMAC-SHA384
+// ============================================================================
+
+// Initialize HMAC-SHA384 context with key
+U0 HMAC_SHA384_Init(CHMACContext *ctx, U8 *key, I64 key_len)
+{
+	U8 key_block[SHA512_BLOCK_SIZE];
+	I64 i;
+
+	ctx->hash_type = HASH_SHA384;
+
+	// If key is longer than block size, hash it first
+	if (key_len > SHA512_BLOCK_SIZE)
+	{
+		SHA384(key, key_len, key_block);
+		key_len = SHA384_DIGEST_SIZE;
+	}
+	else
+	{
+		MemCopy(key_block, key, key_len);
+	}
+
+	// Pad key with zeros to block size
+	if (key_len < SHA512_BLOCK_SIZE)
+	{
+		MemSet(key_block + key_len, 0, SHA512_BLOCK_SIZE - key_len);
+	}
+
+	// Compute ipad_key = key XOR ipad
+	// Compute opad_key = key XOR opad
+	for (i = 0; i < SHA512_BLOCK_SIZE; i++)
+	{
+		ctx->ipad_key[i] = key_block[i] ^ HMAC_IPAD;
+		ctx->opad_key[i] = key_block[i] ^ HMAC_OPAD;
+	}
+
+	// Initialize inner hash: H(ipad_key || ...)
+	SHA384Init(&ctx->sha512);
+	SHA384Update(&ctx->sha512, ctx->ipad_key, SHA512_BLOCK_SIZE);
+
+	// Clear key material
+	CryptoSecureZero(key_block, SHA512_BLOCK_SIZE);
+}
+
+// Update HMAC-SHA384 with data
+U0 HMAC_SHA384_Update(CHMACContext *ctx, U8 *data, I64 length)
+{
+	SHA384Update(&ctx->sha512, data, length);
+}
+
+// Finalize HMAC-SHA384 and output MAC
+U0 HMAC_SHA384_Final(CHMACContext *ctx, U8 *mac)
+{
+	U8 inner_hash[SHA384_DIGEST_SIZE];
+	CSHA512Context outer_ctx;
+
+	// Compute inner hash
+	SHA384Final(&ctx->sha512, inner_hash);
+
+	// Compute outer hash: H(opad_key || inner_hash)
+	SHA384Init(&outer_ctx);
+	SHA384Update(&outer_ctx, ctx->opad_key, SHA512_BLOCK_SIZE);
+	SHA384Update(&outer_ctx, inner_hash, SHA384_DIGEST_SIZE);
+	SHA384Final(&outer_ctx, mac);
+
+	// Clear sensitive data
+	CryptoSecureZero(inner_hash, SHA384_DIGEST_SIZE);
+	CryptoSecureZero(ctx->ipad_key, SHA512_BLOCK_SIZE);
+	CryptoSecureZero(ctx->opad_key, SHA512_BLOCK_SIZE);
+}
+
+// One-shot HMAC-SHA384
+U0 HMAC_SHA384(U8 *key, I64 key_len, U8 *data, I64 data_len, U8 *mac)
+{
+	CHMACContext ctx;
+	HMAC_SHA384_Init(&ctx, key, key_len);
+	HMAC_SHA384_Update(&ctx, data, data_len);
+	HMAC_SHA384_Final(&ctx, mac);
+}
+
+// ============================================================================
+// GENERIC HMAC API (selects based on hash_type)
+// ============================================================================
+
+U0 HMACInit(CHMACContext *ctx, U8 *key, I64 key_len, I64 hash_type)
+{
+	switch (hash_type)
+	{
+		case HASH_SHA256:
+			HMAC_SHA256_Init(ctx, key, key_len);
+			break;
+		case HASH_SHA384:
+			HMAC_SHA384_Init(ctx, key, key_len);
+			break;
+		default:
+			NetErr("HMAC: Unsupported hash type %d", hash_type);
+	}
+}
+
+U0 HMACUpdate(CHMACContext *ctx, U8 *data, I64 length)
+{
+	switch (ctx->hash_type)
+	{
+		case HASH_SHA256:
+			HMAC_SHA256_Update(ctx, data, length);
+			break;
+		case HASH_SHA384:
+			HMAC_SHA384_Update(ctx, data, length);
+			break;
+	}
+}
+
+U0 HMACFinal(CHMACContext *ctx, U8 *mac)
+{
+	switch (ctx->hash_type)
+	{
+		case HASH_SHA256:
+			HMAC_SHA256_Final(ctx, mac);
+			break;
+		case HASH_SHA384:
+			HMAC_SHA384_Final(ctx, mac);
+			break;
+	}
+}
+
+U0 HMAC(U8 *key, I64 key_len, U8 *data, I64 data_len, U8 *mac, I64 hash_type)
+{
+	switch (hash_type)
+	{
+		case HASH_SHA256:
+			HMAC_SHA256(key, key_len, data, data_len, mac);
+			break;
+		case HASH_SHA384:
+			HMAC_SHA384(key, key_len, data, data_len, mac);
+			break;
+		default:
+			NetErr("HMAC: Unsupported hash type %d", hash_type);
+	}
+}
+
+// Returns the output size for the given hash type
+I64 HMACSize(I64 hash_type)
+{
+	switch (hash_type)
+	{
+		case HASH_SHA256:
+			return SHA256_DIGEST_SIZE;
+		case HASH_SHA384:
+			return SHA384_DIGEST_SIZE;
+		default:
+			return 0;
+	}
+}
+
+// ============================================================================
+// HMAC TEST VECTORS (RFC 4231)
+// ============================================================================
+
+U0 HMACTest()
+{
+	U8 mac[64];
+	U8 expected[64];
+	I64 i;
+	Bool pass;
+
+	"$$LTBLUE$$HMAC Test Vectors (RFC 4231):$$FG$$\n\n";
+
+	// Test Case 1: HMAC-SHA256
+	// Key  = 0x0b repeated 20 times
+	// Data = "Hi There"
+	"Test 1: HMAC-SHA256 with 20-byte key\n";
+
+	U8 key1[20];
+	MemSet(key1, 0x0B, 20);
+
+	HMAC_SHA256(key1, 20, "Hi There", 8, mac);
+
+	// Expected: b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7
+	expected[0]  = 0xB0; expected[1]  = 0x34; expected[2]  = 0x4C; expected[3]  = 0x61;
+	expected[4]  = 0xD8; expected[5]  = 0xDB; expected[6]  = 0x38; expected[7]  = 0x53;
+	expected[8]  = 0x5C; expected[9]  = 0xA8; expected[10] = 0xAF; expected[11] = 0xCE;
+	expected[12] = 0xAF; expected[13] = 0x0B; expected[14] = 0xF1; expected[15] = 0x2B;
+	expected[16] = 0x88; expected[17] = 0x1D; expected[18] = 0xC2; expected[19] = 0x00;
+	expected[20] = 0xC9; expected[21] = 0x83; expected[22] = 0x3D; expected[23] = 0xA7;
+	expected[24] = 0x26; expected[25] = 0xE9; expected[26] = 0x37; expected[27] = 0x6C;
+	expected[28] = 0x2E; expected[29] = 0x32; expected[30] = 0xCF; expected[31] = 0xF7;
+
+	pass = TRUE;
+	for (i = 0; i < 32; i++)
+	{
+		if (mac[i] != expected[i])
+		{
+			pass = FALSE;
+			break;
+		}
+	}
+
+	"  Result:   ";
+	for (i = 0; i < 32; i++)
+		"%02X", mac[i];
+	"\n";
+	"  Expected: ";
+	for (i = 0; i < 32; i++)
+		"%02X", expected[i];
+	"\n";
+
+	if (pass)
+		"  $$GREEN$$PASS$$FG$$\n\n";
+	else
+		"  $$RED$$FAIL$$FG$$\n\n";
+
+	// Test Case 2: HMAC-SHA256 with "Jefe" key
+	// Key  = "Jefe"
+	// Data = "what do ya want for nothing?"
+	"Test 2: HMAC-SHA256 with \"Jefe\" key\n";
+
+	HMAC_SHA256("Jefe", 4, "what do ya want for nothing?", 28, mac);
+
+	// Expected: 5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843
+	expected[0]  = 0x5B; expected[1]  = 0xDC; expected[2]  = 0xC1; expected[3]  = 0x46;
+	expected[4]  = 0xBF; expected[5]  = 0x60; expected[6]  = 0x75; expected[7]  = 0x4E;
+	expected[8]  = 0x6A; expected[9]  = 0x04; expected[10] = 0x24; expected[11] = 0x26;
+	expected[12] = 0x08; expected[13] = 0x95; expected[14] = 0x75; expected[15] = 0xC7;
+	expected[16] = 0x5A; expected[17] = 0x00; expected[18] = 0x3F; expected[19] = 0x08;
+	expected[20] = 0x9D; expected[21] = 0x27; expected[22] = 0x39; expected[23] = 0x83;
+	expected[24] = 0x9D; expected[25] = 0xEC; expected[26] = 0x58; expected[27] = 0xB9;
+	expected[28] = 0x64; expected[29] = 0xEC; expected[30] = 0x38; expected[31] = 0x43;
+
+	pass = TRUE;
+	for (i = 0; i < 32; i++)
+	{
+		if (mac[i] != expected[i])
+		{
+			pass = FALSE;
+			break;
+		}
+	}
+
+	"  Result:   ";
+	for (i = 0; i < 32; i++)
+		"%02X", mac[i];
+	"\n";
+	"  Expected: ";
+	for (i = 0; i < 32; i++)
+		"%02X", expected[i];
+	"\n";
+
+	if (pass)
+		"  $$GREEN$$PASS$$FG$$\n\n";
+	else
+		"  $$RED$$FAIL$$FG$$\n\n";
+
+	// Test Case 3: HMAC-SHA384
+	// Key  = 0x0b repeated 20 times
+	// Data = "Hi There"
+	"Test 3: HMAC-SHA384 with 20-byte key\n";
+
+	HMAC_SHA384(key1, 20, "Hi There", 8, mac);
+
+	// Expected: afd03944d84895626b0825f4ab46907f15f9dadbe4101ec682aa034c7cebc59c
+	//           faea9ea9076ede7f4af152e8b2fa9cb6
+	expected[0]  = 0xAF; expected[1]  = 0xD0; expected[2]  = 0x39; expected[3]  = 0x44;
+	expected[4]  = 0xD8; expected[5]  = 0x48; expected[6]  = 0x95; expected[7]  = 0x62;
+	expected[8]  = 0x6B; expected[9]  = 0x08; expected[10] = 0x25; expected[11] = 0xF4;
+	expected[12] = 0xAB; expected[13] = 0x46; expected[14] = 0x90; expected[15] = 0x7F;
+	expected[16] = 0x15; expected[17] = 0xF9; expected[18] = 0xDA; expected[19] = 0xDB;
+	expected[20] = 0xE4; expected[21] = 0x10; expected[22] = 0x1E; expected[23] = 0xC6;
+	expected[24] = 0x82; expected[25] = 0xAA; expected[26] = 0x03; expected[27] = 0x4C;
+	expected[28] = 0x7C; expected[29] = 0xEB; expected[30] = 0xC5; expected[31] = 0x9C;
+	expected[32] = 0xFA; expected[33] = 0xEA; expected[34] = 0x9E; expected[35] = 0xA9;
+	expected[36] = 0x07; expected[37] = 0x6E; expected[38] = 0xDE; expected[39] = 0x7F;
+	expected[40] = 0x4A; expected[41] = 0xF1; expected[42] = 0x52; expected[43] = 0xE8;
+	expected[44] = 0xB2; expected[45] = 0xFA; expected[46] = 0x9C; expected[47] = 0xB6;
+
+	pass = TRUE;
+	for (i = 0; i < 48; i++)
+	{
+		if (mac[i] != expected[i])
+		{
+			pass = FALSE;
+			break;
+		}
+	}
+
+	"  Result:   ";
+	for (i = 0; i < 48; i++)
+		"%02X", mac[i];
+	"\n";
+	"  Expected: ";
+	for (i = 0; i < 48; i++)
+		"%02X", expected[i];
+	"\n";
+
+	if (pass)
+		"  $$GREEN$$PASS$$FG$$\n\n";
+	else
+		"  $$RED$$FAIL$$FG$$\n\n";
+
+	// Test Case 4: Incremental update test
+	"Test 4: HMAC-SHA256 incremental update\n";
+
+	CHMACContext ctx;
+	HMAC_SHA256_Init(&ctx, "Jefe", 4);
+	HMAC_SHA256_Update(&ctx, "what do ya ", 11);
+	HMAC_SHA256_Update(&ctx, "want for ", 9);
+	HMAC_SHA256_Update(&ctx, "nothing?", 8);
+	HMAC_SHA256_Final(&ctx, mac);
+
+	// Should match Test 2
+	expected[0]  = 0x5B; expected[1]  = 0xDC; expected[2]  = 0xC1; expected[3]  = 0x46;
+	expected[4]  = 0xBF; expected[5]  = 0x60; expected[6]  = 0x75; expected[7]  = 0x4E;
+	expected[8]  = 0x6A; expected[9]  = 0x04; expected[10] = 0x24; expected[11] = 0x26;
+	expected[12] = 0x08; expected[13] = 0x95; expected[14] = 0x75; expected[15] = 0xC7;
+	expected[16] = 0x5A; expected[17] = 0x00; expected[18] = 0x3F; expected[19] = 0x08;
+	expected[20] = 0x9D; expected[21] = 0x27; expected[22] = 0x39; expected[23] = 0x83;
+	expected[24] = 0x9D; expected[25] = 0xEC; expected[26] = 0x58; expected[27] = 0xB9;
+	expected[28] = 0x64; expected[29] = 0xEC; expected[30] = 0x38; expected[31] = 0x43;
+
+	pass = TRUE;
+	for (i = 0; i < 32; i++)
+	{
+		if (mac[i] != expected[i])
+		{
+			pass = FALSE;
+			break;
+		}
+	}
+
+	"  Result:   ";
+	for (i = 0; i < 32; i++)
+		"%02X", mac[i];
+	"\n";
+	"  Expected: ";
+	for (i = 0; i < 32; i++)
+		"%02X", expected[i];
+	"\n";
+
+	if (pass)
+		"  $$GREEN$$PASS$$FG$$\n\n";
+	else
+		"  $$RED$$FAIL$$FG$$\n\n";
+
+	"HMAC tests complete.\n";
+}

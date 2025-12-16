@@ -1,0 +1,476 @@
+// xargs.ZC - Build and execute command lines from standard input
+// GNU xargs compatible implementation for ZealOS
+// Part of the POSIX compatibility layer
+
+// ============================================================================
+// XARGS CONFIGURATION
+// ============================================================================
+
+#define XARGS_ARG_MAX       4096    // Max size of command line
+#define XARGS_MAX_ARGS      256     // Max number of arguments
+#define XARGS_LINE_SIZE     4096    // Input line buffer size
+
+// ============================================================================
+// XARGS STATE
+// ============================================================================
+
+class CXargsState {
+    // Options
+    U8      *command;           // Command to execute (default: echo)
+    U8      *delimiter;         // Input delimiter (-d)
+    U8      *replace_str;       // Replace string (-I)
+    I64     max_args;           // Max arguments per command (-n)
+    I64     max_chars;          // Max command line length (-s)
+    I64     max_procs;          // Max parallel processes (-P)
+    Bool    null_delim;         // Use NUL as delimiter (-0)
+    Bool    no_run_empty;       // Don't run if input is empty (-r)
+    Bool    verbose;            // Print commands before executing (-t)
+    Bool    interactive;        // Prompt before executing (-p)
+    Bool    exit_on_error;      // Exit if command fails (-x)
+    Bool    open_tty;           // Open /dev/tty for -p (-o)
+
+    // Runtime state
+    U8      *args[XARGS_MAX_ARGS];   // Collected arguments
+    I64     arg_count;               // Current argument count
+    I64     total_chars;             // Total characters in args
+    I64     exit_status;             // Exit status to return
+    Bool    eof_reached;             // End of input
+};
+
+// ============================================================================
+// HELPER FUNCTIONS
+// ============================================================================
+
+// Skip whitespace
+U8 *XargsSkipWhitespace(U8 *p)
+{
+    while (*p && (*p == ' ' || *p == '\t' || *p == '\n'))
+        p++;
+    return p;
+}
+
+// Read a quoted string, returns pointer past closing quote
+U8 *XargsReadQuoted(U8 *p, U8 *buf, I64 bufsize, U8 quote)
+{
+    I64 i = 0;
+    p++; // Skip opening quote
+
+    while (*p && *p != quote && i < bufsize - 1) {
+        if (*p == '\\' && p[1]) {
+            p++;
+            switch (*p) {
+                case 'n':  buf[i++] = '\n'; break;
+                case 't':  buf[i++] = '\t'; break;
+                case 'r':  buf[i++] = '\r'; break;
+                case '\\': buf[i++] = '\\'; break;
+                default:   buf[i++] = *p;   break;
+            }
+        } else {
+            buf[i++] = *p;
+        }
+        p++;
+    }
+    buf[i] = 0;
+
+    if (*p == quote)
+        p++;
+
+    return p;
+}
+
+// Read an unquoted word
+U8 *XargsReadWord(U8 *p, U8 *buf, I64 bufsize, CXargsState *state)
+{
+    I64 i = 0;
+
+    while (*p && i < bufsize - 1) {
+        // Check for delimiter
+        if (state->null_delim) {
+            if (*p == 0)
+                break;
+        } else if (state->delimiter) {
+            if (*p == state->delimiter[0])
+                break;
+        } else {
+            // Default: whitespace delimited
+            if (*p == ' ' || *p == '\t' || *p == '\n')
+                break;
+        }
+
+        // Handle escapes in non-null mode
+        if (!state->null_delim && *p == '\\' && p[1]) {
+            p++;
+            buf[i++] = *p++;
+            continue;
+        }
+
+        // Handle quotes in non-null mode
+        if (!state->null_delim && (*p == '"' || *p == '\'')) {
+            U8 quote = *p;
+            p = XargsReadQuoted(p, buf + i, bufsize - i, quote);
+            i = strlen(buf);
+            continue;
+        }
+
+        buf[i++] = *p++;
+    }
+    buf[i] = 0;
+
+    // Skip delimiter
+    if (*p && state->delimiter && *p == state->delimiter[0])
+        p++;
+    else if (*p && state->null_delim && *p == 0)
+        p++;
+
+    return p;
+}
+
+// Execute command with current arguments
+I64 XargsExecute(CXargsState *state)
+{
+    if (state->arg_count == 0 && state->no_run_empty)
+        return 0;
+
+    // Build command line
+    U8 cmdline[XARGS_ARG_MAX];
+    I64 pos = 0;
+
+    if (state->replace_str && state->arg_count > 0) {
+        // Replace mode: substitute {} with each argument
+        U8 *cmd = state->command ? state->command : "echo";
+        U8 *p = cmd;
+
+        while (*p && pos < XARGS_ARG_MAX - 1) {
+            // Look for replace string
+            Bool found = FALSE;
+            if (state->replace_str) {
+                I64 rlen = strlen(state->replace_str);
+                if (strncmp(p, state->replace_str, rlen) == 0) {
+                    // Replace with first argument
+                    if (state->arg_count > 0) {
+                        I64 alen = strlen(state->args[0]);
+                        if (pos + alen < XARGS_ARG_MAX - 1) {
+                            strcpy(cmdline + pos, state->args[0]);
+                            pos += alen;
+                        }
+                    }
+                    p += rlen;
+                    found = TRUE;
+                }
+            }
+            if (!found) {
+                cmdline[pos++] = *p++;
+            }
+        }
+        cmdline[pos] = 0;
+    } else {
+        // Normal mode: append arguments
+        if (state->command) {
+            strcpy(cmdline, state->command);
+            pos = strlen(cmdline);
+        } else {
+            strcpy(cmdline, "echo");
+            pos = 4;
+        }
+
+        for (I64 i = 0; i < state->arg_count; i++) {
+            if (pos + strlen(state->args[i]) + 2 >= XARGS_ARG_MAX) {
+                fprintf(stderr, "xargs: argument list too long\n");
+                return 1;
+            }
+            cmdline[pos++] = ' ';
+            strcpy(cmdline + pos, state->args[i]);
+            pos += strlen(state->args[i]);
+        }
+        cmdline[pos] = 0;
+    }
+
+    // Verbose mode
+    if (state->verbose) {
+        fprintf(stderr, "%s\n", cmdline);
+    }
+
+    // Interactive mode
+    if (state->interactive) {
+        fprintf(stderr, "%s ?...", cmdline);
+        I64 ch = getchar();
+        if (ch != 'y' && ch != 'Y') {
+            // Skip rest of line
+            while (ch != '\n' && ch != EOF)
+                ch = getchar();
+            return 0;
+        }
+        while (ch != '\n' && ch != EOF)
+            ch = getchar();
+    }
+
+    // Execute via shell
+    I64 result = GnuRun(cmdline);
+
+    if (result != 0 && state->exit_on_error) {
+        state->exit_status = 123;
+        return -1;
+    }
+
+    if (result != 0)
+        state->exit_status = 123;
+
+    return result;
+}
+
+// Clear collected arguments
+U0 XargsClearArgs(CXargsState *state)
+{
+    for (I64 i = 0; i < state->arg_count; i++) {
+        if (state->args[i]) {
+            Free(state->args[i]);
+            state->args[i] = NULL;
+        }
+    }
+    state->arg_count = 0;
+    state->total_chars = 0;
+}
+
+// Add an argument to collection
+Bool XargsAddArg(CXargsState *state, U8 *arg)
+{
+    if (state->arg_count >= XARGS_MAX_ARGS)
+        return FALSE;
+
+    I64 len = strlen(arg);
+
+    // Check if adding would exceed max chars
+    if (state->max_chars > 0) {
+        I64 needed = state->total_chars + len + 1;
+        if (needed > state->max_chars)
+            return FALSE;
+    }
+
+    state->args[state->arg_count] = strdup(arg);
+    state->arg_count++;
+    state->total_chars += len + 1;
+
+    // Check if we've hit max_args
+    if (state->max_args > 0 && state->arg_count >= state->max_args)
+        return FALSE;
+
+    return TRUE;
+}
+
+// ============================================================================
+// MAIN INPUT PROCESSING
+// ============================================================================
+
+I64 XargsProcess(CXargsState *state, FILE *fp)
+{
+    U8 buf[XARGS_LINE_SIZE];
+    U8 word[XARGS_LINE_SIZE];
+    Bool has_input = FALSE;
+
+    while (!state->eof_reached) {
+        // Read input
+        I64 len = 0;
+
+        if (state->null_delim) {
+            // Read until NUL
+            I64 ch;
+            while ((ch = fgetc(fp)) != EOF && ch != 0 && len < XARGS_LINE_SIZE - 1) {
+                buf[len++] = ch;
+            }
+            buf[len] = 0;
+            if (ch == EOF)
+                state->eof_reached = TRUE;
+        } else {
+            // Read a line
+            if (!fgets(buf, XARGS_LINE_SIZE, fp)) {
+                state->eof_reached = TRUE;
+                break;
+            }
+            len = strlen(buf);
+            // Remove trailing newline
+            if (len > 0 && buf[len-1] == '\n')
+                buf[--len] = 0;
+        }
+
+        if (len == 0 && state->eof_reached)
+            break;
+
+        // Parse words from input
+        U8 *p = buf;
+
+        if (!state->null_delim && !state->delimiter)
+            p = XargsSkipWhitespace(p);
+
+        while (*p) {
+            // Read next word
+            p = XargsReadWord(p, word, XARGS_LINE_SIZE, state);
+
+            if (word[0] == 0)
+                continue;
+
+            has_input = TRUE;
+
+            // Try to add argument
+            if (!XargsAddArg(state, word)) {
+                // Arguments full, execute and try again
+                I64 ret = XargsExecute(state);
+                if (ret < 0)
+                    return state->exit_status;
+
+                XargsClearArgs(state);
+
+                // Add the argument that didn't fit
+                if (!XargsAddArg(state, word)) {
+                    fprintf(stderr, "xargs: argument too long\n");
+                    return 1;
+                }
+            }
+
+            if (!state->null_delim && !state->delimiter)
+                p = XargsSkipWhitespace(p);
+        }
+    }
+
+    // Execute remaining arguments
+    if (state->arg_count > 0 || (has_input && !state->no_run_empty) ||
+        (!has_input && !state->no_run_empty)) {
+        if (state->arg_count > 0 || !state->no_run_empty) {
+            XargsExecute(state);
+        }
+    }
+
+    XargsClearArgs(state);
+
+    return state->exit_status;
+}
+
+// ============================================================================
+// OPTION PARSING AND MAIN
+// ============================================================================
+
+U0 xargs_usage()
+{
+    printf("Usage: xargs [OPTION]... [COMMAND [INITIAL-ARGS]]\n");
+    printf("Build and execute command lines from standard input.\n\n");
+    printf("Options:\n");
+    printf("  -0, --null           Input items are NUL-terminated\n");
+    printf("  -d, --delimiter=C    Input items terminated by C\n");
+    printf("  -I REPLACE           Replace REPLACE in COMMAND with input\n");
+    printf("  -n MAX-ARGS          Use at most MAX-ARGS arguments per command\n");
+    printf("  -s MAX-CHARS         Limit command line to MAX-CHARS\n");
+    printf("  -r, --no-run-if-empty  Don't run if input is empty\n");
+    printf("  -t, --verbose        Print commands before executing\n");
+    printf("  -p, --interactive    Prompt before executing each command\n");
+    printf("  -x, --exit           Exit if size is exceeded\n");
+    printf("  --help               Display this help\n");
+}
+
+I64 xargs_main(I64 argc, U8 **argv)
+{
+    CXargsState state;
+    MemSet(&state, 0, sizeof(CXargsState));
+
+    // Defaults
+    state.max_args = 0;         // No limit
+    state.max_chars = XARGS_ARG_MAX;
+    state.no_run_empty = FALSE;
+    state.exit_status = 0;
+
+    // Parse options
+    I64 i = 1;
+    while (i < argc && argv[i][0] == '-' && argv[i][1]) {
+        U8 *opt = argv[i];
+
+        if (strcmp(opt, "--help") == 0) {
+            xargs_usage();
+            return 0;
+        } else if (strcmp(opt, "-0") == 0 || strcmp(opt, "--null") == 0) {
+            state.null_delim = TRUE;
+        } else if (strcmp(opt, "-r") == 0 || strcmp(opt, "--no-run-if-empty") == 0) {
+            state.no_run_empty = TRUE;
+        } else if (strcmp(opt, "-t") == 0 || strcmp(opt, "--verbose") == 0) {
+            state.verbose = TRUE;
+        } else if (strcmp(opt, "-p") == 0 || strcmp(opt, "--interactive") == 0) {
+            state.interactive = TRUE;
+        } else if (strcmp(opt, "-x") == 0 || strcmp(opt, "--exit") == 0) {
+            state.exit_on_error = TRUE;
+        } else if (opt[1] == 'd') {
+            if (opt[2]) {
+                state.delimiter = strdup(opt + 2);
+            } else if (i + 1 < argc) {
+                state.delimiter = strdup(argv[++i]);
+            }
+        } else if (opt[1] == 'I') {
+            if (opt[2]) {
+                state.replace_str = strdup(opt + 2);
+            } else if (i + 1 < argc) {
+                state.replace_str = strdup(argv[++i]);
+            }
+            state.max_args = 1;  // -I implies -n1
+        } else if (opt[1] == 'n') {
+            U8 *val = NULL;
+            if (opt[2]) {
+                val = opt + 2;
+            } else if (i + 1 < argc) {
+                val = argv[++i];
+            }
+            if (val)
+                state.max_args = atoi(val);
+        } else if (opt[1] == 's') {
+            U8 *val = NULL;
+            if (opt[2]) {
+                val = opt + 2;
+            } else if (i + 1 < argc) {
+                val = argv[++i];
+            }
+            if (val)
+                state.max_chars = atoi(val);
+        } else if (opt[1] == 'P') {
+            // Parallel execution - not fully implemented
+            U8 *val = NULL;
+            if (opt[2]) {
+                val = opt + 2;
+            } else if (i + 1 < argc) {
+                val = argv[++i];
+            }
+            if (val)
+                state.max_procs = atoi(val);
+        } else if (strcmp(opt, "--") == 0) {
+            i++;
+            break;
+        } else {
+            fprintf(stderr, "xargs: unrecognized option '%s'\n", opt);
+            return 1;
+        }
+        i++;
+    }
+
+    // Remaining arguments form the command
+    if (i < argc) {
+        // Build command string from remaining args
+        U8 cmd[XARGS_ARG_MAX];
+        I64 pos = 0;
+
+        for (; i < argc; i++) {
+            if (pos > 0)
+                cmd[pos++] = ' ';
+            strcpy(cmd + pos, argv[i]);
+            pos += strlen(argv[i]);
+        }
+        cmd[pos] = 0;
+        state.command = strdup(cmd);
+    }
+
+    // Process stdin
+    I64 result = XargsProcess(&state, stdin);
+
+    // Cleanup
+    if (state.command)
+        Free(state.command);
+    if (state.delimiter)
+        Free(state.delimiter);
+    if (state.replace_str)
+        Free(state.replace_str);
+
+    return result;
+}

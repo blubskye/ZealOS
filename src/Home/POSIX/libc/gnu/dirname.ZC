@@ -1,0 +1,97 @@
+// dirname.ZC - GNU coreutils 'dirname' implementation
+// Strip last component from file name
+
+// C-style main function
+I64 dirname_main(I64 argc, U8 **argv)
+{
+    Bool zero_term = FALSE;
+    I64 start = 1;
+
+    // Parse options
+    while (start < argc && argv[start][0] == '-' && argv[start][1]) {
+        U8 *arg = argv[start];
+
+        if (strcmp(arg, "--help") == 0) {
+            printf("Usage: dirname [OPTION] NAME...\n");
+            printf("Output each NAME with its last non-slash component and trailing slashes\n");
+            printf("removed; if NAME contains no /'s, output '.' (meaning the current directory).\n\n");
+            printf("  -z, --zero     end each output line with NUL, not newline\n");
+            printf("      --help     display this help and exit\n");
+            printf("      --version  output version information and exit\n");
+            return 0;
+        }
+
+        if (strcmp(arg, "--version") == 0) {
+            printf("dirname (ZealOS coreutils) 1.0\n");
+            return 0;
+        }
+
+        if (strcmp(arg, "-z") == 0 || strcmp(arg, "--zero") == 0) {
+            zero_term = TRUE;
+            start++;
+            continue;
+        }
+
+        if (strcmp(arg, "--") == 0) {
+            start++;
+            break;
+        }
+
+        break;
+    }
+
+    if (start >= argc) {
+        fprintf(stderr, "dirname: missing operand\n");
+        return 1;
+    }
+
+    // Process dirname for a single name
+    auto do_dirname = [](U8 *name, Bool zero) {
+        I64 len = strlen(name);
+
+        // Remove trailing slashes
+        while (len > 1 && name[len - 1] == '/')
+            len--;
+
+        // Find last slash
+        I64 last_slash = -1;
+        for (I64 i = len - 1; i >= 0; i--) {
+            if (name[i] == '/') {
+                last_slash = i;
+                break;
+            }
+        }
+
+        if (last_slash < 0) {
+            // No slash found - return "."
+            putchar('.');
+        } else if (last_slash == 0) {
+            // Root directory
+            putchar('/');
+        } else {
+            // Remove trailing slashes from result
+            while (last_slash > 1 && name[last_slash - 1] == '/')
+                last_slash--;
+
+            // Print directory part
+            for (I64 i = 0; i < last_slash; i++)
+                putchar(name[i]);
+        }
+
+        if (zero)
+            putchar(0);
+        else
+            putchar('\n');
+    };
+
+    for (I64 i = start; i < argc; i++) {
+        do_dirname(argv[i], zero_term);
+    }
+
+    return 0;
+}
+
+U0 GnuDirnameRegister()
+{
+    "GNU 'dirname' utility loaded. Run: CRun(&dirname_main, \"dirname /path/to/file.txt\");\n";
+}

@@ -1,0 +1,846 @@
+// netdb.ZC - Network Database Functions for ZealOS
+// Part of the POSIX compatibility layer
+//
+// Implements DNS resolution and host/service lookup functions.
+// This is a native implementation that bypasses glibc's NSS complexity.
+
+// ============================================================================
+// DNS PROTOCOL CONSTANTS
+// ============================================================================
+
+#define DNS_PORT            53
+#define DNS_MAX_PACKET      512
+#define DNS_MAX_NAME        255
+#define DNS_TIMEOUT_MS      5000
+#define DNS_MAX_RETRIES     3
+
+// DNS header flags
+#define DNS_QR_QUERY        0
+#define DNS_QR_RESPONSE     1
+#define DNS_OPCODE_QUERY    0
+#define DNS_RCODE_OK        0
+#define DNS_RCODE_NXDOMAIN  3
+
+// DNS record types
+#define DNS_TYPE_A          1       // IPv4 address
+#define DNS_TYPE_NS         2       // Nameserver
+#define DNS_TYPE_CNAME      5       // Canonical name
+#define DNS_TYPE_SOA        6       // Start of authority
+#define DNS_TYPE_PTR        12      // Pointer (reverse DNS)
+#define DNS_TYPE_MX         15      // Mail exchange
+#define DNS_TYPE_TXT        16      // Text record
+#define DNS_TYPE_AAAA       28      // IPv6 address
+#define DNS_TYPE_SRV        33      // Service record
+
+// DNS classes
+#define DNS_CLASS_IN        1       // Internet
+
+// ============================================================================
+// DNS HEADER STRUCTURE
+// ============================================================================
+
+class CDNSHeader {
+    U16     id;             // Transaction ID
+    U16     flags;          // Flags
+    U16     qdcount;        // Questions
+    U16     ancount;        // Answers
+    U16     nscount;        // Authority records
+    U16     arcount;        // Additional records
+};
+
+// ============================================================================
+// NETWORK ADDRESS STRUCTURES
+// ============================================================================
+
+#define AF_UNSPEC   0
+#define AF_INET     2
+#define AF_INET6    10
+
+#define SOCK_STREAM 1
+#define SOCK_DGRAM  2
+
+#define IPPROTO_TCP 6
+#define IPPROTO_UDP 17
+
+// IPv4 address
+class in_addr {
+    U32     s_addr;
+};
+
+// IPv6 address
+class in6_addr {
+    U8      s6_addr[16];
+};
+
+// Socket address (generic)
+class sockaddr {
+    U16     sa_family;
+    U8      sa_data[14];
+};
+
+// IPv4 socket address
+class sockaddr_in {
+    U16     sin_family;     // AF_INET
+    U16     sin_port;       // Port (network byte order)
+    in_addr sin_addr;       // IPv4 address
+    U8      sin_zero[8];    // Padding
+};
+
+// IPv6 socket address
+class sockaddr_in6 {
+    U16     sin6_family;    // AF_INET6
+    U16     sin6_port;      // Port
+    U32     sin6_flowinfo;  // Flow info
+    in6_addr sin6_addr;     // IPv6 address
+    U32     sin6_scope_id;  // Scope ID
+};
+
+// Storage for any address type
+class sockaddr_storage {
+    U16     ss_family;
+    U8      __ss_padding[126];
+};
+
+// ============================================================================
+// HOST ENTRY STRUCTURE
+// ============================================================================
+
+#define HOSTENT_MAX_ADDRS   16
+#define HOSTENT_MAX_ALIASES 8
+
+class hostent {
+    U8      *h_name;            // Official name
+    U8      **h_aliases;        // Alias list
+    I64     h_addrtype;         // Address type (AF_INET or AF_INET6)
+    I64     h_length;           // Address length
+    U8      **h_addr_list;      // List of addresses
+};
+
+#define h_addr  h_addr_list[0]  // First address (backward compat)
+
+// Static storage for hostent
+U8 _hostent_name[DNS_MAX_NAME];
+U8 *_hostent_aliases[HOSTENT_MAX_ALIASES + 1];
+U8 *_hostent_addrs[HOSTENT_MAX_ADDRS + 1];
+U8 _hostent_addr_data[HOSTENT_MAX_ADDRS * 16];  // Room for IPv6
+hostent _hostent_storage;
+
+// ============================================================================
+// ADDRINFO STRUCTURE
+// ============================================================================
+
+class addrinfo {
+    I64             ai_flags;       // Input flags
+    I64             ai_family;      // Address family
+    I64             ai_socktype;    // Socket type
+    I64             ai_protocol;    // Protocol
+    I64             ai_addrlen;     // Address length
+    sockaddr        *ai_addr;       // Socket address
+    U8              *ai_canonname;  // Canonical name
+    addrinfo        *ai_next;       // Next in list
+};
+
+// addrinfo flags
+#define AI_PASSIVE      0x0001  // For binding
+#define AI_CANONNAME    0x0002  // Return canonical name
+#define AI_NUMERICHOST  0x0004  // Numeric host string
+#define AI_NUMERICSERV  0x0400  // Numeric service string
+#define AI_V4MAPPED     0x0008  // Map IPv4 to IPv6
+#define AI_ALL          0x0010  // Return all addresses
+#define AI_ADDRCONFIG   0x0020  // Only if configured
+
+// ============================================================================
+// SERVICE ENTRY
+// ============================================================================
+
+class servent {
+    U8      *s_name;        // Official name
+    U8      **s_aliases;    // Alias list
+    I64     s_port;         // Port number (network byte order)
+    U8      *s_proto;       // Protocol
+};
+
+// ============================================================================
+// ERROR CODES
+// ============================================================================
+
+#define EAI_AGAIN       -3      // Temporary failure
+#define EAI_BADFLAGS    -1      // Invalid flags
+#define EAI_FAIL        -4      // Non-recoverable failure
+#define EAI_FAMILY      -6      // Address family not supported
+#define EAI_MEMORY      -10     // Memory allocation failure
+#define EAI_NODATA      -5      // No address associated
+#define EAI_NONAME      -2      // Name or service not known
+#define EAI_SERVICE     -8      // Service not supported
+#define EAI_SOCKTYPE    -7      // Socket type not supported
+#define EAI_SYSTEM      -11     // System error (check errno)
+
+I64 h_errno = 0;
+
+#define HOST_NOT_FOUND  1
+#define TRY_AGAIN       2
+#define NO_RECOVERY     3
+#define NO_DATA         4
+
+// ============================================================================
+// DNS SERVER CONFIGURATION
+// ============================================================================
+
+#define DNS_MAX_SERVERS     4
+
+U32 dns_servers[DNS_MAX_SERVERS] = {
+    0x08080808,     // 8.8.8.8 (Google)
+    0x08080404,     // 8.8.4.4 (Google)
+    0x01010101,     // 1.1.1.1 (Cloudflare)
+    0x01000001      // 1.0.0.1 (Cloudflare)
+};
+I64 dns_server_count = 4;
+
+// ============================================================================
+// BYTE ORDER FUNCTIONS
+// ============================================================================
+
+U16 htons(U16 x)
+{
+    return ((x & 0xFF) << 8) | ((x >> 8) & 0xFF);
+}
+
+U16 ntohs(U16 x)
+{
+    return htons(x);
+}
+
+U32 htonl(U32 x)
+{
+    return ((x & 0xFF) << 24) |
+           ((x & 0xFF00) << 8) |
+           ((x >> 8) & 0xFF00) |
+           ((x >> 24) & 0xFF);
+}
+
+U32 ntohl(U32 x)
+{
+    return htonl(x);
+}
+
+// ============================================================================
+// IP ADDRESS CONVERSION
+// ============================================================================
+
+// Convert dotted-decimal to network address
+I64 inet_aton(U8 *cp, in_addr *inp)
+{
+    U32 parts[4];
+    I64 i = 0;
+    U8 *p = cp;
+
+    for (i = 0; i < 4; i++) {
+        parts[i] = 0;
+        while (*p >= '0' && *p <= '9') {
+            parts[i] = parts[i] * 10 + (*p - '0');
+            p++;
+        }
+        if (i < 3) {
+            if (*p != '.')
+                return 0;
+            p++;
+        }
+    }
+
+    inp->s_addr = (parts[0]) | (parts[1] << 8) | (parts[2] << 16) | (parts[3] << 24);
+    return 1;
+}
+
+U32 inet_addr(U8 *cp)
+{
+    in_addr addr;
+    if (inet_aton(cp, &addr))
+        return addr.s_addr;
+    return 0xFFFFFFFF;
+}
+
+// Convert network address to dotted-decimal
+U8 *inet_ntoa(in_addr in)
+{
+    static U8 buf[16];
+    U32 a = in.s_addr;
+    snprintf(buf, 16, "%d.%d.%d.%d",
+             a & 0xFF, (a >> 8) & 0xFF, (a >> 16) & 0xFF, (a >> 24) & 0xFF);
+    return buf;
+}
+
+// Generic conversion
+U8 *inet_ntop(I64 af, void *src, U8 *dst, I64 size)
+{
+    if (af == AF_INET) {
+        in_addr *addr = src;
+        U32 a = addr->s_addr;
+        snprintf(dst, size, "%d.%d.%d.%d",
+                 a & 0xFF, (a >> 8) & 0xFF, (a >> 16) & 0xFF, (a >> 24) & 0xFF);
+        return dst;
+    }
+    // TODO: AF_INET6
+    return NULL;
+}
+
+I64 inet_pton(I64 af, U8 *src, void *dst)
+{
+    if (af == AF_INET) {
+        return inet_aton(src, dst);
+    }
+    // TODO: AF_INET6
+    return -1;
+}
+
+// ============================================================================
+// DNS QUERY BUILDING
+// ============================================================================
+
+// Encode domain name in DNS format
+I64 dns_encode_name(U8 *name, U8 *buf)
+{
+    U8 *p = buf;
+    U8 *label_len = p++;
+    I64 len = 0;
+
+    while (*name) {
+        if (*name == '.') {
+            *label_len = len;
+            label_len = p++;
+            len = 0;
+        } else {
+            *p++ = *name;
+            len++;
+        }
+        name++;
+    }
+    *label_len = len;
+    *p++ = 0;  // Root label
+
+    return p - buf;
+}
+
+// Decode domain name from DNS response
+I64 dns_decode_name(U8 *packet, U8 *ptr, U8 *name, I64 max_len)
+{
+    U8 *start = ptr;
+    I64 name_len = 0;
+    Bool jumped = FALSE;
+    I64 bytes_read = 0;
+
+    while (*ptr && name_len < max_len - 1) {
+        if ((*ptr & 0xC0) == 0xC0) {
+            // Pointer (compression)
+            if (!jumped) {
+                bytes_read = ptr - start + 2;
+                jumped = TRUE;
+            }
+            U16 offset = ((*ptr & 0x3F) << 8) | *(ptr + 1);
+            ptr = packet + offset;
+        } else {
+            I64 label_len = *ptr++;
+            if (label_len == 0)
+                break;
+
+            if (name_len > 0)
+                name[name_len++] = '.';
+
+            while (label_len-- > 0 && name_len < max_len - 1)
+                name[name_len++] = *ptr++;
+        }
+    }
+
+    name[name_len] = 0;
+
+    if (!jumped)
+        bytes_read = ptr - start + 1;
+
+    return bytes_read;
+}
+
+// Build DNS query packet
+I64 dns_build_query(U8 *buf, U8 *name, U16 type, U16 id)
+{
+    CDNSHeader *hdr = buf(CDNSHeader*);
+    U8 *p = buf + sizeof(CDNSHeader);
+
+    // Header
+    hdr->id = htons(id);
+    hdr->flags = htons(0x0100);  // Standard query, recursion desired
+    hdr->qdcount = htons(1);
+    hdr->ancount = 0;
+    hdr->nscount = 0;
+    hdr->arcount = 0;
+
+    // Question
+    p += dns_encode_name(name, p);
+
+    // Type and class
+    *(U16*)p = htons(type);
+    p += 2;
+    *(U16*)p = htons(DNS_CLASS_IN);
+    p += 2;
+
+    return p - buf;
+}
+
+// ============================================================================
+// DNS RESOLUTION
+// ============================================================================
+
+// Perform DNS query
+I64 dns_query(U8 *name, U16 type, U8 *response, I64 *resp_len)
+{
+    U8 query[DNS_MAX_PACKET];
+    U16 id = RandU16();
+
+    // Build query
+    I64 query_len = dns_build_query(query, name, type, id);
+
+    // Try each DNS server
+    for (I64 server = 0; server < dns_server_count; server++) {
+        for (I64 retry = 0; retry < DNS_MAX_RETRIES; retry++) {
+            // Create UDP socket
+            I64 sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+            if (sock < 0)
+                continue;
+
+            // Set up server address
+            sockaddr_in server_addr;
+            server_addr.sin_family = AF_INET;
+            server_addr.sin_port = htons(DNS_PORT);
+            server_addr.sin_addr.s_addr = dns_servers[server];
+
+            // Send query
+            I64 sent = sendto(sock, query, query_len, 0,
+                              &server_addr(sockaddr*), sizeof(sockaddr_in));
+            if (sent != query_len) {
+                close(sock);
+                continue;
+            }
+
+            // Wait for response with timeout
+            pollfd pfd;
+            pfd.fd = sock;
+            pfd.events = POLLIN;
+            pfd.revents = 0;
+
+            I64 ret = poll(&pfd, 1, DNS_TIMEOUT_MS);
+            if (ret <= 0) {
+                close(sock);
+                continue;
+            }
+
+            // Receive response
+            sockaddr_in from_addr;
+            I64 from_len = sizeof(sockaddr_in);
+            I64 received = recvfrom(sock, response, DNS_MAX_PACKET, 0,
+                                    &from_addr(sockaddr*), &from_len);
+            close(sock);
+
+            if (received < sizeof(CDNSHeader))
+                continue;
+
+            // Verify response
+            CDNSHeader *resp_hdr = response(CDNSHeader*);
+            if (ntohs(resp_hdr->id) != id)
+                continue;
+
+            U16 flags = ntohs(resp_hdr->flags);
+            if ((flags & 0x8000) == 0)  // Not a response
+                continue;
+
+            if ((flags & 0x000F) != DNS_RCODE_OK) {
+                // Error response
+                if ((flags & 0x000F) == DNS_RCODE_NXDOMAIN)
+                    return -HOST_NOT_FOUND;
+                continue;
+            }
+
+            *resp_len = received;
+            return 0;
+        }
+    }
+
+    return -TRY_AGAIN;
+}
+
+// Parse DNS response and extract addresses
+I64 dns_parse_response(U8 *response, I64 resp_len, U32 *addrs, I64 max_addrs)
+{
+    CDNSHeader *hdr = response(CDNSHeader*);
+    U8 *p = response + sizeof(CDNSHeader);
+    I64 addr_count = 0;
+
+    U16 qdcount = ntohs(hdr->qdcount);
+    U16 ancount = ntohs(hdr->ancount);
+
+    // Skip questions
+    for (I64 i = 0; i < qdcount; i++) {
+        U8 name[DNS_MAX_NAME];
+        p += dns_decode_name(response, p, name, DNS_MAX_NAME);
+        p += 4;  // Type and class
+    }
+
+    // Parse answers
+    for (I64 i = 0; i < ancount && addr_count < max_addrs; i++) {
+        U8 name[DNS_MAX_NAME];
+        p += dns_decode_name(response, p, name, DNS_MAX_NAME);
+
+        U16 type = ntohs(*(U16*)p);
+        p += 2;
+        U16 class_ = ntohs(*(U16*)p);
+        p += 2;
+        U32 ttl = ntohl(*(U32*)p);
+        p += 4;
+        U16 rdlength = ntohs(*(U16*)p);
+        p += 2;
+
+        if (type == DNS_TYPE_A && class_ == DNS_CLASS_IN && rdlength == 4) {
+            addrs[addr_count++] = *(U32*)p;
+        }
+
+        p += rdlength;
+    }
+
+    return addr_count;
+}
+
+// ============================================================================
+// GETHOSTBYNAME
+// ============================================================================
+
+hostent *gethostbyname(U8 *name)
+{
+    // Check for numeric address
+    in_addr addr;
+    if (inet_aton(name, &addr)) {
+        _hostent_storage.h_name = _hostent_name;
+        StrCpy(_hostent_name, name);
+        _hostent_storage.h_aliases = _hostent_aliases;
+        _hostent_aliases[0] = NULL;
+        _hostent_storage.h_addrtype = AF_INET;
+        _hostent_storage.h_length = 4;
+        _hostent_storage.h_addr_list = _hostent_addrs;
+        *(U32*)_hostent_addr_data = addr.s_addr;
+        _hostent_addrs[0] = _hostent_addr_data;
+        _hostent_addrs[1] = NULL;
+        return &_hostent_storage;
+    }
+
+    // DNS query
+    U8 response[DNS_MAX_PACKET];
+    I64 resp_len;
+
+    I64 ret = dns_query(name, DNS_TYPE_A, response, &resp_len);
+    if (ret < 0) {
+        h_errno = -ret;
+        return NULL;
+    }
+
+    // Parse response
+    U32 addrs[HOSTENT_MAX_ADDRS];
+    I64 addr_count = dns_parse_response(response, resp_len, addrs, HOSTENT_MAX_ADDRS);
+
+    if (addr_count == 0) {
+        h_errno = NO_DATA;
+        return NULL;
+    }
+
+    // Fill hostent
+    _hostent_storage.h_name = _hostent_name;
+    StrCpy(_hostent_name, name);
+    _hostent_storage.h_aliases = _hostent_aliases;
+    _hostent_aliases[0] = NULL;
+    _hostent_storage.h_addrtype = AF_INET;
+    _hostent_storage.h_length = 4;
+    _hostent_storage.h_addr_list = _hostent_addrs;
+
+    for (I64 i = 0; i < addr_count; i++) {
+        *(U32*)(_hostent_addr_data + i * 4) = addrs[i];
+        _hostent_addrs[i] = _hostent_addr_data + i * 4;
+    }
+    _hostent_addrs[addr_count] = NULL;
+
+    return &_hostent_storage;
+}
+
+hostent *gethostbyname2(U8 *name, I64 af)
+{
+    if (af == AF_INET)
+        return gethostbyname(name);
+    // TODO: AF_INET6
+    h_errno = NO_DATA;
+    return NULL;
+}
+
+// Thread-safe version
+I64 gethostbyname_r(U8 *name, hostent *ret, U8 *buf, I64 buflen,
+                    hostent **result, I64 *h_errnop)
+{
+    hostent *h = gethostbyname(name);
+    if (!h) {
+        *result = NULL;
+        *h_errnop = h_errno;
+        return -1;
+    }
+
+    // Copy to provided buffer
+    MemCpy(ret, h, sizeof(hostent));
+    *result = ret;
+    *h_errnop = 0;
+    return 0;
+}
+
+// ============================================================================
+// GETADDRINFO
+// ============================================================================
+
+U0 freeaddrinfo(addrinfo *ai)
+{
+    while (ai) {
+        addrinfo *next = ai->ai_next;
+        if (ai->ai_addr)
+            Free(ai->ai_addr);
+        if (ai->ai_canonname)
+            Free(ai->ai_canonname);
+        Free(ai);
+        ai = next;
+    }
+}
+
+I64 getaddrinfo(U8 *node, U8 *service, addrinfo *hints, addrinfo **res)
+{
+    *res = NULL;
+
+    // Get port number
+    U16 port = 0;
+    if (service) {
+        port = atoi(service);
+        if (port == 0) {
+            // Try to look up service name
+            servent *se = getservbyname(service, NULL);
+            if (se)
+                port = ntohs(se->s_port);
+        }
+    }
+
+    // Determine family
+    I64 family = AF_UNSPEC;
+    I64 socktype = 0;
+    I64 protocol = 0;
+    I64 flags = 0;
+
+    if (hints) {
+        family = hints->ai_family;
+        socktype = hints->ai_socktype;
+        protocol = hints->ai_protocol;
+        flags = hints->ai_flags;
+    }
+
+    // Handle numeric host
+    if (flags & AI_NUMERICHOST) {
+        in_addr addr;
+        if (!inet_aton(node, &addr))
+            return EAI_NONAME;
+
+        addrinfo *ai = MAlloc(sizeof(addrinfo));
+        if (!ai)
+            return EAI_MEMORY;
+
+        MemSet(ai, 0, sizeof(addrinfo));
+        ai->ai_family = AF_INET;
+        ai->ai_socktype = socktype ? socktype : SOCK_STREAM;
+        ai->ai_protocol = protocol;
+        ai->ai_addrlen = sizeof(sockaddr_in);
+
+        sockaddr_in *sa = MAlloc(sizeof(sockaddr_in));
+        if (!sa) {
+            Free(ai);
+            return EAI_MEMORY;
+        }
+        MemSet(sa, 0, sizeof(sockaddr_in));
+        sa->sin_family = AF_INET;
+        sa->sin_port = htons(port);
+        sa->sin_addr = addr;
+        ai->ai_addr = sa(sockaddr*);
+
+        *res = ai;
+        return 0;
+    }
+
+    // Handle NULL node (for binding)
+    if (!node) {
+        if (!(flags & AI_PASSIVE))
+            return EAI_NONAME;
+
+        addrinfo *ai = MAlloc(sizeof(addrinfo));
+        if (!ai)
+            return EAI_MEMORY;
+
+        MemSet(ai, 0, sizeof(addrinfo));
+        ai->ai_family = (family == AF_UNSPEC) ? AF_INET : family;
+        ai->ai_socktype = socktype ? socktype : SOCK_STREAM;
+        ai->ai_protocol = protocol;
+        ai->ai_addrlen = sizeof(sockaddr_in);
+
+        sockaddr_in *sa = MAlloc(sizeof(sockaddr_in));
+        if (!sa) {
+            Free(ai);
+            return EAI_MEMORY;
+        }
+        MemSet(sa, 0, sizeof(sockaddr_in));
+        sa->sin_family = AF_INET;
+        sa->sin_port = htons(port);
+        sa->sin_addr.s_addr = 0;  // INADDR_ANY
+        ai->ai_addr = sa(sockaddr*);
+
+        *res = ai;
+        return 0;
+    }
+
+    // DNS lookup
+    hostent *h = gethostbyname(node);
+    if (!h) {
+        switch (h_errno) {
+            case HOST_NOT_FOUND:
+                return EAI_NONAME;
+            case TRY_AGAIN:
+                return EAI_AGAIN;
+            case NO_RECOVERY:
+                return EAI_FAIL;
+            case NO_DATA:
+                return EAI_NODATA;
+            default:
+                return EAI_FAIL;
+        }
+    }
+
+    // Build result list
+    addrinfo *head = NULL;
+    addrinfo *tail = NULL;
+
+    for (I64 i = 0; h->h_addr_list[i]; i++) {
+        addrinfo *ai = MAlloc(sizeof(addrinfo));
+        if (!ai) {
+            freeaddrinfo(head);
+            return EAI_MEMORY;
+        }
+
+        MemSet(ai, 0, sizeof(addrinfo));
+        ai->ai_family = AF_INET;
+        ai->ai_socktype = socktype ? socktype : SOCK_STREAM;
+        ai->ai_protocol = protocol;
+        ai->ai_addrlen = sizeof(sockaddr_in);
+
+        sockaddr_in *sa = MAlloc(sizeof(sockaddr_in));
+        if (!sa) {
+            Free(ai);
+            freeaddrinfo(head);
+            return EAI_MEMORY;
+        }
+        MemSet(sa, 0, sizeof(sockaddr_in));
+        sa->sin_family = AF_INET;
+        sa->sin_port = htons(port);
+        MemCpy(&sa->sin_addr, h->h_addr_list[i], 4);
+        ai->ai_addr = sa(sockaddr*);
+
+        if (flags & AI_CANONNAME && i == 0)
+            ai->ai_canonname = StrNew(h->h_name);
+
+        if (tail)
+            tail->ai_next = ai;
+        else
+            head = ai;
+        tail = ai;
+    }
+
+    *res = head;
+    return 0;
+}
+
+U8 *gai_strerror(I64 errcode)
+{
+    switch (errcode) {
+        case 0:             return "Success";
+        case EAI_AGAIN:     return "Temporary failure in name resolution";
+        case EAI_BADFLAGS:  return "Invalid value for ai_flags";
+        case EAI_FAIL:      return "Non-recoverable failure in name resolution";
+        case EAI_FAMILY:    return "ai_family not supported";
+        case EAI_MEMORY:    return "Memory allocation failure";
+        case EAI_NODATA:    return "No address associated with hostname";
+        case EAI_NONAME:    return "Name or service not known";
+        case EAI_SERVICE:   return "Servname not supported for ai_socktype";
+        case EAI_SOCKTYPE:  return "ai_socktype not supported";
+        case EAI_SYSTEM:    return "System error";
+        default:            return "Unknown error";
+    }
+}
+
+// ============================================================================
+// SERVICE LOOKUP
+// ============================================================================
+
+// Common services
+class CServiceEntry {
+    U8      *name;
+    U16     port;
+    U8      *proto;
+};
+
+CServiceEntry common_services[] = {
+    {"ftp",     21,     "tcp"},
+    {"ssh",     22,     "tcp"},
+    {"telnet",  23,     "tcp"},
+    {"smtp",    25,     "tcp"},
+    {"dns",     53,     "udp"},
+    {"http",    80,     "tcp"},
+    {"pop3",    110,    "tcp"},
+    {"imap",    143,    "tcp"},
+    {"https",   443,    "tcp"},
+    {"smtps",   465,    "tcp"},
+    {"imaps",   993,    "tcp"},
+    {"pop3s",   995,    "tcp"},
+    {NULL,      0,      NULL}
+};
+
+servent _servent_storage;
+
+servent *getservbyname(U8 *name, U8 *proto)
+{
+    for (I64 i = 0; common_services[i].name; i++) {
+        if (strcmp(name, common_services[i].name) == 0) {
+            if (!proto || strcmp(proto, common_services[i].proto) == 0) {
+                _servent_storage.s_name = common_services[i].name;
+                _servent_storage.s_aliases = NULL;
+                _servent_storage.s_port = htons(common_services[i].port);
+                _servent_storage.s_proto = common_services[i].proto;
+                return &_servent_storage;
+            }
+        }
+    }
+    return NULL;
+}
+
+servent *getservbyport(I64 port, U8 *proto)
+{
+    U16 p = ntohs(port);
+    for (I64 i = 0; common_services[i].name; i++) {
+        if (common_services[i].port == p) {
+            if (!proto || strcmp(proto, common_services[i].proto) == 0) {
+                _servent_storage.s_name = common_services[i].name;
+                _servent_storage.s_aliases = NULL;
+                _servent_storage.s_port = port;
+                _servent_storage.s_proto = common_services[i].proto;
+                return &_servent_storage;
+            }
+        }
+    }
+    return NULL;
+}
+
+// ============================================================================
+// INITIALIZATION
+// ============================================================================
+
+"netdb loaded - DNS resolution and network database for ZealOS\n";

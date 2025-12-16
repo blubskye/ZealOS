@@ -1,0 +1,241 @@
+// wc.ZC - GNU coreutils 'wc' implementation
+// Print newline, word, and byte counts for each file
+
+// C-style main function
+I64 wc_main(I64 argc, U8 **argv)
+{
+    Bool print_lines = FALSE;
+    Bool print_words = FALSE;
+    Bool print_chars = FALSE;
+    Bool print_bytes = FALSE;
+    Bool print_max_line = FALSE;
+    Bool explicit_opts = FALSE;
+    I64 start = 1;
+
+    // Parse options
+    while (start < argc && argv[start][0] == '-' && argv[start][1]) {
+        U8 *arg = argv[start];
+
+        if (strcmp(arg, "--help") == 0) {
+            printf("Usage: wc [OPTION]... [FILE]...\n");
+            printf("Print newline, word, and byte counts for each FILE.\n");
+            printf("A word is a non-zero-length sequence of characters delimited by white space.\n\n");
+            printf("With no FILE, or when FILE is -, read standard input.\n\n");
+            printf("  -c, --bytes            print the byte counts\n");
+            printf("  -m, --chars            print the character counts\n");
+            printf("  -l, --lines            print the newline counts\n");
+            printf("  -L, --max-line-length  print the maximum display width\n");
+            printf("  -w, --words            print the word counts\n");
+            printf("      --help             display this help and exit\n");
+            printf("      --version          output version information and exit\n");
+            return 0;
+        }
+
+        if (strcmp(arg, "--version") == 0) {
+            printf("wc (ZealOS coreutils) 1.0\n");
+            return 0;
+        }
+
+        if (strcmp(arg, "--bytes") == 0) {
+            print_bytes = TRUE;
+            explicit_opts = TRUE;
+            start++;
+            continue;
+        }
+        if (strcmp(arg, "--chars") == 0) {
+            print_chars = TRUE;
+            explicit_opts = TRUE;
+            start++;
+            continue;
+        }
+        if (strcmp(arg, "--lines") == 0) {
+            print_lines = TRUE;
+            explicit_opts = TRUE;
+            start++;
+            continue;
+        }
+        if (strcmp(arg, "--words") == 0) {
+            print_words = TRUE;
+            explicit_opts = TRUE;
+            start++;
+            continue;
+        }
+        if (strcmp(arg, "--max-line-length") == 0) {
+            print_max_line = TRUE;
+            explicit_opts = TRUE;
+            start++;
+            continue;
+        }
+
+        // Short options
+        if (arg[0] == '-' && arg[1] != '-') {
+            for (I64 i = 1; arg[i]; i++) {
+                switch (arg[i]) {
+                    case 'c':
+                        print_bytes = TRUE;
+                        explicit_opts = TRUE;
+                        break;
+                    case 'm':
+                        print_chars = TRUE;
+                        explicit_opts = TRUE;
+                        break;
+                    case 'l':
+                        print_lines = TRUE;
+                        explicit_opts = TRUE;
+                        break;
+                    case 'L':
+                        print_max_line = TRUE;
+                        explicit_opts = TRUE;
+                        break;
+                    case 'w':
+                        print_words = TRUE;
+                        explicit_opts = TRUE;
+                        break;
+                    default:
+                        fprintf(stderr, "wc: invalid option -- '%c'\n", arg[i]);
+                        return 1;
+                }
+            }
+            start++;
+            continue;
+        }
+
+        if (strcmp(arg, "--") == 0) {
+            start++;
+            break;
+        }
+
+        break;
+    }
+
+    // Default: print lines, words, bytes
+    if (!explicit_opts) {
+        print_lines = TRUE;
+        print_words = TRUE;
+        print_bytes = TRUE;
+    }
+
+    // Totals
+    I64 total_lines = 0;
+    I64 total_words = 0;
+    I64 total_bytes = 0;
+    I64 total_chars = 0;
+    I64 total_max_line = 0;
+
+    I64 file_count = argc - start;
+    if (file_count == 0)
+        file_count = 1;
+
+    // Process a single file
+    auto wc_file = [](FILE *fp, I64 *lines, I64 *words, I64 *bytes, I64 *chars, I64 *max_line) {
+        I64 c;
+        Bool in_word = FALSE;
+        I64 line_len = 0;
+
+        *lines = 0;
+        *words = 0;
+        *bytes = 0;
+        *chars = 0;
+        *max_line = 0;
+
+        while ((c = fgetc(fp)) != EOF) {
+            (*bytes)++;
+            (*chars)++;  // Assuming ASCII, chars == bytes
+
+            if (c == '\n') {
+                (*lines)++;
+                if (*max_line < line_len)
+                    *max_line = line_len;
+                line_len = 0;
+            } else {
+                line_len++;
+            }
+
+            if (isspace(c)) {
+                in_word = FALSE;
+            } else {
+                if (!in_word) {
+                    (*words)++;
+                    in_word = TRUE;
+                }
+            }
+        }
+
+        // Handle last line without newline
+        if (line_len > 0 && *max_line < line_len)
+            *max_line = line_len;
+    };
+
+    // Print results for one file
+    auto print_counts = [](I64 lines, I64 words, I64 bytes, I64 chars, I64 max_line,
+                           Bool pl, Bool pw, Bool pb, Bool pc, Bool pm, U8 *name) {
+        if (pl) printf("%7d ", lines);
+        if (pw) printf("%7d ", words);
+        if (pb) printf("%7d ", bytes);
+        if (pc) printf("%7d ", chars);
+        if (pm) printf("%7d ", max_line);
+        if (name)
+            printf("%s", name);
+        printf("\n");
+    };
+
+    I64 exit_status = 0;
+
+    if (start >= argc) {
+        // Read from stdin
+        I64 lines, words, bytes, chars, max_line;
+        wc_file(stdin, &lines, &words, &bytes, &chars, &max_line);
+        print_counts(lines, words, bytes, chars, max_line,
+                    print_lines, print_words, print_bytes, print_chars, print_max_line,
+                    NULL);
+    } else {
+        for (I64 i = start; i < argc; i++) {
+            FILE *fp;
+            U8 *name = argv[i];
+
+            if (strcmp(name, "-") == 0) {
+                fp = stdin;
+                name = NULL;
+            } else {
+                fp = fopen(name, "r");
+                if (!fp) {
+                    fprintf(stderr, "wc: %s: %s\n", name, strerror(errno));
+                    exit_status = 1;
+                    continue;
+                }
+            }
+
+            I64 lines, words, bytes, chars, max_line;
+            wc_file(fp, &lines, &words, &bytes, &chars, &max_line);
+
+            print_counts(lines, words, bytes, chars, max_line,
+                        print_lines, print_words, print_bytes, print_chars, print_max_line,
+                        argv[i]);
+
+            total_lines += lines;
+            total_words += words;
+            total_bytes += bytes;
+            total_chars += chars;
+            if (total_max_line < max_line)
+                total_max_line = max_line;
+
+            if (fp != stdin)
+                fclose(fp);
+        }
+
+        // Print totals if more than one file
+        if (argc - start > 1) {
+            print_counts(total_lines, total_words, total_bytes, total_chars, total_max_line,
+                        print_lines, print_words, print_bytes, print_chars, print_max_line,
+                        "total");
+        }
+    }
+
+    return exit_status;
+}
+
+// Register as a utility
+U0 GnuWcRegister()
+{
+    "GNU 'wc' utility loaded. Run: CRun(&wc_main, \"wc file.txt\");\n";
+}

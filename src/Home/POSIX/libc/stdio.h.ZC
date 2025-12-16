@@ -1,0 +1,625 @@
+// stdio.h - Standard I/O for ZealOS libc
+// Provides FILE* abstraction over POSIX file descriptors
+
+#ifndef _STDIO_H
+#define _STDIO_H
+
+#include "stddef.h"
+#include "stdarg.h"
+
+// Buffer size
+#define BUFSIZ          4096
+
+// End of file
+#define EOF             (-1)
+
+// Seek constants
+#define SEEK_SET        0
+#define SEEK_CUR        1
+#define SEEK_END        2
+
+// fopen modes
+#define _IOFBF          0   // Fully buffered
+#define _IOLBF          1   // Line buffered
+#define _IONBF          2   // Unbuffered
+
+// File flags
+#define _FILE_READ      0x01
+#define _FILE_WRITE     0x02
+#define _FILE_APPEND    0x04
+#define _FILE_BINARY    0x08
+#define _FILE_EOF       0x10
+#define _FILE_ERROR     0x20
+#define _FILE_MYBUF     0x40    // We allocated the buffer
+
+// Maximum open files
+#define FOPEN_MAX       1024
+#define FILENAME_MAX    4096
+
+// ============================================================================
+// FILE STRUCTURE
+// ============================================================================
+
+class FILE {
+    I64     fd;             // Underlying POSIX file descriptor
+    U8      *buf;           // I/O buffer
+    I64     buf_size;       // Buffer size
+    I64     buf_pos;        // Current position in buffer
+    I64     buf_len;        // Valid bytes in buffer (for read)
+    U8      mode;           // _FILE_READ, _FILE_WRITE, etc.
+    U8      buf_mode;       // _IOFBF, _IOLBF, _IONBF
+    U8      flags;          // EOF, error flags
+    U8      ungetc_buf;     // For ungetc
+    Bool    has_ungetc;     // ungetc was called
+};
+
+// ============================================================================
+// STANDARD STREAMS
+// ============================================================================
+
+// Pre-allocated FILE structures for stdin, stdout, stderr
+static FILE _stdin_file = {0, NULL, 0, 0, 0, _FILE_READ, _IOLBF, 0, 0, FALSE};
+static FILE _stdout_file = {1, NULL, 0, 0, 0, _FILE_WRITE, _IOLBF, 0, 0, FALSE};
+static FILE _stderr_file = {2, NULL, 0, 0, 0, _FILE_WRITE, _IONBF, 0, 0, FALSE};
+
+FILE *stdin = &_stdin_file;
+FILE *stdout = &_stdout_file;
+FILE *stderr = &_stderr_file;
+
+// ============================================================================
+// FILE OPENING/CLOSING
+// ============================================================================
+
+FILE *fopen(U8 *path, U8 *mode)
+{
+    FILE *fp;
+    I64 flags = 0;
+    I64 fd_mode = 0;
+
+    // Parse mode string
+    U8 first = mode[0];
+    Bool plus = (mode[1] == '+') || (mode[1] && mode[2] == '+');
+    Bool binary = strchr(mode, 'b') != NULL;
+
+    switch (first) {
+        case 'r':
+            flags = _FILE_READ;
+            fd_mode = plus ? O_RDWR : O_RDONLY;
+            break;
+        case 'w':
+            flags = _FILE_WRITE;
+            fd_mode = (plus ? O_RDWR : O_WRONLY) | O_CREAT | O_TRUNC;
+            break;
+        case 'a':
+            flags = _FILE_WRITE | _FILE_APPEND;
+            fd_mode = (plus ? O_RDWR : O_WRONLY) | O_CREAT | O_APPEND;
+            break;
+        default:
+            return NULL;
+    }
+
+    if (plus)
+        flags |= _FILE_READ | _FILE_WRITE;
+    if (binary)
+        flags |= _FILE_BINARY;
+
+    I64 fd = PosixOpen(path, fd_mode, 0666);
+    if (fd < 0)
+        return NULL;
+
+    fp = MAlloc(sizeof(FILE));
+    if (!fp) {
+        PosixClose(fd);
+        return NULL;
+    }
+
+    MemSet(fp, 0, sizeof(FILE));
+    fp->fd = fd;
+    fp->mode = flags;
+    fp->buf_mode = _IOFBF;  // Default to fully buffered
+
+    // Allocate buffer
+    fp->buf_size = BUFSIZ;
+    fp->buf = MAlloc(fp->buf_size);
+    if (fp->buf) {
+        fp->flags |= _FILE_MYBUF;
+    } else {
+        fp->buf_mode = _IONBF;
+    }
+
+    return fp;
+}
+
+FILE *freopen(U8 *path, U8 *mode, FILE *stream)
+{
+    if (!stream)
+        return NULL;
+
+    fflush(stream);
+
+    if (stream->fd >= 0)
+        PosixClose(stream->fd);
+
+    if (!path)
+        return NULL;
+
+    FILE *new_fp = fopen(path, mode);
+    if (!new_fp)
+        return NULL;
+
+    // Copy new FILE to old one
+    if (stream->flags & _FILE_MYBUF)
+        Free(stream->buf);
+
+    MemCpy(stream, new_fp, sizeof(FILE));
+    Free(new_fp);
+
+    return stream;
+}
+
+I64 fclose(FILE *stream)
+{
+    if (!stream)
+        return EOF;
+
+    fflush(stream);
+
+    I64 result = 0;
+    if (stream->fd >= 0) {
+        if (PosixClose(stream->fd) < 0)
+            result = EOF;
+    }
+
+    if (stream->flags & _FILE_MYBUF)
+        Free(stream->buf);
+
+    // Don't free stdin/stdout/stderr
+    if (stream != stdin && stream != stdout && stream != stderr)
+        Free(stream);
+
+    return result;
+}
+
+FILE *fdopen(I64 fd, U8 *mode)
+{
+    FILE *fp = MAlloc(sizeof(FILE));
+    if (!fp)
+        return NULL;
+
+    MemSet(fp, 0, sizeof(FILE));
+    fp->fd = fd;
+
+    // Parse mode
+    if (mode[0] == 'r')
+        fp->mode = _FILE_READ;
+    else if (mode[0] == 'w')
+        fp->mode = _FILE_WRITE;
+    else if (mode[0] == 'a')
+        fp->mode = _FILE_WRITE | _FILE_APPEND;
+
+    if (strchr(mode, '+'))
+        fp->mode |= _FILE_READ | _FILE_WRITE;
+
+    fp->buf_mode = _IOFBF;
+    fp->buf_size = BUFSIZ;
+    fp->buf = MAlloc(fp->buf_size);
+    if (fp->buf)
+        fp->flags |= _FILE_MYBUF;
+    else
+        fp->buf_mode = _IONBF;
+
+    return fp;
+}
+
+I64 fileno(FILE *stream)
+{
+    return stream ? stream->fd : -1;
+}
+
+// ============================================================================
+// BUFFERED I/O
+// ============================================================================
+
+I64 fflush(FILE *stream)
+{
+    if (!stream)
+        return 0;  // Flush all streams
+
+    if (!(stream->mode & _FILE_WRITE))
+        return 0;
+
+    if (stream->buf_pos > 0) {
+        I64 written = PosixWrite(stream->fd, stream->buf, stream->buf_pos);
+        if (written < stream->buf_pos) {
+            stream->flags |= _FILE_ERROR;
+            return EOF;
+        }
+        stream->buf_pos = 0;
+    }
+
+    return 0;
+}
+
+U0 setbuf(FILE *stream, U8 *buf)
+{
+    setvbuf(stream, buf, buf ? _IOFBF : _IONBF, BUFSIZ);
+}
+
+I64 setvbuf(FILE *stream, U8 *buf, I64 mode, size_t size)
+{
+    if (!stream)
+        return -1;
+
+    fflush(stream);
+
+    if (stream->flags & _FILE_MYBUF) {
+        Free(stream->buf);
+        stream->flags &= ~_FILE_MYBUF;
+    }
+
+    stream->buf_mode = mode;
+
+    if (mode == _IONBF) {
+        stream->buf = NULL;
+        stream->buf_size = 0;
+    } else if (buf) {
+        stream->buf = buf;
+        stream->buf_size = size;
+    } else {
+        stream->buf = MAlloc(size);
+        stream->buf_size = size;
+        if (stream->buf)
+            stream->flags |= _FILE_MYBUF;
+        else
+            stream->buf_mode = _IONBF;
+    }
+
+    stream->buf_pos = 0;
+    stream->buf_len = 0;
+
+    return 0;
+}
+
+// ============================================================================
+// CHARACTER I/O
+// ============================================================================
+
+I64 fgetc(FILE *stream)
+{
+    if (!stream)
+        return EOF;
+
+    // Check for ungetc character
+    if (stream->has_ungetc) {
+        stream->has_ungetc = FALSE;
+        return stream->ungetc_buf;
+    }
+
+    if (stream->flags & _FILE_EOF)
+        return EOF;
+
+    // Unbuffered read
+    if (stream->buf_mode == _IONBF || !stream->buf) {
+        U8 c;
+        I64 n = PosixRead(stream->fd, &c, 1);
+        if (n <= 0) {
+            stream->flags |= (n < 0) ? _FILE_ERROR : _FILE_EOF;
+            return EOF;
+        }
+        return c;
+    }
+
+    // Buffered read
+    if (stream->buf_pos >= stream->buf_len) {
+        stream->buf_len = PosixRead(stream->fd, stream->buf, stream->buf_size);
+        stream->buf_pos = 0;
+        if (stream->buf_len <= 0) {
+            stream->flags |= (stream->buf_len < 0) ? _FILE_ERROR : _FILE_EOF;
+            return EOF;
+        }
+    }
+
+    return stream->buf[stream->buf_pos++];
+}
+
+I64 getc(FILE *stream)
+{
+    return fgetc(stream);
+}
+
+I64 getchar()
+{
+    return fgetc(stdin);
+}
+
+I64 fputc(I64 c, FILE *stream)
+{
+    if (!stream)
+        return EOF;
+
+    // Unbuffered write
+    if (stream->buf_mode == _IONBF || !stream->buf) {
+        U8 ch = c;
+        if (PosixWrite(stream->fd, &ch, 1) != 1) {
+            stream->flags |= _FILE_ERROR;
+            return EOF;
+        }
+        return c;
+    }
+
+    // Buffered write
+    stream->buf[stream->buf_pos++] = c;
+
+    // Flush if buffer full or line buffered and newline
+    if (stream->buf_pos >= stream->buf_size ||
+        (stream->buf_mode == _IOLBF && c == '\n')) {
+        if (fflush(stream) == EOF)
+            return EOF;
+    }
+
+    return c;
+}
+
+I64 putc(I64 c, FILE *stream)
+{
+    return fputc(c, stream);
+}
+
+I64 putchar(I64 c)
+{
+    return fputc(c, stdout);
+}
+
+I64 ungetc(I64 c, FILE *stream)
+{
+    if (!stream || c == EOF)
+        return EOF;
+    if (stream->has_ungetc)
+        return EOF;  // Can only unget one character
+
+    stream->has_ungetc = TRUE;
+    stream->ungetc_buf = c;
+    stream->flags &= ~_FILE_EOF;
+    return c;
+}
+
+// ============================================================================
+// STRING I/O
+// ============================================================================
+
+U8 *fgets(U8 *s, I64 size, FILE *stream)
+{
+    if (!s || size <= 0 || !stream)
+        return NULL;
+
+    I64 i = 0;
+    while (i < size - 1) {
+        I64 c = fgetc(stream);
+        if (c == EOF) {
+            if (i == 0)
+                return NULL;
+            break;
+        }
+        s[i++] = c;
+        if (c == '\n')
+            break;
+    }
+    s[i] = 0;
+    return s;
+}
+
+I64 fputs(U8 *s, FILE *stream)
+{
+    while (*s) {
+        if (fputc(*s++, stream) == EOF)
+            return EOF;
+    }
+    return 0;
+}
+
+I64 puts(U8 *s)
+{
+    if (fputs(s, stdout) == EOF)
+        return EOF;
+    if (fputc('\n', stdout) == EOF)
+        return EOF;
+    return 0;
+}
+
+// ============================================================================
+// BLOCK I/O
+// ============================================================================
+
+size_t fread(U0 *ptr, size_t size, size_t nmemb, FILE *stream)
+{
+    if (!ptr || !stream || size == 0 || nmemb == 0)
+        return 0;
+
+    size_t total = size * nmemb;
+    size_t count = 0;
+    U8 *p = ptr;
+
+    while (count < total) {
+        I64 c = fgetc(stream);
+        if (c == EOF)
+            break;
+        *p++ = c;
+        count++;
+    }
+
+    return count / size;
+}
+
+size_t fwrite(U0 *ptr, size_t size, size_t nmemb, FILE *stream)
+{
+    if (!ptr || !stream || size == 0 || nmemb == 0)
+        return 0;
+
+    size_t total = size * nmemb;
+    size_t count = 0;
+    U8 *p = ptr;
+
+    while (count < total) {
+        if (fputc(*p++, stream) == EOF)
+            break;
+        count++;
+    }
+
+    return count / size;
+}
+
+// ============================================================================
+// FILE POSITIONING
+// ============================================================================
+
+I64 fseek(FILE *stream, I64 offset, I64 whence)
+{
+    if (!stream)
+        return -1;
+
+    fflush(stream);
+
+    I64 result = PosixLseek(stream->fd, offset, whence);
+    if (result < 0)
+        return -1;
+
+    stream->buf_pos = 0;
+    stream->buf_len = 0;
+    stream->flags &= ~_FILE_EOF;
+    stream->has_ungetc = FALSE;
+
+    return 0;
+}
+
+I64 ftell(FILE *stream)
+{
+    if (!stream)
+        return -1;
+
+    I64 pos = PosixLseek(stream->fd, 0, SEEK_CUR);
+    if (pos < 0)
+        return -1;
+
+    // Adjust for buffering
+    if (stream->mode & _FILE_READ)
+        pos -= (stream->buf_len - stream->buf_pos);
+    else if (stream->mode & _FILE_WRITE)
+        pos += stream->buf_pos;
+
+    if (stream->has_ungetc)
+        pos--;
+
+    return pos;
+}
+
+U0 rewind(FILE *stream)
+{
+    fseek(stream, 0, SEEK_SET);
+    if (stream)
+        stream->flags &= ~_FILE_ERROR;
+}
+
+I64 fgetpos(FILE *stream, I64 *pos)
+{
+    I64 p = ftell(stream);
+    if (p < 0)
+        return -1;
+    *pos = p;
+    return 0;
+}
+
+I64 fsetpos(FILE *stream, I64 *pos)
+{
+    return fseek(stream, *pos, SEEK_SET);
+}
+
+// ============================================================================
+// ERROR HANDLING
+// ============================================================================
+
+I64 feof(FILE *stream)
+{
+    return stream && (stream->flags & _FILE_EOF);
+}
+
+I64 ferror(FILE *stream)
+{
+    return stream && (stream->flags & _FILE_ERROR);
+}
+
+U0 clearerr(FILE *stream)
+{
+    if (stream)
+        stream->flags &= ~(_FILE_EOF | _FILE_ERROR);
+}
+
+U0 perror(U8 *s)
+{
+    if (s && *s) {
+        fputs(s, stderr);
+        fputs(": ", stderr);
+    }
+    fputs(strerror(errno), stderr);
+    fputc('\n', stderr);
+}
+
+// ============================================================================
+// PRINTF FAMILY - Forward declarations (implemented in printf.ZC)
+// ============================================================================
+
+I64 vfprintf(FILE *stream, U8 *format, va_list ap);
+I64 vprintf(U8 *format, va_list ap);
+I64 vsprintf(U8 *str, U8 *format, va_list ap);
+I64 vsnprintf(U8 *str, size_t size, U8 *format, va_list ap);
+
+I64 fprintf(FILE *stream, U8 *format, ...)
+{
+    va_list ap;
+    va_start(ap, format);
+    I64 result = vfprintf(stream, format, ap);
+    va_end(ap);
+    return result;
+}
+
+I64 printf(U8 *format, ...)
+{
+    va_list ap;
+    va_start(ap, format);
+    I64 result = vprintf(format, ap);
+    va_end(ap);
+    return result;
+}
+
+I64 sprintf(U8 *str, U8 *format, ...)
+{
+    va_list ap;
+    va_start(ap, format);
+    I64 result = vsprintf(str, format, ap);
+    va_end(ap);
+    return result;
+}
+
+I64 snprintf(U8 *str, size_t size, U8 *format, ...)
+{
+    va_list ap;
+    va_start(ap, format);
+    I64 result = vsnprintf(str, size, format, ap);
+    va_end(ap);
+    return result;
+}
+
+// ============================================================================
+// REMOVE/RENAME
+// ============================================================================
+
+I64 remove(U8 *path)
+{
+    return PosixUnlink(path);
+}
+
+I64 rename(U8 *oldpath, U8 *newpath)
+{
+    return PosixRename(oldpath, newpath);
+}
+
+#endif // _STDIO_H

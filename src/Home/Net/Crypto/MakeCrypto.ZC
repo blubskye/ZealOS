@@ -1,0 +1,39 @@
+// MakeCrypto.ZC - Crypto module loader for ZealOS TLS
+// Include this file to load all cryptographic primitives
+
+Cd(__DIR__);;
+
+#include "Crypto.HH"
+
+// Hash functions
+#include "SHA256"
+#include "SHA512"
+
+// Message authentication
+#include "HMAC"
+#include "HKDF"
+
+// Block cipher and AEAD
+#include "AES"
+#include "GCM"
+
+// Key exchange
+#include "X25519"
+
+// Random number generation
+#include "Random"
+
+// ASN.1/DER parsing
+#include "ASN1.HH"
+#include "ASN1"
+
+// X.509 certificates
+#include "X509.HH"
+#include "X509"
+
+// ChaCha20-Poly1305 stream cipher and MAC
+#include "ChaCha20"
+#include "Poly1305"
+#include "ChaCha20Poly1305"
+
+NetLog("Crypto module loaded.");

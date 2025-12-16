@@ -1,0 +1,901 @@
+// sed.ZC - GNU 'sed' implementation
+// Stream editor
+
+#define SED_LINE_SIZE 8192
+#define SED_HOLD_SIZE 8192
+#define SED_MAX_CMDS  256
+#define SED_MAX_LABELS 64
+
+// Address types
+#define ADDR_NONE    0
+#define ADDR_LINE    1
+#define ADDR_LAST    2   // $
+#define ADDR_REGEX   3
+#define ADDR_STEP    4   // first~step
+
+// Command types
+#define CMD_PRINT    'p'
+#define CMD_DELETE   'd'
+#define CMD_QUIT     'q'
+#define CMD_SUBST    's'
+#define CMD_APPEND   'a'
+#define CMD_INSERT   'i'
+#define CMD_CHANGE   'c'
+#define CMD_TRANS    'y'
+#define CMD_NEXT     'n'
+#define CMD_NEXT_APP 'N'
+#define CMD_HOLD     'h'
+#define CMD_HOLD_APP 'H'
+#define CMD_GET      'g'
+#define CMD_GET_APP  'G'
+#define CMD_EXCHANGE 'x'
+#define CMD_PRINT_LN '='
+#define CMD_LIST     'l'
+#define CMD_BRANCH   'b'
+#define CMD_TEST     't'
+#define CMD_LABEL    ':'
+#define CMD_READ     'r'
+#define CMD_WRITE    'w'
+#define CMD_BLOCK    '{'  // Block start
+#define CMD_BLOCK_END '}'
+
+class CSedAddr {
+    I64 type;
+    I64 line_num;
+    I64 step;           // For first~step
+    U8 regex[256];
+};
+
+class CSedCmd {
+    CSedAddr addr1;
+    CSedAddr addr2;
+    Bool negated;       // !
+    I64 cmd;
+    U8 arg1[SED_LINE_SIZE];  // Pattern/text/label
+    U8 arg2[SED_LINE_SIZE];  // Replacement
+    U8 flags[32];            // s/// flags
+    I64 block_end;           // For { } blocks
+};
+
+class CSedLabel {
+    U8 name[64];
+    I64 cmd_idx;
+};
+
+class CSedState {
+    CSedCmd cmds[SED_MAX_CMDS];
+    I64 cmd_count;
+
+    CSedLabel labels[SED_MAX_LABELS];
+    I64 label_count;
+
+    U8 pattern[SED_LINE_SIZE];
+    U8 hold[SED_HOLD_SIZE];
+    I64 line_num;
+    Bool subst_success;
+    Bool suppress_default;
+    Bool quit_flag;
+};
+
+// ============================================================================
+// REGEX MATCHING (Simple implementation)
+// ============================================================================
+
+// Match regex pattern against string
+// Returns: start of match or NULL, sets *match_end to end of match
+U8 *SedRegexMatch(U8 *str, U8 *pattern, U8 **match_end, Bool ignore_case)
+{
+    U8 *s = str;
+    U8 *p = pattern;
+    Bool anchored_start = FALSE;
+
+    if (*p == '^') {
+        anchored_start = TRUE;
+        p++;
+    }
+
+    // Check for $ anchor at end
+    I64 plen = strlen(p);
+    Bool anchored_end = (plen > 0 && p[plen-1] == '$');
+    if (anchored_end) plen--;
+
+    // Try match at each position
+    U8 *start_pos = str;
+    do {
+        U8 *sp = start_pos;
+        U8 *pp = p;
+        Bool matched = TRUE;
+
+        while (*pp && (pp - p) < plen) {
+            if (*pp == '.') {
+                // Match any char
+                if (!*sp) { matched = FALSE; break; }
+                sp++;
+                pp++;
+            } else if (*pp == '*') {
+                // Zero or more of previous
+                // Simplified - just skip
+                pp++;
+            } else if (*pp == '[') {
+                // Character class
+                pp++;
+                Bool negated = (*pp == '^');
+                if (negated) pp++;
+
+                Bool found = FALSE;
+                while (*pp && *pp != ']') {
+                    if (*(pp+1) == '-' && *(pp+2) && *(pp+2) != ']') {
+                        // Range
+                        U8 c1 = *pp;
+                        U8 c2 = *(pp+2);
+                        U8 sc = ignore_case ? toupper(*sp) : *sp;
+                        if (ignore_case) { c1 = toupper(c1); c2 = toupper(c2); }
+                        if (sc >= c1 && sc <= c2) found = TRUE;
+                        pp += 3;
+                    } else {
+                        U8 pc = ignore_case ? toupper(*pp) : *pp;
+                        U8 sc = ignore_case ? toupper(*sp) : *sp;
+                        if (sc == pc) found = TRUE;
+                        pp++;
+                    }
+                }
+                if (*pp == ']') pp++;
+
+                if (negated) found = !found;
+                if (!found) { matched = FALSE; break; }
+                sp++;
+            } else if (*pp == '\\' && *(pp+1)) {
+                pp++;
+                U8 pc = *pp;
+                U8 sc = *sp;
+                if (ignore_case) { pc = toupper(pc); sc = toupper(sc); }
+                if (sc != pc) { matched = FALSE; break; }
+                sp++;
+                pp++;
+            } else {
+                U8 pc = *pp;
+                U8 sc = *sp;
+                if (ignore_case) { pc = toupper(pc); sc = toupper(sc); }
+                if (sc != pc) { matched = FALSE; break; }
+                sp++;
+                pp++;
+            }
+        }
+
+        if (matched) {
+            if (anchored_end && *sp != 0) {
+                matched = FALSE;
+            }
+        }
+
+        if (matched) {
+            if (match_end) *match_end = sp;
+            return start_pos;
+        }
+
+        start_pos++;
+    } while (!anchored_start && *start_pos);
+
+    return NULL;
+}
+
+// ============================================================================
+// SUBSTITUTION
+// ============================================================================
+
+I64 SedSubstitute(CSedState *sed, U8 *pattern, U8 *replacement, U8 *flags)
+{
+    Bool global = (strchr(flags, 'g') != NULL);
+    Bool ignore_case = (strchr(flags, 'i') != NULL || strchr(flags, 'I') != NULL);
+    Bool print = (strchr(flags, 'p') != NULL);
+    I64 nth = 0;
+
+    // Check for numeric flag
+    for (U8 *f = flags; *f; f++) {
+        if (isdigit(*f)) {
+            nth = atoi(f);
+            break;
+        }
+    }
+
+    U8 result[SED_LINE_SIZE];
+    U8 *src = sed->pattern;
+    U8 *dst = result;
+    I64 match_count = 0;
+    Bool did_subst = FALSE;
+
+    while (*src && (dst - result) < SED_LINE_SIZE - 256) {
+        U8 *match_end;
+        U8 *match = SedRegexMatch(src, pattern, &match_end, ignore_case);
+
+        if (!match || match != src) {
+            // No match at current position
+            if (match && !global && (nth == 0 || match_count >= nth)) {
+                // Copy up to match
+                while (src < match)
+                    *dst++ = *src++;
+                continue;
+            }
+            *dst++ = *src++;
+            continue;
+        }
+
+        match_count++;
+
+        // Check if we should replace this occurrence
+        Bool do_replace = global || (nth == 0 && match_count == 1) ||
+                          (nth > 0 && match_count == nth);
+
+        if (do_replace) {
+            // Apply replacement
+            U8 *r = replacement;
+            while (*r) {
+                if (*r == '&') {
+                    // Entire match
+                    U8 *m = match;
+                    while (m < match_end)
+                        *dst++ = *m++;
+                } else if (*r == '\\' && isdigit(*(r+1))) {
+                    // Back-reference (simplified - just copy match)
+                    r++;
+                    U8 *m = match;
+                    while (m < match_end)
+                        *dst++ = *m++;
+                } else if (*r == '\\' && *(r+1)) {
+                    r++;
+                    *dst++ = *r;
+                } else {
+                    *dst++ = *r;
+                }
+                r++;
+            }
+            src = match_end;
+            did_subst = TRUE;
+
+            if (!global && (nth == 0 || match_count == nth)) {
+                // Copy rest and stop
+                while (*src)
+                    *dst++ = *src++;
+                break;
+            }
+        } else {
+            // Copy the match unchanged
+            while (src < match_end)
+                *dst++ = *src++;
+        }
+    }
+
+    *dst = 0;
+    strcpy(sed->pattern, result);
+
+    if (did_subst) {
+        sed->subst_success = TRUE;
+        if (print)
+            printf("%s\n", sed->pattern);
+    }
+
+    return did_subst ? 0 : 1;
+}
+
+// ============================================================================
+// TRANSLITERATE (y command)
+// ============================================================================
+
+U0 SedTransliterate(CSedState *sed, U8 *set1, U8 *set2)
+{
+    I64 len1 = strlen(set1);
+    I64 len2 = strlen(set2);
+
+    for (U8 *p = sed->pattern; *p; p++) {
+        for (I64 i = 0; i < len1; i++) {
+            if (*p == set1[i]) {
+                *p = (i < len2) ? set2[i] : set2[len2 - 1];
+                break;
+            }
+        }
+    }
+}
+
+// ============================================================================
+// COMMAND PARSING
+// ============================================================================
+
+// Parse an address
+U8 *SedParseAddr(U8 *p, CSedAddr *addr)
+{
+    addr->type = ADDR_NONE;
+
+    while (*p == ' ' || *p == '\t') p++;
+
+    if (!*p || *p == ',' || *p == '{' || *p == '}' || *p == ';' ||
+        *p == '!' || isalpha(*p))
+        return p;
+
+    if (*p == '$') {
+        addr->type = ADDR_LAST;
+        return p + 1;
+    }
+
+    if (isdigit(*p)) {
+        addr->type = ADDR_LINE;
+        addr->line_num = strtol(p, &p, 10);
+
+        // Check for ~step
+        if (*p == '~') {
+            p++;
+            addr->type = ADDR_STEP;
+            addr->step = strtol(p, &p, 10);
+        }
+        return p;
+    }
+
+    if (*p == '/' || *p == '\\') {
+        U8 delim = *p;
+        if (delim == '\\') {
+            p++;
+            delim = *p;
+        }
+        p++;
+
+        I64 i = 0;
+        while (*p && *p != delim && i < 255) {
+            if (*p == '\\' && *(p+1)) {
+                addr->regex[i++] = *p++;
+            }
+            addr->regex[i++] = *p++;
+        }
+        addr->regex[i] = 0;
+
+        if (*p == delim) p++;
+        addr->type = ADDR_REGEX;
+        return p;
+    }
+
+    return p;
+}
+
+// Parse a command
+U8 *SedParseCmd(U8 *p, CSedState *sed)
+{
+    while (*p == ' ' || *p == '\t') p++;
+
+    if (!*p || *p == '\n' || *p == '#')
+        return p;
+
+    CSedCmd *cmd = &sed->cmds[sed->cmd_count];
+    MemSet(cmd, 0, sizeof(CSedCmd));
+
+    // Parse first address
+    p = SedParseAddr(p, &cmd->addr1);
+
+    // Check for comma (address range)
+    while (*p == ' ' || *p == '\t') p++;
+    if (*p == ',') {
+        p++;
+        p = SedParseAddr(p, &cmd->addr2);
+    }
+
+    while (*p == ' ' || *p == '\t') p++;
+
+    // Check for negation
+    if (*p == '!') {
+        cmd->negated = TRUE;
+        p++;
+        while (*p == ' ' || *p == '\t') p++;
+    }
+
+    // Get command character
+    if (!*p || *p == '\n') {
+        return p;
+    }
+
+    cmd->cmd = *p++;
+
+    // Parse command arguments
+    switch (cmd->cmd) {
+        case 's': {
+            // s/pattern/replacement/flags
+            U8 delim = *p++;
+            I64 i = 0;
+
+            // Pattern
+            while (*p && *p != delim && i < SED_LINE_SIZE - 1) {
+                if (*p == '\\' && *(p+1)) {
+                    cmd->arg1[i++] = *p++;
+                }
+                cmd->arg1[i++] = *p++;
+            }
+            cmd->arg1[i] = 0;
+            if (*p == delim) p++;
+
+            // Replacement
+            i = 0;
+            while (*p && *p != delim && i < SED_LINE_SIZE - 1) {
+                if (*p == '\\' && *(p+1)) {
+                    cmd->arg2[i++] = *p++;
+                }
+                cmd->arg2[i++] = *p++;
+            }
+            cmd->arg2[i] = 0;
+            if (*p == delim) p++;
+
+            // Flags
+            i = 0;
+            while (*p && *p != ';' && *p != '\n' && *p != '}' && i < 31) {
+                if (*p != ' ' && *p != '\t')
+                    cmd->flags[i++] = *p;
+                p++;
+            }
+            cmd->flags[i] = 0;
+            break;
+        }
+
+        case 'y': {
+            // y/set1/set2/
+            U8 delim = *p++;
+            I64 i = 0;
+
+            while (*p && *p != delim && i < SED_LINE_SIZE - 1)
+                cmd->arg1[i++] = *p++;
+            cmd->arg1[i] = 0;
+            if (*p == delim) p++;
+
+            i = 0;
+            while (*p && *p != delim && i < SED_LINE_SIZE - 1)
+                cmd->arg2[i++] = *p++;
+            cmd->arg2[i] = 0;
+            if (*p == delim) p++;
+            break;
+        }
+
+        case 'a':
+        case 'i':
+        case 'c': {
+            // Text follows on next line or after backslash
+            while (*p == ' ' || *p == '\t') p++;
+            if (*p == '\\') p++;
+            if (*p == '\n') p++;
+
+            I64 i = 0;
+            while (*p && *p != '\n' && i < SED_LINE_SIZE - 1)
+                cmd->arg1[i++] = *p++;
+            cmd->arg1[i] = 0;
+            break;
+        }
+
+        case 'b':
+        case 't':
+        case 'T':
+        case ':': {
+            // Label name
+            while (*p == ' ' || *p == '\t') p++;
+            I64 i = 0;
+            while (*p && *p != ';' && *p != '\n' && *p != '}' &&
+                   *p != ' ' && *p != '\t' && i < 63)
+                cmd->arg1[i++] = *p++;
+            cmd->arg1[i] = 0;
+
+            // Register label
+            if (cmd->cmd == ':' && cmd->arg1[0]) {
+                if (sed->label_count < SED_MAX_LABELS) {
+                    strcpy(sed->labels[sed->label_count].name, cmd->arg1);
+                    sed->labels[sed->label_count].cmd_idx = sed->cmd_count;
+                    sed->label_count++;
+                }
+            }
+            break;
+        }
+
+        case 'r':
+        case 'w': {
+            // Filename
+            while (*p == ' ' || *p == '\t') p++;
+            I64 i = 0;
+            while (*p && *p != '\n' && i < SED_LINE_SIZE - 1)
+                cmd->arg1[i++] = *p++;
+            cmd->arg1[i] = 0;
+            break;
+        }
+    }
+
+    sed->cmd_count++;
+    return p;
+}
+
+// Parse sed script
+I64 SedParseScript(CSedState *sed, U8 *script)
+{
+    U8 *p = script;
+
+    while (*p) {
+        while (*p == ' ' || *p == '\t' || *p == '\n' || *p == ';')
+            p++;
+
+        if (*p == '#') {
+            // Comment
+            while (*p && *p != '\n') p++;
+            continue;
+        }
+
+        if (!*p) break;
+
+        p = SedParseCmd(p, sed);
+    }
+
+    return 0;
+}
+
+// ============================================================================
+// ADDRESS MATCHING
+// ============================================================================
+
+Bool SedAddrMatches(CSedState *sed, CSedAddr *addr)
+{
+    if (addr->type == ADDR_NONE)
+        return TRUE;
+
+    if (addr->type == ADDR_LINE)
+        return (sed->line_num == addr->line_num);
+
+    if (addr->type == ADDR_LAST)
+        return FALSE;  // Can't know last line ahead of time
+
+    if (addr->type == ADDR_STEP) {
+        if (sed->line_num < addr->line_num) return FALSE;
+        return ((sed->line_num - addr->line_num) % addr->step == 0);
+    }
+
+    if (addr->type == ADDR_REGEX) {
+        return (SedRegexMatch(sed->pattern, addr->regex, NULL, FALSE) != NULL);
+    }
+
+    return FALSE;
+}
+
+// ============================================================================
+// COMMAND EXECUTION
+// ============================================================================
+
+I64 SedExecCmd(CSedState *sed, CSedCmd *cmd, Bool *printed, I64 *next_cmd)
+{
+    *next_cmd = -1;  // Continue normally
+
+    // Check address
+    Bool in_range = FALSE;
+
+    if (cmd->addr1.type == ADDR_NONE) {
+        in_range = TRUE;
+    } else if (cmd->addr2.type == ADDR_NONE) {
+        in_range = SedAddrMatches(sed, &cmd->addr1);
+    } else {
+        // Range - simplified, just check both
+        in_range = SedAddrMatches(sed, &cmd->addr1) ||
+                   SedAddrMatches(sed, &cmd->addr2);
+    }
+
+    if (cmd->negated) in_range = !in_range;
+
+    if (!in_range) return 0;
+
+    switch (cmd->cmd) {
+        case CMD_PRINT:
+            printf("%s\n", sed->pattern);
+            *printed = TRUE;
+            break;
+
+        case CMD_DELETE:
+            sed->pattern[0] = 0;
+            return 1;  // Skip to next cycle
+
+        case CMD_QUIT:
+            sed->quit_flag = TRUE;
+            break;
+
+        case CMD_SUBST:
+            SedSubstitute(sed, cmd->arg1, cmd->arg2, cmd->flags);
+            break;
+
+        case CMD_TRANS:
+            SedTransliterate(sed, cmd->arg1, cmd->arg2);
+            break;
+
+        case CMD_APPEND:
+            printf("%s\n", sed->pattern);
+            printf("%s\n", cmd->arg1);
+            *printed = TRUE;
+            break;
+
+        case CMD_INSERT:
+            printf("%s\n", cmd->arg1);
+            break;
+
+        case CMD_CHANGE:
+            printf("%s\n", cmd->arg1);
+            sed->pattern[0] = 0;
+            return 1;
+
+        case CMD_NEXT:
+            if (!sed->suppress_default)
+                printf("%s\n", sed->pattern);
+            return 1;  // Get next line
+
+        case CMD_NEXT_APP:
+            // Append next line to pattern
+            // Would need to read next line here
+            break;
+
+        case CMD_HOLD:
+            strcpy(sed->hold, sed->pattern);
+            break;
+
+        case CMD_HOLD_APP:
+            strcat(sed->hold, "\n");
+            strcat(sed->hold, sed->pattern);
+            break;
+
+        case CMD_GET:
+            strcpy(sed->pattern, sed->hold);
+            break;
+
+        case CMD_GET_APP:
+            strcat(sed->pattern, "\n");
+            strcat(sed->pattern, sed->hold);
+            break;
+
+        case CMD_EXCHANGE: {
+            U8 tmp[SED_LINE_SIZE];
+            strcpy(tmp, sed->pattern);
+            strcpy(sed->pattern, sed->hold);
+            strcpy(sed->hold, tmp);
+            break;
+        }
+
+        case CMD_PRINT_LN:
+            printf("%ld\n", sed->line_num);
+            break;
+
+        case CMD_BRANCH:
+            // Find label
+            for (I64 i = 0; i < sed->label_count; i++) {
+                if (strcmp(sed->labels[i].name, cmd->arg1) == 0) {
+                    *next_cmd = sed->labels[i].cmd_idx;
+                    break;
+                }
+            }
+            break;
+
+        case CMD_TEST:
+            if (sed->subst_success) {
+                for (I64 i = 0; i < sed->label_count; i++) {
+                    if (strcmp(sed->labels[i].name, cmd->arg1) == 0) {
+                        *next_cmd = sed->labels[i].cmd_idx;
+                        break;
+                    }
+                }
+            }
+            break;
+
+        case CMD_READ: {
+            FILE *fp = fopen(cmd->arg1, "r");
+            if (fp) {
+                U8 buf[SED_LINE_SIZE];
+                while (fgets(buf, SED_LINE_SIZE, fp)) {
+                    I64 len = strlen(buf);
+                    if (len > 0 && buf[len-1] == '\n')
+                        buf[len-1] = 0;
+                    printf("%s\n", buf);
+                }
+                fclose(fp);
+            }
+            break;
+        }
+
+        case CMD_WRITE: {
+            FILE *fp = fopen(cmd->arg1, "a");
+            if (fp) {
+                fprintf(fp, "%s\n", sed->pattern);
+                fclose(fp);
+            }
+            break;
+        }
+
+        case CMD_LABEL:
+            // Labels are just markers
+            break;
+    }
+
+    return 0;
+}
+
+// Process one line
+I64 SedProcessLine(CSedState *sed)
+{
+    Bool printed = FALSE;
+    sed->subst_success = FALSE;
+
+    I64 cmd_idx = 0;
+    while (cmd_idx < sed->cmd_count && !sed->quit_flag) {
+        I64 next_cmd = -1;
+        I64 result = SedExecCmd(sed, &sed->cmds[cmd_idx], &printed, &next_cmd);
+
+        if (result != 0) return result;
+
+        if (next_cmd >= 0) {
+            cmd_idx = next_cmd;
+        } else {
+            cmd_idx++;
+        }
+    }
+
+    if (!sed->suppress_default && !printed && sed->pattern[0])
+        printf("%s\n", sed->pattern);
+
+    return 0;
+}
+
+// ============================================================================
+// MAIN
+// ============================================================================
+
+I64 sed_main(I64 argc, U8 **argv)
+{
+    Bool suppress = FALSE;         // -n
+    Bool extended = FALSE;         // -E/-r
+    Bool in_place = FALSE;         // -i
+    U8 *scripts[64];
+    I64 script_count = 0;
+    U8 *files[64];
+    I64 file_count = 0;
+    I64 start = 1;
+
+    // Parse options
+    while (start < argc && argv[start][0] == '-' && argv[start][1]) {
+        U8 *arg = argv[start];
+
+        if (strcmp(arg, "--help") == 0) {
+            printf("Usage: sed [OPTION]... {script-only-if-no-other-script} [input-file]...\n\n");
+            printf("  -n, --quiet, --silent\n");
+            printf("                 suppress automatic printing of pattern space\n");
+            printf("  -e script, --expression=script\n");
+            printf("                 add the script to the commands to be executed\n");
+            printf("  -f script-file, --file=script-file\n");
+            printf("                 add the contents of script-file to commands\n");
+            printf("  -i[SUFFIX], --in-place[=SUFFIX]\n");
+            printf("                 edit files in place\n");
+            printf("  -E, -r, --regexp-extended\n");
+            printf("                 use extended regular expressions\n");
+            printf("      --help     display this help and exit\n");
+            printf("      --version  output version information and exit\n");
+            return 0;
+        }
+
+        if (strcmp(arg, "--version") == 0) {
+            printf("sed (ZealOS coreutils) 1.0\n");
+            return 0;
+        }
+
+        if (strcmp(arg, "-n") == 0 || strcmp(arg, "--quiet") == 0 ||
+            strcmp(arg, "--silent") == 0) {
+            suppress = TRUE;
+            start++;
+            continue;
+        }
+
+        if (strcmp(arg, "-E") == 0 || strcmp(arg, "-r") == 0 ||
+            strcmp(arg, "--regexp-extended") == 0) {
+            extended = TRUE;
+            start++;
+            continue;
+        }
+
+        if (strncmp(arg, "-e", 2) == 0) {
+            if (arg[2]) {
+                scripts[script_count++] = &arg[2];
+            } else if (start + 1 < argc) {
+                start++;
+                scripts[script_count++] = argv[start];
+            }
+            start++;
+            continue;
+        }
+
+        if (strncmp(arg, "-f", 2) == 0) {
+            U8 *filename;
+            if (arg[2]) filename = &arg[2];
+            else if (start + 1 < argc) { start++; filename = argv[start]; }
+            else { start++; continue; }
+
+            // Read script file
+            FILE *fp = fopen(filename, "r");
+            if (fp) {
+                U8 *script = MAlloc(65536);
+                I64 total = fread(script, 1, 65535, fp);
+                script[total] = 0;
+                fclose(fp);
+                scripts[script_count++] = script;
+            } else {
+                fprintf(stderr, "sed: can't read %s: %s\n", filename, strerror(errno));
+                return 4;
+            }
+            start++;
+            continue;
+        }
+
+        if (strncmp(arg, "-i", 2) == 0) {
+            in_place = TRUE;
+            start++;
+            continue;
+        }
+
+        if (strcmp(arg, "--") == 0) {
+            start++;
+            break;
+        }
+
+        break;
+    }
+
+    // If no -e script, first non-option arg is script
+    if (script_count == 0 && start < argc) {
+        scripts[script_count++] = argv[start++];
+    }
+
+    // Remaining args are files
+    while (start < argc) {
+        files[file_count++] = argv[start++];
+    }
+
+    if (script_count == 0) {
+        fprintf(stderr, "sed: no script specified\n");
+        return 4;
+    }
+
+    // Initialize state
+    CSedState sed;
+    MemSet(&sed, 0, sizeof(CSedState));
+    sed.suppress_default = suppress;
+
+    // Parse all scripts
+    for (I64 i = 0; i < script_count; i++) {
+        SedParseScript(&sed, scripts[i]);
+    }
+
+    // Process files
+    FILE *fp;
+    if (file_count == 0) {
+        fp = stdin;
+        files[file_count++] = "-";
+    }
+
+    for (I64 f = 0; f < file_count && !sed.quit_flag; f++) {
+        if (strcmp(files[f], "-") == 0) {
+            fp = stdin;
+        } else {
+            fp = fopen(files[f], "r");
+            if (!fp) {
+                fprintf(stderr, "sed: can't read %s: %s\n", files[f], strerror(errno));
+                continue;
+            }
+        }
+
+        while (fgets(sed.pattern, SED_LINE_SIZE, fp) && !sed.quit_flag) {
+            // Remove trailing newline
+            I64 len = strlen(sed.pattern);
+            if (len > 0 && sed.pattern[len-1] == '\n')
+                sed.pattern[len-1] = 0;
+
+            sed.line_num++;
+            SedProcessLine(&sed);
+        }
+
+        if (fp != stdin)
+            fclose(fp);
+    }
+
+    return 0;
+}
+
+U0 GnuSedRegister()
+{
+    "GNU 'sed' utility loaded.\n";
+}

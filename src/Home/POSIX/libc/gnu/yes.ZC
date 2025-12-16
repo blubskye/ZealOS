@@ -1,0 +1,51 @@
+// yes.ZC - GNU coreutils 'yes' implementation
+// Repeatedly output a line with all specified STRING(s), or 'y'
+
+// C-style main function
+I64 yes_main(I64 argc, U8 **argv)
+{
+    // Handle --help and --version
+    if (argc > 1) {
+        if (strcmp(argv[1], "--help") == 0) {
+            printf("Usage: yes [STRING]...\n");
+            printf("  or:  yes OPTION\n");
+            printf("Repeatedly output a line with all specified STRING(s), or 'y'.\n\n");
+            printf("      --help     display this help and exit\n");
+            printf("      --version  output version information and exit\n");
+            return 0;
+        }
+        if (strcmp(argv[1], "--version") == 0) {
+            printf("yes (ZealOS coreutils) 1.0\n");
+            return 0;
+        }
+    }
+
+    // Build output string
+    U8 output[4096];
+
+    if (argc > 1) {
+        output[0] = 0;
+        for (I64 i = 1; i < argc; i++) {
+            if (i > 1)
+                strcat(output, " ");
+            strcat(output, argv[i]);
+        }
+    } else {
+        strcpy(output, "y");
+    }
+
+    // Output forever (or until interrupted)
+    while (TRUE) {
+        if (puts(output) == EOF)
+            break;
+    }
+
+    return 0;
+}
+
+// Register as a utility
+U0 GnuYesRegister()
+{
+    "GNU 'yes' utility loaded. Run: CRun(&yes_main, \"yes\");\n";
+    "WARNING: This will loop forever! Use Ctrl+C to stop.\n";
+}

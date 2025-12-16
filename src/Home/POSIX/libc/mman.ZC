@@ -1,0 +1,562 @@
+// mman.ZC - Memory mapping functions for ZealOS
+// Part of the POSIX compatibility layer
+//
+// ZealOS doesn't have virtual memory or memory protection.
+// This implementation provides compatible interfaces using
+// regular memory allocation for anonymous mappings and
+// file reading for file-backed mappings.
+
+// ============================================================================
+// MMAP CONSTANTS
+// ============================================================================
+
+// Protection flags
+#define PROT_NONE       0x0
+#define PROT_READ       0x1
+#define PROT_WRITE      0x2
+#define PROT_EXEC       0x4
+
+// Map flags
+#define MAP_SHARED      0x01
+#define MAP_PRIVATE     0x02
+#define MAP_FIXED       0x10
+#define MAP_ANONYMOUS   0x20
+#define MAP_ANON        MAP_ANONYMOUS
+#define MAP_NORESERVE   0x4000
+#define MAP_GROWSDOWN   0x0100
+#define MAP_DENYWRITE   0x0800
+#define MAP_EXECUTABLE  0x1000
+#define MAP_LOCKED      0x2000
+#define MAP_POPULATE    0x8000
+#define MAP_NONBLOCK    0x10000
+#define MAP_STACK       0x20000
+#define MAP_HUGETLB     0x40000
+
+// Return value for failed mmap
+#define MAP_FAILED      ((void*)-1)
+
+// msync flags
+#define MS_ASYNC        1
+#define MS_SYNC         2
+#define MS_INVALIDATE   4
+
+// madvise flags
+#define MADV_NORMAL     0
+#define MADV_RANDOM     1
+#define MADV_SEQUENTIAL 2
+#define MADV_WILLNEED   3
+#define MADV_DONTNEED   4
+
+// mlockall flags
+#define MCL_CURRENT     1
+#define MCL_FUTURE      2
+
+// ============================================================================
+// MAPPING TRACKING
+// ============================================================================
+
+#define MMAP_MAX_MAPPINGS   1024
+
+class CMmapEntry {
+    void    *addr;          // Mapped address
+    I64     length;         // Mapping length
+    I64     prot;           // Protection flags
+    I64     flags;          // Mapping flags
+    I64     fd;             // File descriptor (-1 for anonymous)
+    I64     offset;         // File offset
+    Bool    in_use;         // Entry in use
+    Bool    is_file;        // File-backed mapping
+    U8      *file_path;     // Path for file-backed (for debugging)
+};
+
+CMmapEntry mmap_entries[MMAP_MAX_MAPPINGS];
+I64 mmap_entry_count = 0;
+Bool mmap_initialized = FALSE;
+
+// ============================================================================
+// INITIALIZATION
+// ============================================================================
+
+U0 MmapInit()
+{
+    if (mmap_initialized)
+        return;
+
+    MemSet(mmap_entries, 0, sizeof(mmap_entries));
+    mmap_entry_count = 0;
+    mmap_initialized = TRUE;
+}
+
+// Find mapping entry by address
+CMmapEntry *MmapFindEntry(void *addr)
+{
+    for (I64 i = 0; i < MMAP_MAX_MAPPINGS; i++) {
+        if (mmap_entries[i].in_use && mmap_entries[i].addr == addr)
+            return &mmap_entries[i];
+    }
+    return NULL;
+}
+
+// Find mapping entry containing address
+CMmapEntry *MmapFindContaining(void *addr)
+{
+    U64 a = addr(U64);
+    for (I64 i = 0; i < MMAP_MAX_MAPPINGS; i++) {
+        if (mmap_entries[i].in_use) {
+            U64 start = mmap_entries[i].addr(U64);
+            U64 end = start + mmap_entries[i].length;
+            if (a >= start && a < end)
+                return &mmap_entries[i];
+        }
+    }
+    return NULL;
+}
+
+// Allocate new mapping entry
+CMmapEntry *MmapAllocEntry()
+{
+    for (I64 i = 0; i < MMAP_MAX_MAPPINGS; i++) {
+        if (!mmap_entries[i].in_use) {
+            mmap_entries[i].in_use = TRUE;
+            mmap_entry_count++;
+            return &mmap_entries[i];
+        }
+    }
+    return NULL;
+}
+
+// Free mapping entry
+U0 MmapFreeEntry(CMmapEntry *entry)
+{
+    if (entry && entry->in_use) {
+        if (entry->file_path)
+            Free(entry->file_path);
+        MemSet(entry, 0, sizeof(CMmapEntry));
+        mmap_entry_count--;
+    }
+}
+
+// ============================================================================
+// MMAP IMPLEMENTATION
+// ============================================================================
+
+// Main mmap function
+void *mmap(void *addr, I64 length, I64 prot, I64 flags, I64 fd, I64 offset)
+{
+    CMmapEntry *entry;
+    void *result;
+
+    MmapInit();
+
+    // Validate parameters
+    if (length <= 0) {
+        posix_errno = EINVAL;
+        return MAP_FAILED;
+    }
+
+    // Page-align length (ZealOS doesn't have pages, but we round up anyway)
+    I64 page_size = 4096;
+    length = (length + page_size - 1) & ~(page_size - 1);
+
+    // Handle MAP_FIXED
+    if (flags & MAP_FIXED) {
+        if (!addr) {
+            posix_errno = EINVAL;
+            return MAP_FAILED;
+        }
+        // Check if address is already mapped
+        CMmapEntry *existing = MmapFindContaining(addr);
+        if (existing) {
+            // Unmap existing
+            munmap(existing->addr, existing->length);
+        }
+    }
+
+    // Allocate tracking entry
+    entry = MmapAllocEntry();
+    if (!entry) {
+        posix_errno = ENOMEM;
+        return MAP_FAILED;
+    }
+
+    // Anonymous mapping
+    if (flags & MAP_ANONYMOUS) {
+        result = MAlloc(length);
+        if (!result) {
+            MmapFreeEntry(entry);
+            posix_errno = ENOMEM;
+            return MAP_FAILED;
+        }
+
+        // Zero-initialize anonymous mappings
+        MemSet(result, 0, length);
+
+        entry->addr = result;
+        entry->length = length;
+        entry->prot = prot;
+        entry->flags = flags;
+        entry->fd = -1;
+        entry->offset = 0;
+        entry->is_file = FALSE;
+
+        return result;
+    }
+
+    // File-backed mapping
+    if (fd >= 0) {
+        CPosixProcess *proc = PosixGetCurrent();
+        if (!proc) {
+            MmapFreeEntry(entry);
+            posix_errno = EBADF;
+            return MAP_FAILED;
+        }
+
+        CPosixFD *pfd = PosixFDGet(proc, fd);
+        if (!pfd || pfd->type != FD_TYPE_FILE) {
+            MmapFreeEntry(entry);
+            posix_errno = EBADF;
+            return MAP_FAILED;
+        }
+
+        // Allocate memory
+        result = MAlloc(length);
+        if (!result) {
+            MmapFreeEntry(entry);
+            posix_errno = ENOMEM;
+            return MAP_FAILED;
+        }
+
+        // Read file contents into mapping
+        I64 old_offset = pfd->offset;
+        pfd->offset = offset;
+
+        I64 bytes_read = PosixRead(fd, result, length);
+        if (bytes_read < 0) {
+            Free(result);
+            MmapFreeEntry(entry);
+            pfd->offset = old_offset;
+            return MAP_FAILED;
+        }
+
+        // Zero-fill remainder
+        if (bytes_read < length) {
+            MemSet(result(U8*) + bytes_read, 0, length - bytes_read);
+        }
+
+        pfd->offset = old_offset;
+
+        entry->addr = result;
+        entry->length = length;
+        entry->prot = prot;
+        entry->flags = flags;
+        entry->fd = fd;
+        entry->offset = offset;
+        entry->is_file = TRUE;
+        if (pfd->path)
+            entry->file_path = StrNew(pfd->path);
+
+        return result;
+    }
+
+    // Invalid - not anonymous and no file descriptor
+    MmapFreeEntry(entry);
+    posix_errno = EINVAL;
+    return MAP_FAILED;
+}
+
+// Unmap memory
+I64 munmap(void *addr, I64 length)
+{
+    MmapInit();
+
+    if (!addr || length <= 0) {
+        posix_errno = EINVAL;
+        return -1;
+    }
+
+    CMmapEntry *entry = MmapFindEntry(addr);
+    if (!entry) {
+        // Not an error in POSIX - may be partial unmap
+        // For simplicity, we require exact match
+        posix_errno = EINVAL;
+        return -1;
+    }
+
+    // Free the memory
+    Free(entry->addr);
+
+    // Free the entry
+    MmapFreeEntry(entry);
+
+    return 0;
+}
+
+// Change memory protection (no-op on ZealOS)
+I64 mprotect(void *addr, I64 len, I64 prot)
+{
+    MmapInit();
+
+    // ZealOS doesn't have memory protection
+    // Just update our tracking if the mapping exists
+
+    CMmapEntry *entry = MmapFindContaining(addr);
+    if (entry) {
+        // Partially update protection (simplified)
+        entry->prot = prot;
+    }
+
+    return 0;
+}
+
+// Synchronize memory with file
+I64 msync(void *addr, I64 length, I64 flags)
+{
+    MmapInit();
+
+    CMmapEntry *entry = MmapFindContaining(addr);
+    if (!entry) {
+        posix_errno = ENOMEM;
+        return -1;
+    }
+
+    // If it's a shared file mapping, write back to file
+    if (entry->is_file && (entry->flags & MAP_SHARED)) {
+        CPosixProcess *proc = PosixGetCurrent();
+        if (proc && entry->fd >= 0) {
+            CPosixFD *pfd = PosixFDGet(proc, entry->fd);
+            if (pfd && pfd->type == FD_TYPE_FILE) {
+                I64 old_offset = pfd->offset;
+                pfd->offset = entry->offset;
+                PosixWrite(entry->fd, entry->addr, length);
+                pfd->offset = old_offset;
+            }
+        }
+    }
+
+    return 0;
+}
+
+// Lock memory (no-op on ZealOS - all memory is "locked")
+I64 mlock(void *addr, I64 len)
+{
+    return 0;
+}
+
+I64 munlock(void *addr, I64 len)
+{
+    return 0;
+}
+
+I64 mlockall(I64 flags)
+{
+    return 0;
+}
+
+I64 munlockall()
+{
+    return 0;
+}
+
+// Memory advice (no-op on ZealOS)
+I64 madvise(void *addr, I64 length, I64 advice)
+{
+    return 0;
+}
+
+I64 posix_madvise(void *addr, I64 len, I64 advice)
+{
+    return 0;
+}
+
+// ============================================================================
+// SHARED MEMORY (POSIX shm_*)
+// ============================================================================
+
+// Shared memory is simulated using regular files
+
+#define SHM_MAX_OBJECTS     64
+#define SHM_NAME_MAX        255
+
+class CShmObject {
+    U8      name[SHM_NAME_MAX + 1];
+    void    *addr;
+    I64     size;
+    I64     refcount;
+    Bool    in_use;
+};
+
+CShmObject shm_objects[SHM_MAX_OBJECTS];
+Bool shm_initialized = FALSE;
+
+U0 ShmInit()
+{
+    if (shm_initialized)
+        return;
+
+    MemSet(shm_objects, 0, sizeof(shm_objects));
+    shm_initialized = TRUE;
+}
+
+// Open shared memory object
+I64 shm_open(U8 *name, I64 oflag, I64 mode)
+{
+    ShmInit();
+
+    if (!name || name[0] != '/') {
+        posix_errno = EINVAL;
+        return -1;
+    }
+
+    // Skip leading slash
+    name++;
+
+    // Find existing
+    for (I64 i = 0; i < SHM_MAX_OBJECTS; i++) {
+        if (shm_objects[i].in_use && StrCmp(shm_objects[i].name, name) == 0) {
+            if (oflag & O_EXCL) {
+                posix_errno = EEXIST;
+                return -1;
+            }
+            shm_objects[i].refcount++;
+            // Return a pseudo-fd (negative to distinguish from real fds)
+            return -(i + 1);
+        }
+    }
+
+    // Create new if O_CREAT
+    if (!(oflag & O_CREAT)) {
+        posix_errno = ENOENT;
+        return -1;
+    }
+
+    // Find free slot
+    for (I64 i = 0; i < SHM_MAX_OBJECTS; i++) {
+        if (!shm_objects[i].in_use) {
+            StrNCpy(shm_objects[i].name, name, SHM_NAME_MAX);
+            shm_objects[i].addr = NULL;
+            shm_objects[i].size = 0;
+            shm_objects[i].refcount = 1;
+            shm_objects[i].in_use = TRUE;
+            return -(i + 1);
+        }
+    }
+
+    posix_errno = EMFILE;
+    return -1;
+}
+
+// Unlink shared memory object
+I64 shm_unlink(U8 *name)
+{
+    ShmInit();
+
+    if (!name || name[0] != '/') {
+        posix_errno = EINVAL;
+        return -1;
+    }
+
+    name++;
+
+    for (I64 i = 0; i < SHM_MAX_OBJECTS; i++) {
+        if (shm_objects[i].in_use && StrCmp(shm_objects[i].name, name) == 0) {
+            // Mark for deletion when refcount reaches 0
+            shm_objects[i].name[0] = 0;  // Unlink name
+            if (shm_objects[i].refcount == 0) {
+                if (shm_objects[i].addr)
+                    Free(shm_objects[i].addr);
+                shm_objects[i].in_use = FALSE;
+            }
+            return 0;
+        }
+    }
+
+    posix_errno = ENOENT;
+    return -1;
+}
+
+// Set size of shared memory object (ftruncate for shm fd)
+I64 shm_truncate(I64 shmfd, I64 length)
+{
+    ShmInit();
+
+    if (shmfd >= 0) {
+        posix_errno = EINVAL;
+        return -1;
+    }
+
+    I64 idx = -(shmfd + 1);
+    if (idx < 0 || idx >= SHM_MAX_OBJECTS || !shm_objects[idx].in_use) {
+        posix_errno = EBADF;
+        return -1;
+    }
+
+    // Resize
+    if (shm_objects[idx].addr) {
+        void *new_addr = MAlloc(length);
+        if (!new_addr) {
+            posix_errno = ENOMEM;
+            return -1;
+        }
+        I64 copy_size = (length < shm_objects[idx].size) ? length : shm_objects[idx].size;
+        MemCpy(new_addr, shm_objects[idx].addr, copy_size);
+        Free(shm_objects[idx].addr);
+        shm_objects[idx].addr = new_addr;
+    } else {
+        shm_objects[idx].addr = MAlloc(length);
+        if (!shm_objects[idx].addr) {
+            posix_errno = ENOMEM;
+            return -1;
+        }
+        MemSet(shm_objects[idx].addr, 0, length);
+    }
+
+    shm_objects[idx].size = length;
+    return 0;
+}
+
+// ============================================================================
+// MEMFD (Linux-specific, but useful)
+// ============================================================================
+
+#define MFD_CLOEXEC         0x0001
+#define MFD_ALLOW_SEALING   0x0002
+
+I64 memfd_create(U8 *name, U32 flags)
+{
+    // Create anonymous file in memory
+    // For ZealOS, just create a regular file in a temp location
+    // or use a special FD type
+
+    CPosixProcess *proc = PosixGetCurrent();
+    if (!proc) {
+        posix_errno = ENOMEM;
+        return -1;
+    }
+
+    // Allocate file descriptor
+    I64 fd = PosixFDAlloc(proc);
+    if (fd < 0) {
+        posix_errno = EMFILE;
+        return -1;
+    }
+
+    CPosixFD *pfd = PosixFDGet(proc, fd);
+    pfd->type = FD_TYPE_FILE;
+    pfd->flags = O_RDWR;
+    pfd->offset = 0;
+    pfd->path = StrNew("[memfd]");
+    pfd->data = NULL;
+    pfd->data_size = 0;
+    pfd->handle = -1;  // Not a real file
+
+    if (flags & MFD_CLOEXEC)
+        pfd->fd_flags |= FD_CLOEXEC;
+
+    return fd;
+}
+
+// ============================================================================
+// INITIALIZATION
+// ============================================================================
+
+"mman loaded - memory mapping for ZealOS\n";

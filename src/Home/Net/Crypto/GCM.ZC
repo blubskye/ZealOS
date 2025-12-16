@@ -1,0 +1,594 @@
+// GCM.ZC - Galois/Counter Mode for ZealOS
+// Implementation based on NIST SP 800-38D
+// https://csrc.nist.gov/publications/detail/sp/800-38d/final
+//
+// GCM provides authenticated encryption with associated data (AEAD)
+// Used in TLS 1.3 for record encryption (AES-GCM)
+
+// ============================================================================
+// GCM CONSTANTS
+// ============================================================================
+
+// GCM uses GF(2^128) with reduction polynomial x^128 + x^7 + x^2 + x + 1
+// R = 0xE1 << 120 in big-endian representation
+#define GCM_R_HIGH  0xE100000000000000
+
+// ============================================================================
+// GCM HELPER FUNCTIONS
+// ============================================================================
+
+// XOR two 16-byte blocks
+U0 GCMXorBlock(U8 *a, U8 *b, U8 *result)
+{
+	I64 i;
+	for (i = 0; i < 16; i++)
+		result[i] = a[i] ^ b[i];
+}
+
+// Increment the rightmost 32 bits of a 128-bit counter (big-endian)
+U0 GCMIncrementCounter(U8 *counter)
+{
+	I64 i;
+	for (i = 15; i >= 12; i--)
+	{
+		counter[i]++;
+		if (counter[i] != 0)
+			break;
+	}
+}
+
+// Multiply two 128-bit values in GF(2^128)
+// Uses the reduction polynomial x^128 + x^7 + x^2 + x + 1
+U0 GCMGFMult(U8 *X, U8 *Y, U8 *result)
+{
+	U8 Z[16];
+	U8 V[16];
+	I64 i, j;
+	U8 carry;
+
+	// Z = 0
+	MemSet(Z, 0, 16);
+
+	// V = Y
+	MemCopy(V, Y, 16);
+
+	// Process each bit of X
+	for (i = 0; i < 16; i++)
+	{
+		for (j = 7; j >= 0; j--)
+		{
+			// If bit is set, Z = Z XOR V
+			if (X[i] & (1 << j))
+			{
+				GCMXorBlock(Z, V, Z);
+			}
+
+			// V = V >> 1 in GF(2^128)
+			carry = V[15] & 1;
+
+			// Right shift V by 1 bit
+			I64 k;
+			for (k = 15; k > 0; k--)
+			{
+				V[k] = (V[k] >> 1) | ((V[k - 1] & 1) << 7);
+			}
+			V[0] >>= 1;
+
+			// If carry (V had LSB set), XOR with R
+			if (carry)
+			{
+				V[0] ^= 0xE1;  // R in big-endian: E1 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+			}
+		}
+	}
+
+	MemCopy(result, Z, 16);
+}
+
+// ============================================================================
+// GHASH FUNCTION
+// ============================================================================
+
+// GHASH(H, A, C) computes the authentication tag
+// H = AES(K, 0)
+// A = additional authenticated data
+// C = ciphertext
+U0 GHASH(U8 *H, U8 *data, I64 data_len, U8 *result)
+{
+	U8 X[16];
+	U8 temp[16];
+	I64 i, blocks, remaining;
+
+	// X = 0
+	MemSet(X, 0, 16);
+
+	// Process full blocks
+	blocks = data_len / 16;
+	for (i = 0; i < blocks; i++)
+	{
+		GCMXorBlock(X, data + i * 16, temp);
+		GCMGFMult(temp, H, X);
+	}
+
+	// Process remaining bytes (if any)
+	remaining = data_len % 16;
+	if (remaining > 0)
+	{
+		MemSet(temp, 0, 16);
+		MemCopy(temp, data + blocks * 16, remaining);
+		GCMXorBlock(X, temp, temp);
+		GCMGFMult(temp, H, X);
+	}
+
+	MemCopy(result, X, 16);
+}
+
+// ============================================================================
+// GCM INITIALIZATION
+// ============================================================================
+
+// Initialize GCM context with AES key
+U0 GCMInit(CGCMContext *ctx, U8 *key, I64 key_bits)
+{
+	U8 zero_block[16];
+
+	// Initialize AES
+	AESKeyExpand(&ctx->aes, key, key_bits);
+
+	// Compute H = AES(K, 0^128)
+	MemSet(zero_block, 0, 16);
+	AESEncryptBlock(&ctx->aes, zero_block, ctx->H);
+}
+
+// ============================================================================
+// GCM ENCRYPTION
+// ============================================================================
+
+// Encrypt plaintext and compute authentication tag
+// Returns: 0 on success, negative on error
+I64 GCMEncrypt(CGCMContext *ctx,
+               U8 *nonce, I64 nonce_len,
+               U8 *plaintext, I64 plaintext_len,
+               U8 *aad, I64 aad_len,
+               U8 *ciphertext,
+               U8 *tag)
+{
+	U8 J0[16];           // Initial counter
+	U8 counter[16];      // Current counter
+	U8 encrypted_counter[16];
+	U8 S[16];            // GHASH state
+	U8 temp[16];
+	U8 len_block[16];
+	I64 i, blocks, remaining;
+
+	// Compute J0 (initial counter)
+	if (nonce_len == 12)
+	{
+		// If nonce is 96 bits, J0 = nonce || 0^31 || 1
+		MemCopy(J0, nonce, 12);
+		J0[12] = 0;
+		J0[13] = 0;
+		J0[14] = 0;
+		J0[15] = 1;
+	}
+	else
+	{
+		// Otherwise, J0 = GHASH(H, {}, nonce || pad || len(nonce))
+		// This is more complex, but 96-bit nonces are standard for TLS
+		NetErr("GCM: Only 96-bit (12-byte) nonces are supported");
+		return CRYPTO_ERR_INVALID_PARAM;
+	}
+
+	// Initialize counter to J0 + 1
+	MemCopy(counter, J0, 16);
+	GCMIncrementCounter(counter);
+
+	// Encrypt plaintext using CTR mode
+	blocks = plaintext_len / 16;
+	for (i = 0; i < blocks; i++)
+	{
+		AESEncryptBlock(&ctx->aes, counter, encrypted_counter);
+		GCMXorBlock(plaintext + i * 16, encrypted_counter, ciphertext + i * 16);
+		GCMIncrementCounter(counter);
+	}
+
+	// Handle remaining bytes
+	remaining = plaintext_len % 16;
+	if (remaining > 0)
+	{
+		AESEncryptBlock(&ctx->aes, counter, encrypted_counter);
+		for (i = 0; i < remaining; i++)
+		{
+			ciphertext[blocks * 16 + i] = plaintext[blocks * 16 + i] ^ encrypted_counter[i];
+		}
+	}
+
+	// Compute GHASH over AAD and ciphertext
+	// S = GHASH(H, AAD || pad || C || pad || len(AAD) || len(C))
+	MemSet(S, 0, 16);
+
+	// Process AAD
+	if (aad_len > 0)
+	{
+		blocks = aad_len / 16;
+		for (i = 0; i < blocks; i++)
+		{
+			GCMXorBlock(S, aad + i * 16, temp);
+			GCMGFMult(temp, ctx->H, S);
+		}
+		remaining = aad_len % 16;
+		if (remaining > 0)
+		{
+			MemSet(temp, 0, 16);
+			MemCopy(temp, aad + blocks * 16, remaining);
+			GCMXorBlock(S, temp, temp);
+			GCMGFMult(temp, ctx->H, S);
+		}
+	}
+
+	// Process ciphertext
+	blocks = plaintext_len / 16;
+	for (i = 0; i < blocks; i++)
+	{
+		GCMXorBlock(S, ciphertext + i * 16, temp);
+		GCMGFMult(temp, ctx->H, S);
+	}
+	remaining = plaintext_len % 16;
+	if (remaining > 0)
+	{
+		MemSet(temp, 0, 16);
+		MemCopy(temp, ciphertext + blocks * 16, remaining);
+		GCMXorBlock(S, temp, temp);
+		GCMGFMult(temp, ctx->H, S);
+	}
+
+	// Append length block: len(AAD) || len(C) in bits, as 64-bit big-endian
+	MemSet(len_block, 0, 16);
+	U64 aad_bits = aad_len * 8;
+	U64 ct_bits = plaintext_len * 8;
+	BE64_STORE(len_block, aad_bits);
+	BE64_STORE(len_block + 8, ct_bits);
+
+	GCMXorBlock(S, len_block, temp);
+	GCMGFMult(temp, ctx->H, S);
+
+	// Compute tag: T = S XOR AES(K, J0)
+	AESEncryptBlock(&ctx->aes, J0, encrypted_counter);
+	GCMXorBlock(S, encrypted_counter, tag);
+
+	return CRYPTO_OK;
+}
+
+// ============================================================================
+// GCM DECRYPTION
+// ============================================================================
+
+// Decrypt ciphertext and verify authentication tag
+// Returns: 0 on success, CRYPTO_ERR_AUTH_FAILED if tag doesn't match
+I64 GCMDecrypt(CGCMContext *ctx,
+               U8 *nonce, I64 nonce_len,
+               U8 *ciphertext, I64 ciphertext_len,
+               U8 *aad, I64 aad_len,
+               U8 *tag,
+               U8 *plaintext)
+{
+	U8 J0[16];
+	U8 counter[16];
+	U8 encrypted_counter[16];
+	U8 S[16];
+	U8 temp[16];
+	U8 len_block[16];
+	U8 computed_tag[16];
+	I64 i, blocks, remaining;
+
+	// Compute J0
+	if (nonce_len == 12)
+	{
+		MemCopy(J0, nonce, 12);
+		J0[12] = 0;
+		J0[13] = 0;
+		J0[14] = 0;
+		J0[15] = 1;
+	}
+	else
+	{
+		NetErr("GCM: Only 96-bit (12-byte) nonces are supported");
+		return CRYPTO_ERR_INVALID_PARAM;
+	}
+
+	// Compute GHASH over AAD and ciphertext first (to verify tag)
+	MemSet(S, 0, 16);
+
+	// Process AAD
+	if (aad_len > 0)
+	{
+		blocks = aad_len / 16;
+		for (i = 0; i < blocks; i++)
+		{
+			GCMXorBlock(S, aad + i * 16, temp);
+			GCMGFMult(temp, ctx->H, S);
+		}
+		remaining = aad_len % 16;
+		if (remaining > 0)
+		{
+			MemSet(temp, 0, 16);
+			MemCopy(temp, aad + blocks * 16, remaining);
+			GCMXorBlock(S, temp, temp);
+			GCMGFMult(temp, ctx->H, S);
+		}
+	}
+
+	// Process ciphertext
+	blocks = ciphertext_len / 16;
+	for (i = 0; i < blocks; i++)
+	{
+		GCMXorBlock(S, ciphertext + i * 16, temp);
+		GCMGFMult(temp, ctx->H, S);
+	}
+	remaining = ciphertext_len % 16;
+	if (remaining > 0)
+	{
+		MemSet(temp, 0, 16);
+		MemCopy(temp, ciphertext + blocks * 16, remaining);
+		GCMXorBlock(S, temp, temp);
+		GCMGFMult(temp, ctx->H, S);
+	}
+
+	// Append length block
+	MemSet(len_block, 0, 16);
+	U64 aad_bits = aad_len * 8;
+	U64 ct_bits = ciphertext_len * 8;
+	BE64_STORE(len_block, aad_bits);
+	BE64_STORE(len_block + 8, ct_bits);
+
+	GCMXorBlock(S, len_block, temp);
+	GCMGFMult(temp, ctx->H, S);
+
+	// Compute tag
+	AESEncryptBlock(&ctx->aes, J0, encrypted_counter);
+	GCMXorBlock(S, encrypted_counter, computed_tag);
+
+	// Verify tag (constant-time comparison)
+	if (CryptoConstantTimeCompare(tag, computed_tag, 16) != 0)
+	{
+		// Tag verification failed - clear output and return error
+		MemSet(plaintext, 0, ciphertext_len);
+		return CRYPTO_ERR_AUTH_FAILED;
+	}
+
+	// Tag verified - now decrypt
+	MemCopy(counter, J0, 16);
+	GCMIncrementCounter(counter);
+
+	blocks = ciphertext_len / 16;
+	for (i = 0; i < blocks; i++)
+	{
+		AESEncryptBlock(&ctx->aes, counter, encrypted_counter);
+		GCMXorBlock(ciphertext + i * 16, encrypted_counter, plaintext + i * 16);
+		GCMIncrementCounter(counter);
+	}
+
+	remaining = ciphertext_len % 16;
+	if (remaining > 0)
+	{
+		AESEncryptBlock(&ctx->aes, counter, encrypted_counter);
+		for (i = 0; i < remaining; i++)
+		{
+			plaintext[blocks * 16 + i] = ciphertext[blocks * 16 + i] ^ encrypted_counter[i];
+		}
+	}
+
+	return CRYPTO_OK;
+}
+
+// ============================================================================
+// GCM TEST VECTORS (from NIST)
+// ============================================================================
+
+U0 GCMTest()
+{
+	CGCMContext ctx;
+	U8 key[32];
+	U8 nonce[12];
+	U8 plaintext[64];
+	U8 aad[20];
+	U8 ciphertext[64];
+	U8 tag[16];
+	U8 decrypted[64];
+	U8 expected_ct[64];
+	U8 expected_tag[16];
+	I64 i;
+	I64 result;
+	Bool pass;
+
+	"$$LTBLUE$$AES-GCM Test Vectors:$$FG$$\n\n";
+
+	// Test Case 1: AES-128-GCM with empty plaintext and AAD
+	"Test 1: AES-128-GCM (empty plaintext and AAD)\n";
+
+	// Key: all zeros
+	MemSet(key, 0, 16);
+	// Nonce: all zeros
+	MemSet(nonce, 0, 12);
+
+	GCMInit(&ctx, key, 128);
+	GCMEncrypt(&ctx, nonce, 12, NULL, 0, NULL, 0, ciphertext, tag);
+
+	// Expected tag: 58e2fccefa7e3061367f1d57a4e7455a
+	expected_tag[0]  = 0x58; expected_tag[1]  = 0xE2; expected_tag[2]  = 0xFC; expected_tag[3]  = 0xCE;
+	expected_tag[4]  = 0xFA; expected_tag[5]  = 0x7E; expected_tag[6]  = 0x30; expected_tag[7]  = 0x61;
+	expected_tag[8]  = 0x36; expected_tag[9]  = 0x7F; expected_tag[10] = 0x1D; expected_tag[11] = 0x57;
+	expected_tag[12] = 0xA4; expected_tag[13] = 0xE7; expected_tag[14] = 0x45; expected_tag[15] = 0x5A;
+
+	pass = TRUE;
+	for (i = 0; i < 16; i++)
+	{
+		if (tag[i] != expected_tag[i])
+		{
+			pass = FALSE;
+			break;
+		}
+	}
+
+	"  Tag:      ";
+	for (i = 0; i < 16; i++)
+		"%02X", tag[i];
+	"\n";
+	"  Expected: ";
+	for (i = 0; i < 16; i++)
+		"%02X", expected_tag[i];
+	"\n";
+
+	if (pass)
+		"  $$GREEN$$PASS$$FG$$\n\n";
+	else
+		"  $$RED$$FAIL$$FG$$\n\n";
+
+	// Test Case 2: AES-128-GCM with 16-byte plaintext
+	"Test 2: AES-128-GCM (16-byte plaintext, no AAD)\n";
+
+	// Key: all zeros
+	MemSet(key, 0, 16);
+	// Nonce: all zeros
+	MemSet(nonce, 0, 12);
+	// Plaintext: all zeros
+	MemSet(plaintext, 0, 16);
+
+	GCMInit(&ctx, key, 128);
+	GCMEncrypt(&ctx, nonce, 12, plaintext, 16, NULL, 0, ciphertext, tag);
+
+	// Expected ciphertext: 0388dace60b6a392f328c2b971b2fe78
+	expected_ct[0]  = 0x03; expected_ct[1]  = 0x88; expected_ct[2]  = 0xDA; expected_ct[3]  = 0xCE;
+	expected_ct[4]  = 0x60; expected_ct[5]  = 0xB6; expected_ct[6]  = 0xA3; expected_ct[7]  = 0x92;
+	expected_ct[8]  = 0xF3; expected_ct[9]  = 0x28; expected_ct[10] = 0xC2; expected_ct[11] = 0xB9;
+	expected_ct[12] = 0x71; expected_ct[13] = 0xB2; expected_ct[14] = 0xFE; expected_ct[15] = 0x78;
+
+	// Expected tag: ab6e47d42cec13bdf53a67b21257bddf
+	expected_tag[0]  = 0xAB; expected_tag[1]  = 0x6E; expected_tag[2]  = 0x47; expected_tag[3]  = 0xD4;
+	expected_tag[4]  = 0x2C; expected_tag[5]  = 0xEC; expected_tag[6]  = 0x13; expected_tag[7]  = 0xBD;
+	expected_tag[8]  = 0xF5; expected_tag[9]  = 0x3A; expected_tag[10] = 0x67; expected_tag[11] = 0xB2;
+	expected_tag[12] = 0x12; expected_tag[13] = 0x57; expected_tag[14] = 0xBD; expected_tag[15] = 0xDF;
+
+	pass = TRUE;
+	for (i = 0; i < 16; i++)
+	{
+		if (ciphertext[i] != expected_ct[i] || tag[i] != expected_tag[i])
+		{
+			pass = FALSE;
+			break;
+		}
+	}
+
+	"  Ciphertext: ";
+	for (i = 0; i < 16; i++)
+		"%02X", ciphertext[i];
+	"\n";
+	"  Tag:        ";
+	for (i = 0; i < 16; i++)
+		"%02X", tag[i];
+	"\n";
+
+	if (pass)
+		"  $$GREEN$$PASS$$FG$$\n\n";
+	else
+		"  $$RED$$FAIL$$FG$$\n\n";
+
+	// Test Case 3: Decrypt and verify
+	"Test 3: AES-128-GCM decryption and verification\n";
+
+	result = GCMDecrypt(&ctx, nonce, 12, ciphertext, 16, NULL, 0, tag, decrypted);
+
+	pass = (result == CRYPTO_OK);
+	if (pass)
+	{
+		for (i = 0; i < 16; i++)
+		{
+			if (decrypted[i] != plaintext[i])
+			{
+				pass = FALSE;
+				break;
+			}
+		}
+	}
+
+	"  Result:     ";
+	if (result == CRYPTO_OK)
+		"Tag verified\n";
+	else
+		"Tag verification FAILED\n";
+
+	"  Decrypted:  ";
+	for (i = 0; i < 16; i++)
+		"%02X", decrypted[i];
+	"\n";
+
+	if (pass)
+		"  $$GREEN$$PASS$$FG$$\n\n";
+	else
+		"  $$RED$$FAIL$$FG$$\n\n";
+
+	// Test Case 4: Tampered ciphertext should fail verification
+	"Test 4: AES-128-GCM tampered ciphertext detection\n";
+
+	ciphertext[0] ^= 0x01;  // Flip one bit
+	result = GCMDecrypt(&ctx, nonce, 12, ciphertext, 16, NULL, 0, tag, decrypted);
+
+	if (result == CRYPTO_ERR_AUTH_FAILED)
+	{
+		"  Tampered ciphertext correctly detected!\n";
+		"  $$GREEN$$PASS$$FG$$\n\n";
+	}
+	else
+	{
+		"  ERROR: Tampered ciphertext was not detected!\n";
+		"  $$RED$$FAIL$$FG$$\n\n";
+	}
+
+	// Test Case 5: AES-256-GCM
+	"Test 5: AES-256-GCM basic test\n";
+
+	// Key: 0x00-0x1F
+	for (i = 0; i < 32; i++)
+		key[i] = i;
+	// Nonce: 0x00-0x0B
+	for (i = 0; i < 12; i++)
+		nonce[i] = i;
+	// Plaintext: 0x00-0x0F
+	for (i = 0; i < 16; i++)
+		plaintext[i] = i;
+
+	GCMInit(&ctx, key, 256);
+	GCMEncrypt(&ctx, nonce, 12, plaintext, 16, NULL, 0, ciphertext, tag);
+
+	"  Ciphertext: ";
+	for (i = 0; i < 16; i++)
+		"%02X", ciphertext[i];
+	"\n";
+	"  Tag:        ";
+	for (i = 0; i < 16; i++)
+		"%02X", tag[i];
+	"\n";
+
+	// Decrypt and verify
+	result = GCMDecrypt(&ctx, nonce, 12, ciphertext, 16, NULL, 0, tag, decrypted);
+
+	pass = (result == CRYPTO_OK);
+	if (pass)
+	{
+		for (i = 0; i < 16; i++)
+		{
+			if (decrypted[i] != plaintext[i])
+			{
+				pass = FALSE;
+				break;
+			}
+		}
+	}
+
+	if (pass)
+		"  $$GREEN$$PASS$$FG$$\n\n";
+	else
+		"  $$RED$$FAIL$$FG$$\n\n";
+
+	"AES-GCM tests complete.\n";
+}

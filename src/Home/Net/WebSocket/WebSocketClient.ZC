@@ -1,0 +1,827 @@
+// WebSocketClient.ZC - WebSocket Client Implementation
+// Part of ZealOS TLS/HTTP/WebSocket implementation
+// RFC 6455 compliant
+
+// ============================================================================
+// BASE64 ENCODING (needed for WebSocket handshake)
+// ============================================================================
+
+U8 base64_chars[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+// Encode data to Base64
+I64 Base64Encode(U8 *input, I64 input_len, U8 *output)
+{
+	I64 i, j;
+	U32 triple;
+
+	for (i = 0, j = 0; i < input_len; i += 3) {
+		triple = input[i] << 16;
+		if (i + 1 < input_len) triple |= input[i + 1] << 8;
+		if (i + 2 < input_len) triple |= input[i + 2];
+
+		output[j++] = base64_chars[(triple >> 18) & 0x3F];
+		output[j++] = base64_chars[(triple >> 12) & 0x3F];
+		output[j++] = (i + 1 < input_len) ? base64_chars[(triple >> 6) & 0x3F] : '=';
+		output[j++] = (i + 2 < input_len) ? base64_chars[triple & 0x3F] : '=';
+	}
+
+	output[j] = 0;
+	return j;
+}
+
+// ============================================================================
+// SHA-1 (needed for WebSocket handshake accept key)
+// ============================================================================
+
+// SHA-1 implementation for WebSocket handshake only
+// This is not in the crypto module because SHA-1 is deprecated for security use
+
+class CSHA1Context
+{
+	U32  state[5];
+	U64  count;
+	U8   buffer[64];
+	I64  buffer_len;
+};
+
+#define SHA1_ROTL(x, n) (((x) << (n)) | ((x) >> (32 - (n))))
+
+U0 SHA1Init(CSHA1Context *ctx)
+{
+	ctx->state[0] = 0x67452301;
+	ctx->state[1] = 0xEFCDAB89;
+	ctx->state[2] = 0x98BADCFE;
+	ctx->state[3] = 0x10325476;
+	ctx->state[4] = 0xC3D2E1F0;
+	ctx->count = 0;
+	ctx->buffer_len = 0;
+}
+
+U0 SHA1Transform(CSHA1Context *ctx, U8 *block)
+{
+	U32 W[80];
+	U32 a, b, c, d, e, f, k, temp;
+	I64 i;
+
+	// Prepare message schedule
+	for (i = 0; i < 16; i++) {
+		W[i] = BE32_LOAD(&block[i * 4]);
+	}
+	for (i = 16; i < 80; i++) {
+		W[i] = SHA1_ROTL(W[i-3] ^ W[i-8] ^ W[i-14] ^ W[i-16], 1);
+	}
+
+	a = ctx->state[0];
+	b = ctx->state[1];
+	c = ctx->state[2];
+	d = ctx->state[3];
+	e = ctx->state[4];
+
+	for (i = 0; i < 80; i++) {
+		if (i < 20) {
+			f = (b & c) | ((~b) & d);
+			k = 0x5A827999;
+		} else if (i < 40) {
+			f = b ^ c ^ d;
+			k = 0x6ED9EBA1;
+		} else if (i < 60) {
+			f = (b & c) | (b & d) | (c & d);
+			k = 0x8F1BBCDC;
+		} else {
+			f = b ^ c ^ d;
+			k = 0xCA62C1D6;
+		}
+
+		temp = SHA1_ROTL(a, 5) + f + e + k + W[i];
+		e = d;
+		d = c;
+		c = SHA1_ROTL(b, 30);
+		b = a;
+		a = temp;
+	}
+
+	ctx->state[0] += a;
+	ctx->state[1] += b;
+	ctx->state[2] += c;
+	ctx->state[3] += d;
+	ctx->state[4] += e;
+}
+
+U0 SHA1Update(CSHA1Context *ctx, U8 *data, I64 length)
+{
+	I64 i;
+
+	for (i = 0; i < length; i++) {
+		ctx->buffer[ctx->buffer_len++] = data[i];
+		ctx->count += 8;
+
+		if (ctx->buffer_len == 64) {
+			SHA1Transform(ctx, ctx->buffer);
+			ctx->buffer_len = 0;
+		}
+	}
+}
+
+U0 SHA1Final(CSHA1Context *ctx, U8 *digest)
+{
+	U8 padding[64];
+	I64 pad_len;
+	I64 i;
+
+	// Pad message
+	MemSet(padding, 0, 64);
+	padding[0] = 0x80;
+
+	if (ctx->buffer_len < 56) {
+		pad_len = 56 - ctx->buffer_len;
+	} else {
+		pad_len = 120 - ctx->buffer_len;
+	}
+
+	SHA1Update(ctx, padding, pad_len);
+
+	// Append length (big-endian)
+	U8 len_bytes[8];
+	BE64_STORE(len_bytes, ctx->count);
+	SHA1Update(ctx, len_bytes, 8);
+
+	// Output hash
+	for (i = 0; i < 5; i++) {
+		BE32_STORE(&digest[i * 4], ctx->state[i]);
+	}
+}
+
+U0 SHA1(U8 *data, I64 length, U8 *digest)
+{
+	CSHA1Context ctx;
+	SHA1Init(&ctx);
+	SHA1Update(&ctx, data, length);
+	SHA1Final(&ctx, digest);
+}
+
+// ============================================================================
+// URL PARSING
+// ============================================================================
+
+// Parse WebSocket URL (ws:// or wss://)
+I64 WSParseURL(U8 *url, U8 **host_out, U8 **path_out, U16 *port_out, Bool *tls_out)
+{
+	U8 *p = url;
+	U8 *host_start;
+	U8 *host_end;
+	U8 *path_start;
+	I64 host_len;
+	I64 path_len;
+	U16 port = 0;
+	Bool use_tls = FALSE;
+
+	// Check scheme
+	if (StrNCmp(p, "wss://", 6) == 0) {
+		use_tls = TRUE;
+		port = 443;
+		p += 6;
+	} else if (StrNCmp(p, "ws://", 5) == 0) {
+		use_tls = FALSE;
+		port = 80;
+		p += 5;
+	} else {
+		return WS_ERR_INVALID_URL;
+	}
+
+	// Find host
+	host_start = p;
+	while (*p && *p != ':' && *p != '/') p++;
+	host_end = p;
+	host_len = host_end - host_start;
+
+	if (host_len == 0) return WS_ERR_INVALID_URL;
+
+	// Check for port
+	if (*p == ':') {
+		p++;
+		port = 0;
+		while (*p >= '0' && *p <= '9') {
+			port = port * 10 + (*p - '0');
+			p++;
+		}
+	}
+
+	// Get path
+	if (*p == '/') {
+		path_start = p;
+		path_len = StrLen(p);
+	} else {
+		path_start = "/";
+		path_len = 1;
+	}
+
+	// Allocate and copy
+	*host_out = MAlloc(host_len + 1);
+	MemCpy(*host_out, host_start, host_len);
+	(*host_out)[host_len] = 0;
+
+	*path_out = MAlloc(path_len + 1);
+	MemCpy(*path_out, path_start, path_len);
+	(*path_out)[path_len] = 0;
+
+	*port_out = port;
+	*tls_out = use_tls;
+
+	return WS_OK;
+}
+
+// ============================================================================
+// WEBSOCKET CREATION/DESTRUCTION
+// ============================================================================
+
+// Create new WebSocket connection object
+CWebSocket *WSNew()
+{
+	CWebSocket *ws = MAlloc(sizeof(CWebSocket));
+	MemSet(ws, 0, sizeof(CWebSocket));
+	ws->state = WS_STATE_CLOSED;
+	ws->timeout = 30000;
+	ws->recv_buffer_size = 65536;
+	ws->recv_buffer = MAlloc(ws->recv_buffer_size);
+	return ws;
+}
+
+// Free WebSocket connection
+U0 WSFree(CWebSocket *ws)
+{
+	if (!ws) return;
+
+	if (ws->state != WS_STATE_CLOSED) {
+		// Should close properly but just cleanup
+		if (ws->use_tls && ws->tls_socket) {
+			TLSClose(ws->tls_socket);
+			Free(ws->tls_socket);
+		} else if (ws->tcp_socket) {
+			TCPSocketClose(ws->tcp_socket);
+		}
+	}
+
+	if (ws->host) Free(ws->host);
+	if (ws->path) Free(ws->path);
+	if (ws->recv_buffer) Free(ws->recv_buffer);
+	if (ws->close_reason) Free(ws->close_reason);
+
+	Free(ws);
+}
+
+// ============================================================================
+// LOW-LEVEL I/O
+// ============================================================================
+
+// Send data
+I64 WSSend(CWebSocket *ws, U8 *data, I64 length)
+{
+	if (ws->use_tls) {
+		return TLSSocketSend(ws->tls_socket, data, length);
+	} else {
+		return TCPSocketSend(ws->tcp_socket, data, length);
+	}
+}
+
+// Receive data
+I64 WSRecv(CWebSocket *ws, U8 *buffer, I64 length)
+{
+	if (ws->use_tls) {
+		return TLSSocketRecv(ws->tls_socket, buffer, length);
+	} else {
+		return TCPSocketRecv(ws->tcp_socket, buffer, length);
+	}
+}
+
+// Read exact number of bytes
+I64 WSRecvExact(CWebSocket *ws, U8 *buffer, I64 length)
+{
+	I64 received = 0;
+	I64 result;
+
+	while (received < length) {
+		result = WSRecv(ws, &buffer[received], length - received);
+		if (result <= 0) return WS_ERR_RECV_FAILED;
+		received += result;
+	}
+
+	return received;
+}
+
+// ============================================================================
+// HANDSHAKE
+// ============================================================================
+
+// Perform WebSocket opening handshake
+I64 WSHandshake(CWebSocket *ws)
+{
+	U8 request[1024];
+	U8 response[2048];
+	U8 key[16];
+	U8 key_base64[32];
+	U8 accept_key[64];
+	U8 expected_accept[28];
+	U8 sha1_hash[20];
+	I64 pos;
+	I64 result;
+
+	// Generate random key
+	Random(key, 16);
+	Base64Encode(key, 16, key_base64);
+
+	// Build HTTP upgrade request
+	pos = StrPrint(request,
+		"GET %s HTTP/1.1\r\n"
+		"Host: %s\r\n"
+		"Upgrade: websocket\r\n"
+		"Connection: Upgrade\r\n"
+		"Sec-WebSocket-Key: %s\r\n"
+		"Sec-WebSocket-Version: 13\r\n"
+		"\r\n",
+		ws->path, ws->host, key_base64);
+
+	// Send request
+	result = WSSend(ws, request, pos);
+	if (result < 0) return WS_ERR_HANDSHAKE_FAILED;
+
+	// Read response (read until \r\n\r\n)
+	I64 resp_len = 0;
+	while (resp_len < 2040) {
+		result = WSRecv(ws, &response[resp_len], 1);
+		if (result <= 0) return WS_ERR_HANDSHAKE_FAILED;
+		resp_len++;
+
+		if (resp_len >= 4 &&
+		    response[resp_len-4] == '\r' && response[resp_len-3] == '\n' &&
+		    response[resp_len-2] == '\r' && response[resp_len-1] == '\n') {
+			break;
+		}
+	}
+	response[resp_len] = 0;
+
+	// Check for 101 Switching Protocols
+	if (!StrStr(response, "101")) {
+		return WS_ERR_HANDSHAKE_FAILED;
+	}
+
+	// Verify Sec-WebSocket-Accept header
+	// Expected value = Base64(SHA1(key + GUID))
+	StrPrint(accept_key, "%s%s", key_base64, WS_GUID);
+	SHA1(accept_key, StrLen(accept_key), sha1_hash);
+	Base64Encode(sha1_hash, 20, expected_accept);
+
+	// Find Sec-WebSocket-Accept in response
+	U8 *accept_header = StrStr(response, "Sec-WebSocket-Accept:");
+	if (!accept_header) return WS_ERR_HANDSHAKE_FAILED;
+
+	accept_header += 21;  // Skip header name
+	while (*accept_header == ' ') accept_header++;
+
+	// Compare (at least the first 28 chars)
+	if (StrNCmp(accept_header, expected_accept, 28) != 0) {
+		return WS_ERR_HANDSHAKE_FAILED;
+	}
+
+	ws->state = WS_STATE_OPEN;
+	return WS_OK;
+}
+
+// ============================================================================
+// CONNECTION
+// ============================================================================
+
+// Connect to WebSocket server
+I64 WSConnect(CWebSocket *ws, U8 *url)
+{
+	I64 result;
+
+	// Parse URL
+	result = WSParseURL(url, &ws->host, &ws->path, &ws->port, &ws->use_tls);
+	if (result != WS_OK) return result;
+
+	ws->state = WS_STATE_CONNECTING;
+
+	// Connect socket
+	if (ws->use_tls) {
+		ws->tls_socket = MAlloc(sizeof(CTLSSocket));
+		MemSet(ws->tls_socket, 0, sizeof(CTLSSocket));
+
+		result = TLSConnect(ws->tls_socket, ws->host, ws->port, ws->timeout);
+		if (result != TLS_OK) {
+			Free(ws->tls_socket);
+			ws->tls_socket = NULL;
+			ws->state = WS_STATE_CLOSED;
+			return WS_ERR_CONNECTION_FAILED;
+		}
+	} else {
+		ws->tcp_socket = TCPSocket();
+		if (!ws->tcp_socket) {
+			ws->state = WS_STATE_CLOSED;
+			return WS_ERR_CONNECTION_FAILED;
+		}
+
+		result = TCPSocketConnect(ws->tcp_socket, ws->host, ws->port);
+		if (result < 0) {
+			TCPSocketClose(ws->tcp_socket);
+			ws->tcp_socket = NULL;
+			ws->state = WS_STATE_CLOSED;
+			return WS_ERR_CONNECTION_FAILED;
+		}
+	}
+
+	// Perform WebSocket handshake
+	result = WSHandshake(ws);
+	if (result != WS_OK) {
+		if (ws->use_tls) {
+			TLSClose(ws->tls_socket);
+			Free(ws->tls_socket);
+			ws->tls_socket = NULL;
+		} else {
+			TCPSocketClose(ws->tcp_socket);
+			ws->tcp_socket = NULL;
+		}
+		ws->state = WS_STATE_CLOSED;
+		return result;
+	}
+
+	return WS_OK;
+}
+
+// ============================================================================
+// FRAME SENDING
+// ============================================================================
+
+// Send a WebSocket frame
+I64 WSSendFrame(CWebSocket *ws, U8 opcode, U8 *data, I64 length, Bool fin)
+{
+	U8 header[14];
+	U8 mask_key[4];
+	I64 header_len = 0;
+	I64 result;
+	I64 i;
+
+	if (ws->state != WS_STATE_OPEN && ws->state != WS_STATE_CLOSING) {
+		return WS_ERR_CLOSED;
+	}
+
+	// FIN + opcode
+	header[header_len++] = (fin ? 0x80 : 0x00) | (opcode & 0x0F);
+
+	// Payload length + mask bit (client always masks)
+	if (length < 126) {
+		header[header_len++] = 0x80 | length;
+	} else if (length <= 0xFFFF) {
+		header[header_len++] = 0x80 | 126;
+		header[header_len++] = (length >> 8) & 0xFF;
+		header[header_len++] = length & 0xFF;
+	} else {
+		header[header_len++] = 0x80 | 127;
+		header[header_len++] = 0;
+		header[header_len++] = 0;
+		header[header_len++] = 0;
+		header[header_len++] = 0;
+		header[header_len++] = (length >> 24) & 0xFF;
+		header[header_len++] = (length >> 16) & 0xFF;
+		header[header_len++] = (length >> 8) & 0xFF;
+		header[header_len++] = length & 0xFF;
+	}
+
+	// Generate mask key
+	Random(mask_key, 4);
+	MemCpy(&header[header_len], mask_key, 4);
+	header_len += 4;
+
+	// Send header
+	result = WSSend(ws, header, header_len);
+	if (result < 0) return WS_ERR_SEND_FAILED;
+
+	// Send masked payload
+	if (length > 0) {
+		U8 *masked = MAlloc(length);
+		for (i = 0; i < length; i++) {
+			masked[i] = data[i] ^ mask_key[i % 4];
+		}
+		result = WSSend(ws, masked, length);
+		Free(masked);
+		if (result < 0) return WS_ERR_SEND_FAILED;
+	}
+
+	return WS_OK;
+}
+
+// Send text message
+I64 WSSendText(CWebSocket *ws, U8 *text)
+{
+	return WSSendFrame(ws, WS_OPCODE_TEXT, text, StrLen(text), TRUE);
+}
+
+// Send binary message
+I64 WSSendBinary(CWebSocket *ws, U8 *data, I64 length)
+{
+	return WSSendFrame(ws, WS_OPCODE_BINARY, data, length, TRUE);
+}
+
+// Send ping
+I64 WSSendPing(CWebSocket *ws, U8 *data, I64 length)
+{
+	if (length > 125) length = 125;  // Control frame limit
+	return WSSendFrame(ws, WS_OPCODE_PING, data, length, TRUE);
+}
+
+// Send pong
+I64 WSSendPong(CWebSocket *ws, U8 *data, I64 length)
+{
+	if (length > 125) length = 125;
+	return WSSendFrame(ws, WS_OPCODE_PONG, data, length, TRUE);
+}
+
+// Send close frame
+I64 WSSendClose(CWebSocket *ws, U16 code, U8 *reason)
+{
+	U8 data[127];
+	I64 len = 0;
+
+	if (code > 0) {
+		data[0] = (code >> 8) & 0xFF;
+		data[1] = code & 0xFF;
+		len = 2;
+
+		if (reason) {
+			I64 reason_len = StrLen(reason);
+			if (reason_len > 123) reason_len = 123;
+			MemCpy(&data[2], reason, reason_len);
+			len += reason_len;
+		}
+	}
+
+	ws->state = WS_STATE_CLOSING;
+	return WSSendFrame(ws, WS_OPCODE_CLOSE, data, len, TRUE);
+}
+
+// ============================================================================
+// FRAME RECEIVING
+// ============================================================================
+
+// Read a WebSocket frame
+// Returns opcode, or negative error
+// Fills data_out and length_out (caller must Free data_out)
+I64 WSRecvFrame(CWebSocket *ws, U8 **data_out, I64 *length_out, Bool *fin_out)
+{
+	U8 header[2];
+	U8 ext_len[8];
+	U8 mask_key[4];
+	U64 payload_len;
+	Bool fin, masked;
+	U8 opcode;
+	I64 result;
+	I64 i;
+
+	if (ws->state != WS_STATE_OPEN && ws->state != WS_STATE_CLOSING) {
+		return WS_ERR_CLOSED;
+	}
+
+	// Read first 2 bytes
+	result = WSRecvExact(ws, header, 2);
+	if (result < 0) return result;
+
+	fin = (header[0] & 0x80) != 0;
+	opcode = header[0] & 0x0F;
+	masked = (header[1] & 0x80) != 0;
+	payload_len = header[1] & 0x7F;
+
+	// Extended length
+	if (payload_len == 126) {
+		result = WSRecvExact(ws, ext_len, 2);
+		if (result < 0) return result;
+		payload_len = (ext_len[0] << 8) | ext_len[1];
+	} else if (payload_len == 127) {
+		result = WSRecvExact(ws, ext_len, 8);
+		if (result < 0) return result;
+		payload_len = 0;
+		for (i = 0; i < 8; i++) {
+			payload_len = (payload_len << 8) | ext_len[i];
+		}
+	}
+
+	// Check size
+	if (payload_len > WS_MAX_FRAME_SIZE) {
+		return WS_ERR_FRAME_TOO_LARGE;
+	}
+
+	// Read mask key if present (server shouldn't mask, but handle it)
+	if (masked) {
+		result = WSRecvExact(ws, mask_key, 4);
+		if (result < 0) return result;
+	}
+
+	// Read payload
+	*data_out = NULL;
+	*length_out = payload_len;
+	*fin_out = fin;
+
+	if (payload_len > 0) {
+		*data_out = MAlloc(payload_len + 1);  // +1 for null terminator
+		result = WSRecvExact(ws, *data_out, payload_len);
+		if (result < 0) {
+			Free(*data_out);
+			*data_out = NULL;
+			return result;
+		}
+
+		// Unmask if needed
+		if (masked) {
+			for (i = 0; i < payload_len; i++) {
+				(*data_out)[i] ^= mask_key[i % 4];
+			}
+		}
+
+		(*data_out)[payload_len] = 0;  // Null terminate for text
+	}
+
+	return opcode;
+}
+
+// Receive a complete message (handles fragmentation and control frames)
+// Returns message opcode (TEXT or BINARY), or negative error
+I64 WSRecvMessage(CWebSocket *ws, CWSMessage *msg)
+{
+	U8 *frame_data;
+	I64 frame_len;
+	Bool fin;
+	I64 opcode;
+	I64 result;
+
+	msg->data = NULL;
+	msg->length = 0;
+	msg->opcode = 0;
+
+	// Reset fragment buffer
+	ws->recv_buffer_len = 0;
+
+	while (TRUE) {
+		opcode = WSRecvFrame(ws, &frame_data, &frame_len, &fin);
+		if (opcode < 0) return opcode;
+
+		// Handle control frames
+		if (opcode >= 0x08) {
+			switch (opcode) {
+				case WS_OPCODE_CLOSE:
+					if (frame_len >= 2) {
+						ws->close_code = (frame_data[0] << 8) | frame_data[1];
+						if (frame_len > 2) {
+							ws->close_reason = MAlloc(frame_len - 1);
+							MemCpy(ws->close_reason, &frame_data[2], frame_len - 2);
+							ws->close_reason[frame_len - 2] = 0;
+						}
+					}
+					// Send close response if we haven't already
+					if (ws->state == WS_STATE_OPEN) {
+						WSSendClose(ws, WS_CLOSE_NORMAL, NULL);
+					}
+					ws->state = WS_STATE_CLOSED;
+					if (frame_data) Free(frame_data);
+					return WS_ERR_CLOSED;
+
+				case WS_OPCODE_PING:
+					WSSendPong(ws, frame_data, frame_len);
+					if (frame_data) Free(frame_data);
+					continue;  // Keep reading
+
+				case WS_OPCODE_PONG:
+					// Ignore pongs
+					if (frame_data) Free(frame_data);
+					continue;
+			}
+		}
+
+		// Handle data frames
+		if (opcode == WS_OPCODE_TEXT || opcode == WS_OPCODE_BINARY) {
+			ws->recv_opcode = opcode;
+		} else if (opcode != WS_OPCODE_CONTINUATION) {
+			if (frame_data) Free(frame_data);
+			return WS_ERR_INVALID_FRAME;
+		}
+
+		// Append to buffer
+		if (frame_len > 0) {
+			if (ws->recv_buffer_len + frame_len > ws->recv_buffer_size) {
+				// Expand buffer
+				I64 new_size = ws->recv_buffer_size * 2;
+				while (new_size < ws->recv_buffer_len + frame_len) {
+					new_size *= 2;
+				}
+				U8 *new_buf = MAlloc(new_size);
+				MemCpy(new_buf, ws->recv_buffer, ws->recv_buffer_len);
+				Free(ws->recv_buffer);
+				ws->recv_buffer = new_buf;
+				ws->recv_buffer_size = new_size;
+			}
+			MemCpy(&ws->recv_buffer[ws->recv_buffer_len], frame_data, frame_len);
+			ws->recv_buffer_len += frame_len;
+		}
+
+		if (frame_data) Free(frame_data);
+
+		// If FIN, message is complete
+		if (fin) {
+			msg->opcode = ws->recv_opcode;
+			msg->length = ws->recv_buffer_len;
+			msg->data = MAlloc(ws->recv_buffer_len + 1);
+			MemCpy(msg->data, ws->recv_buffer, ws->recv_buffer_len);
+			msg->data[ws->recv_buffer_len] = 0;
+			return ws->recv_opcode;
+		}
+	}
+}
+
+// Free message data
+U0 WSMessageFree(CWSMessage *msg)
+{
+	if (msg->data) {
+		Free(msg->data);
+		msg->data = NULL;
+	}
+	msg->length = 0;
+}
+
+// ============================================================================
+// CLOSE
+// ============================================================================
+
+// Close WebSocket connection gracefully
+U0 WSClose(CWebSocket *ws)
+{
+	if (ws->state == WS_STATE_OPEN) {
+		WSSendClose(ws, WS_CLOSE_NORMAL, NULL);
+
+		// Try to receive close response (with short timeout)
+		U8 *data;
+		I64 len;
+		Bool fin;
+		I64 opcode = WSRecvFrame(ws, &data, &len, &fin);
+		if (data) Free(data);
+	}
+
+	ws->state = WS_STATE_CLOSED;
+
+	if (ws->use_tls && ws->tls_socket) {
+		TLSClose(ws->tls_socket);
+		Free(ws->tls_socket);
+		ws->tls_socket = NULL;
+	} else if (ws->tcp_socket) {
+		TCPSocketClose(ws->tcp_socket);
+		ws->tcp_socket = NULL;
+	}
+}
+
+// ============================================================================
+// TEST
+// ============================================================================
+
+Bool WSTest()
+{
+	"====== WebSocket Test ======\n\n";
+
+	"Connecting to wss://echo.websocket.org ...\n";
+
+	CWebSocket *ws = WSNew();
+	I64 result = WSConnect(ws, "wss://echo.websocket.org");
+
+	if (result != WS_OK) {
+		"Connection failed: %s\n", WSErrorString(result);
+		WSFree(ws);
+		return FALSE;
+	}
+
+	"Connected!\n";
+
+	// Send a message
+	"Sending 'Hello from ZealOS!'...\n";
+	result = WSSendText(ws, "Hello from ZealOS!");
+	if (result != WS_OK) {
+		"Send failed: %s\n", WSErrorString(result);
+		WSFree(ws);
+		return FALSE;
+	}
+
+	// Receive echo
+	"Waiting for echo...\n";
+	CWSMessage msg;
+	result = WSRecvMessage(ws, &msg);
+	if (result < 0) {
+		"Receive failed: %s\n", WSErrorString(result);
+		WSFree(ws);
+		return FALSE;
+	}
+
+	"Received: %s\n", msg.data;
+	WSMessageFree(&msg);
+
+	// Close
+	"Closing connection...\n";
+	WSClose(ws);
+	WSFree(ws);
+
+	"\nWebSocket test passed!\n";
+	return TRUE;
+}

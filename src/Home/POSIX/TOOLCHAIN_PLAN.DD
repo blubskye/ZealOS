@@ -1,0 +1,310 @@
+$WW,1$$FG,5,0$ZealOS Full C/C++/Go Toolchain Plan$FG$
+
+$FG,2$Goal:$FG$ Full C/C++ compiler (LLVM/Clang) + Go language support
+
+═══════════════════════════════════════════════════════════════════════════════
+$FG,5$PHASE A: BUILD INFRASTRUCTURE$FG$
+═══════════════════════════════════════════════════════════════════════════════
+
+These tools are required to run configure scripts and build systems.
+
+$FG,2$A1. Shell Interpreter (sh)$FG$
+────────────────────────────────
+Required features:
+  • Variable expansion ($VAR, ${VAR}, ${VAR:-default})
+  • Command substitution ($(cmd) and `cmd`)
+  • Pipes (cmd1 | cmd2 | cmd3)
+  • Redirects (>, >>, <, 2>&1, &>)
+  • Control flow (if/then/else/fi, for/do/done, while, case)
+  • Functions
+  • Background jobs (&)
+  • Exit status ($?)
+  • Here documents (<<EOF)
+  • Quoting ('single', "double", \escape)
+  • Glob expansion (*, ?, [abc])
+
+Files: sh.ZC (~3000-5000 lines)
+
+$FG,2$A2. Build Tools$FG$
+────────────────────────────────
+make    - GNU Make compatible
+          • Makefile parsing
+          • Variable expansion
+          • Pattern rules (%.o: %.c)
+          • Automatic variables ($@, $<, $^)
+          • Dependency tracking
+          • Parallel builds (-j)
+          Files: make.ZC (~2000-3000 lines)
+
+install - Install files with permissions
+          Files: install.ZC (~200 lines)
+
+cmake   - Minimal CMake (or cmake wrapper)
+          Note: May need to cross-compile CMake first
+          Alternative: Port ninja build system (simpler)
+
+$FG,2$A3. Additional Text Tools$FG$
+────────────────────────────────
+sed     - Stream editor
+          • s/pattern/replacement/flags
+          • Address ranges (1,10 or /pattern/)
+          • Commands: d, p, a, i, c, y
+          • Hold space (h, H, g, G, x)
+          • Branches (b, t)
+          Files: sed.ZC (~1500-2000 lines)
+
+awk     - Pattern scanning
+          • Field splitting ($1, $2, NF, NR)
+          • Pattern { action } rules
+          • BEGIN/END blocks
+          • Variables and arrays
+          • Built-in functions (substr, split, gsub)
+          • Printf formatting
+          Files: awk.ZC (~2500-3500 lines)
+
+find    - Find files
+          • -name, -type, -size, -mtime
+          • -exec, -print, -print0
+          • Logical operators (-a, -o, !)
+          Files: find.ZC (~800-1000 lines)
+
+xargs   - Build command lines
+          • -0 (null delimiter)
+          • -n (max args)
+          • -P (parallel)
+          • -I {} (replacement)
+          Files: xargs.ZC (~400-600 lines)
+
+$FG,2$A4. Compression Tools$FG$
+────────────────────────────────
+gzip    - DEFLATE compression
+          • Compress/decompress
+          • -c (stdout), -d (decompress), -k (keep)
+          Files: gzip.ZC + deflate.ZC (~2000-3000 lines)
+
+tar     - Archive tool
+          • Create (-c), extract (-x), list (-t)
+          • Compression (-z gzip, -j bzip2)
+          • -f file, -v verbose
+          • Handle tar headers
+          Files: tar.ZC (~1500-2000 lines)
+
+bzip2   - BWT compression (optional, but common)
+          Files: bzip2.ZC (~1500 lines)
+
+═══════════════════════════════════════════════════════════════════════════════
+$FG,5$PHASE B: COMPLETE LIBC + SYSTEM LIBRARIES$FG$
+═══════════════════════════════════════════════════════════════════════════════
+
+$FG,2$B1. Threading (pthreads)$FG$
+────────────────────────────────
+pthread_create, pthread_join, pthread_exit
+pthread_mutex_init/lock/unlock/destroy
+pthread_cond_init/wait/signal/broadcast
+pthread_rwlock_*
+pthread_key_create (thread-local storage)
+pthread_once
+pthread_attr_*
+
+Implementation: Map to ZealOS task system
+Files: pthread.ZC (~1000-1500 lines)
+
+$FG,2$B2. Memory Mapping$FG$
+────────────────────────────────
+mmap    - Map files/anonymous memory
+munmap  - Unmap
+mprotect - Change protection
+msync   - Sync to disk
+
+Implementation: Requires kernel support or emulation
+Files: mmap.ZC (~500-800 lines)
+
+$FG,2$B3. Signals$FG$
+────────────────────────────────
+signal, sigaction
+sigprocmask, sigsuspend
+kill, raise
+sigset operations
+
+Implementation: ZealOS doesn't have Unix signals
+               Need emulation layer
+Files: signal.ZC (~800-1000 lines)
+
+$FG,2$B4. Process Management$FG$
+────────────────────────────────
+fork    - Create process (challenging in ZealOS)
+exec*   - Execute program
+wait*   - Wait for child
+pipe    - Create pipe
+dup/dup2 - Duplicate file descriptors
+
+Implementation: May need to redesign for ZealOS model
+Files: process.ZC (~1000-1500 lines)
+
+$FG,2$B5. Networking (already have basics)$FG$
+────────────────────────────────
+Verify complete:
+  socket, bind, listen, accept, connect
+  send, recv, sendto, recvfrom
+  select, poll
+  getaddrinfo, getnameinfo
+  setsockopt, getsockopt
+
+$FG,2$B6. Math Library (libm)$FG$
+────────────────────────────────
+Trigonometric: sin, cos, tan, asin, acos, atan, atan2
+Hyperbolic: sinh, cosh, tanh, asinh, acosh, atanh
+Exponential: exp, exp2, expm1, log, log2, log10, log1p
+Power: pow, sqrt, cbrt, hypot
+Rounding: ceil, floor, trunc, round, nearbyint
+Remainder: fmod, remainder, remquo
+Floating: frexp, ldexp, modf, scalbn, copysign
+Comparison: fmax, fmin, fdim, fabs
+Classification: fpclassify, isnan, isinf, isfinite
+Error/Gamma: erf, erfc, lgamma, tgamma
+
+Implementation: Software implementations or x87 FPU
+Files: libm.ZC (~2000-3000 lines)
+
+$FG,2$B7. Dynamic Linker$FG$
+────────────────────────────────
+If we want shared libraries (.so):
+  • ELF parser
+  • Symbol resolution
+  • Relocation processing
+  • PLT/GOT setup
+
+Alternative: Static linking only (simpler)
+Files: ld.so.ZC (~3000-5000 lines if implemented)
+
+═══════════════════════════════════════════════════════════════════════════════
+$FG,5$PHASE C: LLVM/CLANG PORT$FG$
+═══════════════════════════════════════════════════════════════════════════════
+
+$FG,2$C1. Create ZealOS Target in LLVM$FG$
+────────────────────────────────
+LLVM needs a "target triple" for ZealOS:
+  x86_64-unknown-zealos
+
+Required components:
+  • Target info (data layout, pointer size)
+  • Calling convention (use SysV AMD64 ABI)
+  • Object file format (ELF or custom)
+  • Relocation types
+  • System headers location
+
+Files to create in LLVM source:
+  llvm/lib/Target/X86/X86TargetZealOS.cpp
+  clang/lib/Basic/Targets/ZealOS.h
+  clang/lib/Basic/Targets/ZealOS.cpp
+  clang/lib/Driver/ToolChains/ZealOS.h
+  clang/lib/Driver/ToolChains/ZealOS.cpp
+
+$FG,2$C2. Cross-Compile LLVM$FG$
+────────────────────────────────
+Build on Linux:
+  cmake -DCMAKE_CROSSCOMPILING=True \
+        -DLLVM_TARGET_ARCH=X86 \
+        -DLLVM_DEFAULT_TARGET_TRIPLE=x86_64-unknown-zealos \
+        -DLLVM_TARGETS_TO_BUILD=X86 \
+        ...
+
+This produces clang/clang++ that outputs ZealOS binaries.
+
+$FG,2$C3. Port to Native$FG$
+────────────────────────────────
+Once we have cross-compiled clang:
+  1. Build LLVM on ZealOS using cross-compiled clang
+  2. Now we have native clang on ZealOS
+  3. Self-hosting achieved
+
+═══════════════════════════════════════════════════════════════════════════════
+$FG,5$PHASE D: GO LANGUAGE PORT$FG$
+═══════════════════════════════════════════════════════════════════════════════
+
+$FG,2$D1. Port Go 1.4$FG$
+────────────────────────────────
+Go 1.4 is the last version written in C.
+Source: https://go.dev/dl/go1.4-bootstrap-20171003.tar.gz
+
+Required:
+  • Working C compiler (clang from Phase C)
+  • Complete libc with pthreads
+  • mmap support
+  • Signals (or emulation)
+
+Build:
+  cd go/src
+  ./make.bash
+
+$FG,2$D2. Go Runtime Requirements$FG$
+────────────────────────────────
+Go runtime needs:
+  • Goroutine scheduler (m:n threading)
+  • Garbage collector
+  • Stack management (segmented/copying stacks)
+  • System calls for:
+    - Memory (mmap, madvise)
+    - Threading (clone/futex on Linux → adapt for ZealOS)
+    - Time (clock_gettime)
+    - Networking (epoll → adapt to ZealOS)
+    - Signals (for preemption)
+
+Files to modify in Go:
+  src/runtime/os_zealos.go      (new)
+  src/runtime/sys_zealos_amd64.s (new)
+  src/syscall/syscall_zealos.go (new)
+  src/syscall/zsyscall_zealos_amd64.go (new)
+
+$FG,2$D3. Bootstrap Modern Go$FG$
+────────────────────────────────
+Once Go 1.4 works:
+  GOROOT_BOOTSTRAP=/path/to/go1.4 ./make.bash
+
+This builds Go 1.20+ using Go 1.4.
+
+═══════════════════════════════════════════════════════════════════════════════
+$FG,5$ESTIMATED EFFORT$FG$
+═══════════════════════════════════════════════════════════════════════════════
+
+Phase A (Build Infrastructure):     ~15,000-20,000 lines
+Phase B (Complete libc):            ~10,000-15,000 lines
+Phase C (LLVM port):                ~2,000-5,000 lines (ZealOS-specific)
+                                    + configuration/build work
+Phase D (Go port):                  ~5,000-10,000 lines (ZealOS-specific)
+
+Total new ZealOS code:              ~35,000-50,000 lines
+
+Timeline estimate:
+  Phase A: 2-4 weeks
+  Phase B: 2-3 weeks
+  Phase C: 2-4 weeks (mostly configuration)
+  Phase D: 2-4 weeks
+
+═══════════════════════════════════════════════════════════════════════════════
+$FG,5$ALTERNATIVE: SIMPLER GO PORT$FG$
+═══════════════════════════════════════════════════════════════════════════════
+
+Instead of full LLVM, we could:
+
+1. Use TCC for C compilation (limited but works)
+2. Cross-compile Go on Linux targeting ZealOS
+3. Only need ZealOS runtime support, not full toolchain
+
+This is faster but means:
+  • No native C++ on ZealOS
+  • No building Go from source on ZealOS
+  • Dependency on Linux for toolchain
+
+═══════════════════════════════════════════════════════════════════════════════
+$FG,5$STARTING POINT$FG$
+═══════════════════════════════════════════════════════════════════════════════
+
+Recommended order:
+  1. sh.ZC      - Everything needs shell scripts
+  2. make.ZC   - Build system
+  3. sed.ZC    - Configure scripts need it
+  4. pthread.ZC - Threading (Go needs this)
+  5. Continue from there...
+
+$FG,2$Let's begin with the shell interpreter.$FG$

@@ -1,0 +1,485 @@
+// Environ.ZC - POSIX Environment Variables for ZealOS
+// Part of ZealOS POSIX compatibility layer
+
+// ============================================================================
+// ENVIRONMENT VARIABLE IMPLEMENTATION
+// ============================================================================
+
+// Initial environment capacity
+#define ENV_INITIAL_CAPACITY 64
+
+// Initialize environment for a process
+U0 PosixEnvInit(CPosixProcess *proc)
+{
+	proc->environ = MAlloc(ENV_INITIAL_CAPACITY * sizeof(U8*));
+	MemSet(proc->environ, 0, ENV_INITIAL_CAPACITY * sizeof(U8*));
+	proc->environ_count = 0;
+	proc->environ_capacity = ENV_INITIAL_CAPACITY;
+
+	// Set default environment variables
+	PosixSetenvInternal(proc, "PATH", "/bin:/usr/bin:.", 1);
+	PosixSetenvInternal(proc, "HOME", "~", 1);
+	PosixSetenvInternal(proc, "SHELL", "/bin/sh", 1);
+	PosixSetenvInternal(proc, "USER", "zealos", 1);
+	PosixSetenvInternal(proc, "LOGNAME", "zealos", 1);
+	PosixSetenvInternal(proc, "TERM", "xterm", 1);
+	PosixSetenvInternal(proc, "LANG", "C", 1);
+	PosixSetenvInternal(proc, "LC_ALL", "C", 1);
+
+	// Set PWD to current directory
+	if (proc->cwd)
+		PosixSetenvInternal(proc, "PWD", proc->cwd, 1);
+}
+
+// Free environment
+U0 PosixEnvFree(CPosixProcess *proc)
+{
+	I64 i;
+
+	if (!proc->environ)
+		return;
+
+	for (i = 0; i < proc->environ_count; i++) {
+		if (proc->environ[i])
+			Free(proc->environ[i]);
+	}
+
+	Free(proc->environ);
+	proc->environ = NULL;
+	proc->environ_count = 0;
+	proc->environ_capacity = 0;
+}
+
+// Find environment variable index
+// Returns index or -1 if not found
+I64 PosixEnvFind(CPosixProcess *proc, U8 *name)
+{
+	I64 i, name_len;
+
+	if (!proc->environ || !name)
+		return -1;
+
+	name_len = StrLen(name);
+
+	for (i = 0; i < proc->environ_count; i++) {
+		if (proc->environ[i]) {
+			// Check if this entry starts with "name="
+			if (StrNCmp(proc->environ[i], name, name_len) == 0 &&
+			    proc->environ[i][name_len] == '=') {
+				return i;
+			}
+		}
+	}
+
+	return -1;
+}
+
+// Internal setenv with process parameter
+I64 PosixSetenvInternal(CPosixProcess *proc, U8 *name, U8 *value, I64 overwrite)
+{
+	I64 idx, len;
+	U8 *entry;
+
+	if (!proc || !name || !*name)
+		return PosixSetErrno(EINVAL);
+
+	// Check for '=' in name
+	if (StrFirstOcc(name, "="))
+		return PosixSetErrno(EINVAL);
+
+	// Check if variable exists
+	idx = PosixEnvFind(proc, name);
+
+	if (idx >= 0) {
+		// Variable exists
+		if (!overwrite)
+			return 0;
+
+		// Replace it
+		Free(proc->environ[idx]);
+
+		if (!value) {
+			// Unset
+			proc->environ[idx] = NULL;
+			return 0;
+		}
+
+		len = StrLen(name) + 1 + StrLen(value) + 1;
+		entry = MAlloc(len);
+		StrCpy(entry, name);
+		StrCat(entry, "=");
+		StrCat(entry, value);
+		proc->environ[idx] = entry;
+		return 0;
+	}
+
+	// Variable doesn't exist - add it
+	if (!value)
+		return 0;  // Nothing to unset
+
+	// Expand array if needed
+	if (proc->environ_count >= proc->environ_capacity - 1) {
+		I64 new_cap = proc->environ_capacity * 2;
+		U8 **new_env = MAlloc(new_cap * sizeof(U8*));
+		MemCpy(new_env, proc->environ, proc->environ_capacity * sizeof(U8*));
+		MemSet(&new_env[proc->environ_capacity], 0,
+		       (new_cap - proc->environ_capacity) * sizeof(U8*));
+		Free(proc->environ);
+		proc->environ = new_env;
+		proc->environ_capacity = new_cap;
+	}
+
+	// Create entry
+	len = StrLen(name) + 1 + StrLen(value) + 1;
+	entry = MAlloc(len);
+	StrCpy(entry, name);
+	StrCat(entry, "=");
+	StrCat(entry, value);
+
+	proc->environ[proc->environ_count++] = entry;
+	proc->environ[proc->environ_count] = NULL;  // NULL terminate
+
+	return 0;
+}
+
+// ============================================================================
+// PUBLIC ENVIRONMENT FUNCTIONS
+// ============================================================================
+
+// Get environment variable
+U8 *PosixGetenv(U8 *name)
+{
+	CPosixProcess *proc = PosixGetCurrent();
+	I64 idx, name_len;
+
+	if (!proc || !name)
+		return NULL;
+
+	idx = PosixEnvFind(proc, name);
+	if (idx < 0)
+		return NULL;
+
+	// Return pointer to value after '='
+	name_len = StrLen(name);
+	return &proc->environ[idx][name_len + 1];
+}
+
+// Set environment variable
+I64 PosixSetenv(U8 *name, U8 *value, I64 overwrite)
+{
+	CPosixProcess *proc = PosixGetCurrent();
+
+	if (!proc)
+		return PosixSetErrno(EINVAL);
+
+	return PosixSetenvInternal(proc, name, value, overwrite);
+}
+
+// Unset environment variable
+I64 PosixUnsetenv(U8 *name)
+{
+	CPosixProcess *proc = PosixGetCurrent();
+	I64 idx, i;
+
+	if (!proc || !name || !*name)
+		return PosixSetErrno(EINVAL);
+
+	if (StrFirstOcc(name, "="))
+		return PosixSetErrno(EINVAL);
+
+	idx = PosixEnvFind(proc, name);
+	if (idx < 0)
+		return 0;  // Not found, success
+
+	// Free the entry
+	Free(proc->environ[idx]);
+
+	// Shift remaining entries
+	for (i = idx; i < proc->environ_count - 1; i++) {
+		proc->environ[i] = proc->environ[i + 1];
+	}
+
+	proc->environ_count--;
+	proc->environ[proc->environ_count] = NULL;
+
+	return 0;
+}
+
+// Put environment string (name=value format)
+I64 PosixPutenv(U8 *string)
+{
+	CPosixProcess *proc = PosixGetCurrent();
+	U8 *eq, *name, *value;
+	I64 name_len, result;
+
+	if (!proc || !string)
+		return PosixSetErrno(EINVAL);
+
+	eq = StrFirstOcc(string, "=");
+	if (!eq) {
+		// No '=' means unset
+		return PosixUnsetenv(string);
+	}
+
+	name_len = eq - string;
+	name = MAlloc(name_len + 1);
+	MemCpy(name, string, name_len);
+	name[name_len] = 0;
+
+	value = eq + 1;
+
+	result = PosixSetenvInternal(proc, name, value, 1);
+	Free(name);
+	return result;
+}
+
+// Clear entire environment
+I64 PosixClearenv()
+{
+	CPosixProcess *proc = PosixGetCurrent();
+	I64 i;
+
+	if (!proc)
+		return PosixSetErrno(EINVAL);
+
+	for (i = 0; i < proc->environ_count; i++) {
+		if (proc->environ[i]) {
+			Free(proc->environ[i]);
+			proc->environ[i] = NULL;
+		}
+	}
+
+	proc->environ_count = 0;
+	return 0;
+}
+
+// ============================================================================
+// ENVIRONMENT VARIABLE EXPANSION
+// ============================================================================
+
+// Expand environment variables in a string
+// Handles $VAR, ${VAR}, ${VAR:-default}, ${VAR:+alt}
+U8 *PosixExpandEnv(U8 *str)
+{
+	CPosixProcess *proc = PosixGetCurrent();
+	U8 *result, *p, *out;
+	U8 *var_name, *var_value;
+	I64 result_size, result_len;
+	I64 var_len;
+	Bool in_brace;
+
+	if (!proc || !str)
+		return NULL;
+
+	result_size = StrLen(str) * 2 + 256;  // Initial estimate
+	result = MAlloc(result_size);
+	out = result;
+	result_len = 0;
+
+	p = str;
+	while (*p) {
+		// Check for buffer overflow
+		if (result_len >= result_size - 256) {
+			result_size *= 2;
+			U8 *new_result = MAlloc(result_size);
+			MemCpy(new_result, result, result_len);
+			Free(result);
+			result = new_result;
+			out = result + result_len;
+		}
+
+		if (*p == '$') {
+			p++;
+
+			if (*p == '{') {
+				// ${VAR} form
+				p++;
+				in_brace = TRUE;
+			} else {
+				in_brace = FALSE;
+			}
+
+			if (*p == '$') {
+				// $$ = PID
+				I64 pid = PosixGetPid();
+				U8 pid_str[32];
+				StrPrint(pid_str, "%d", pid);
+				I64 len = StrLen(pid_str);
+				MemCpy(out, pid_str, len);
+				out += len;
+				result_len += len;
+				p++;
+				if (in_brace && *p == '}') p++;
+				continue;
+			}
+
+			if (*p == '?') {
+				// $? = last exit status
+				I64 status = proc->exit_status;
+				U8 status_str[32];
+				StrPrint(status_str, "%d", status);
+				I64 len = StrLen(status_str);
+				MemCpy(out, status_str, len);
+				out += len;
+				result_len += len;
+				p++;
+				if (in_brace && *p == '}') p++;
+				continue;
+			}
+
+			if (*p == '#') {
+				// $# = argument count
+				I64 argc = proc->argc > 0 ? proc->argc - 1 : 0;
+				U8 argc_str[32];
+				StrPrint(argc_str, "%d", argc);
+				I64 len = StrLen(argc_str);
+				MemCpy(out, argc_str, len);
+				out += len;
+				result_len += len;
+				p++;
+				if (in_brace && *p == '}') p++;
+				continue;
+			}
+
+			if (*p >= '0' && *p <= '9') {
+				// $0, $1, ... = positional parameters
+				I64 idx = *p - '0';
+				p++;
+				// Handle multi-digit (${10} etc)
+				if (in_brace) {
+					while (*p >= '0' && *p <= '9') {
+						idx = idx * 10 + (*p - '0');
+						p++;
+					}
+				}
+				if (proc->argv && idx < proc->argc) {
+					var_value = proc->argv[idx];
+					if (var_value) {
+						I64 len = StrLen(var_value);
+						MemCpy(out, var_value, len);
+						out += len;
+						result_len += len;
+					}
+				}
+				if (in_brace && *p == '}') p++;
+				continue;
+			}
+
+			// Regular variable name
+			U8 *var_start = p;
+			while ((*p >= 'a' && *p <= 'z') ||
+			       (*p >= 'A' && *p <= 'Z') ||
+			       (*p >= '0' && *p <= '9') ||
+			       *p == '_') {
+				p++;
+			}
+			var_len = p - var_start;
+
+			if (var_len > 0) {
+				var_name = MAlloc(var_len + 1);
+				MemCpy(var_name, var_start, var_len);
+				var_name[var_len] = 0;
+
+				var_value = PosixGetenv(var_name);
+				if (var_value) {
+					I64 len = StrLen(var_value);
+					MemCpy(out, var_value, len);
+					out += len;
+					result_len += len;
+				}
+
+				Free(var_name);
+			}
+
+			if (in_brace && *p == '}') p++;
+		} else if (*p == '\\' && *(p+1)) {
+			// Escape sequence
+			p++;
+			*out++ = *p++;
+			result_len++;
+		} else {
+			*out++ = *p++;
+			result_len++;
+		}
+	}
+
+	*out = 0;
+	return result;
+}
+
+// ============================================================================
+// WORKING DIRECTORY
+// ============================================================================
+
+// Change current directory
+I64 PosixChdir(U8 *path)
+{
+	CPosixProcess *proc = PosixGetCurrent();
+	U8 *full_path;
+
+	if (!proc)
+		return PosixSetErrno(EINVAL);
+
+	if (!path || !*path)
+		return PosixSetErrno(ENOENT);
+
+	full_path = PosixResolvePath(proc, path);
+	if (!full_path)
+		return PosixSetErrno(ENOMEM);
+
+	// Check if directory exists
+	if (!IsDir(full_path)) {
+		Free(full_path);
+		if (FileFind(full_path))
+			return PosixSetErrno(ENOTDIR);
+		return PosixSetErrno(ENOENT);
+	}
+
+	// Change ZealOS directory
+	Cd(full_path);
+
+	// Update process cwd
+	if (proc->cwd)
+		Free(proc->cwd);
+	proc->cwd = full_path;
+
+	// Update PWD environment variable
+	PosixSetenvInternal(proc, "PWD", full_path, 1);
+
+	return 0;
+}
+
+// Get current working directory
+U8 *PosixGetcwd(U8 *buf, I64 size)
+{
+	CPosixProcess *proc = PosixGetCurrent();
+	I64 len;
+
+	if (!proc) {
+		posix_errno = EINVAL;
+		return NULL;
+	}
+
+	if (!proc->cwd) {
+		// Get from ZealOS
+		proc->cwd = StrNew(Fs->cur_dir);
+	}
+
+	len = StrLen(proc->cwd);
+
+	if (!buf) {
+		// Allocate buffer
+		buf = MAlloc(len + 1);
+		StrCpy(buf, proc->cwd);
+		return buf;
+	}
+
+	if (size < len + 1) {
+		posix_errno = ERANGE;
+		return NULL;
+	}
+
+	StrCpy(buf, proc->cwd);
+	return buf;
+}
+

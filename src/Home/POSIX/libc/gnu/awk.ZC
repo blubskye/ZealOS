@@ -1,0 +1,1424 @@
+// awk.ZC - GNU 'awk' implementation
+// Pattern scanning and processing language
+
+#define AWK_LINE_SIZE   8192
+#define AWK_FIELD_MAX   256
+#define AWK_VAR_MAX     512
+#define AWK_FUNC_MAX    64
+#define AWK_STACK_MAX   256
+
+// Token types
+#define ATOK_EOF        0
+#define ATOK_NUM        1
+#define ATOK_STR        2
+#define ATOK_IDENT      3
+#define ATOK_REGEX      4
+#define ATOK_FIELD      5   // $0, $1, etc.
+#define ATOK_PLUS       10
+#define ATOK_MINUS      11
+#define ATOK_MUL        12
+#define ATOK_DIV        13
+#define ATOK_MOD        14
+#define ATOK_POW        15
+#define ATOK_EQ         20
+#define ATOK_NE         21
+#define ATOK_LT         22
+#define ATOK_LE         23
+#define ATOK_GT         24
+#define ATOK_GE         25
+#define ATOK_MATCH      26  // ~
+#define ATOK_NMATCH     27  // !~
+#define ATOK_AND        30
+#define ATOK_OR         31
+#define ATOK_NOT        32
+#define ATOK_ASSIGN     40
+#define ATOK_PLUSEQ     41
+#define ATOK_MINUSEQ    42
+#define ATOK_MULEQ      43
+#define ATOK_DIVEQ      44
+#define ATOK_MODEQ      45
+#define ATOK_INC        46  // ++
+#define ATOK_DEC        47  // --
+#define ATOK_CONCAT     50  // implicit string concat
+#define ATOK_TERNARY    51  // ?
+#define ATOK_COLON      52
+#define ATOK_COMMA      53
+#define ATOK_SEMI       54
+#define ATOK_LPAREN     55
+#define ATOK_RPAREN     56
+#define ATOK_LBRACE     57
+#define ATOK_RBRACE     58
+#define ATOK_LBRACKET   59
+#define ATOK_RBRACKET   60
+#define ATOK_NEWLINE    61
+#define ATOK_IN         70
+#define ATOK_IF         71
+#define ATOK_ELSE       72
+#define ATOK_WHILE      73
+#define ATOK_FOR        74
+#define ATOK_DO         75
+#define ATOK_BREAK      76
+#define ATOK_CONTINUE   77
+#define ATOK_NEXT       78
+#define ATOK_EXIT       79
+#define ATOK_RETURN     80
+#define ATOK_DELETE     81
+#define ATOK_PRINT      82
+#define ATOK_PRINTF     83
+#define ATOK_GETLINE    84
+#define ATOK_FUNCTION   85
+#define ATOK_BEGIN      86
+#define ATOK_END        87
+
+// Value types
+#define AVAL_NUM    1
+#define AVAL_STR    2
+#define AVAL_ARRAY  3
+
+class CAwkValue {
+    I64 type;
+    F64 num;
+    U8 str[AWK_LINE_SIZE];
+};
+
+class CAwkVar {
+    U8 name[128];
+    CAwkValue val;
+    Bool is_array;
+    // For arrays: simple hash table
+    U8 *keys[256];
+    CAwkValue *values[256];
+    I64 array_count;
+};
+
+class CAwkState {
+    // Current line and fields
+    U8 line[AWK_LINE_SIZE];
+    U8 *fields[AWK_FIELD_MAX];
+    I64 nf;                     // NF
+    I64 nr;                     // NR
+    I64 fnr;                    // FNR
+
+    // Field/record separators
+    U8 fs[64];                  // FS
+    U8 rs[64];                  // RS
+    U8 ofs[64];                 // OFS
+    U8 ors[64];                 // ORS
+
+    // Variables
+    CAwkVar vars[AWK_VAR_MAX];
+    I64 var_count;
+
+    // Control flow
+    Bool next_flag;
+    Bool exit_flag;
+    I64 exit_code;
+    Bool break_flag;
+    Bool continue_flag;
+
+    // Output
+    FILE *output;
+};
+
+CAwkState *g_awk = NULL;
+
+// ============================================================================
+// VARIABLE MANAGEMENT
+// ============================================================================
+
+CAwkVar *AwkVarFind(CAwkState *awk, U8 *name)
+{
+    for (I64 i = 0; i < awk->var_count; i++) {
+        if (strcmp(awk->vars[i].name, name) == 0)
+            return &awk->vars[i];
+    }
+    return NULL;
+}
+
+CAwkVar *AwkVarCreate(CAwkState *awk, U8 *name)
+{
+    CAwkVar *var = AwkVarFind(awk, name);
+    if (var) return var;
+
+    if (awk->var_count >= AWK_VAR_MAX) return NULL;
+
+    var = &awk->vars[awk->var_count++];
+    MemSet(var, 0, sizeof(CAwkVar));
+    strncpy(var->name, name, 127);
+    var->val.type = AVAL_STR;
+    var->val.str[0] = 0;
+    var->val.num = 0;
+
+    return var;
+}
+
+F64 AwkToNum(CAwkValue *val)
+{
+    if (val->type == AVAL_NUM) return val->num;
+    return strtod(val->str, NULL);
+}
+
+U8 *AwkToStr(CAwkValue *val, U8 *buf)
+{
+    if (val->type == AVAL_STR) {
+        strcpy(buf, val->str);
+    } else {
+        if (val->num == (I64)val->num)
+            snprintf(buf, 64, "%ld", (I64)val->num);
+        else
+            snprintf(buf, 64, "%.6g", val->num);
+    }
+    return buf;
+}
+
+U0 AwkSetNum(CAwkValue *val, F64 n)
+{
+    val->type = AVAL_NUM;
+    val->num = n;
+    if (n == (I64)n)
+        snprintf(val->str, 64, "%ld", (I64)n);
+    else
+        snprintf(val->str, 64, "%.6g", n);
+}
+
+U0 AwkSetStr(CAwkValue *val, U8 *s)
+{
+    val->type = AVAL_STR;
+    strncpy(val->str, s, AWK_LINE_SIZE - 1);
+    val->str[AWK_LINE_SIZE - 1] = 0;
+    val->num = strtod(s, NULL);
+}
+
+// Get field value
+CAwkValue *AwkGetField(CAwkState *awk, I64 n, CAwkValue *result)
+{
+    if (n == 0) {
+        AwkSetStr(result, awk->line);
+    } else if (n > 0 && n <= awk->nf) {
+        AwkSetStr(result, awk->fields[n - 1]);
+    } else {
+        AwkSetStr(result, "");
+    }
+    return result;
+}
+
+// Set field value
+U0 AwkSetField(CAwkState *awk, I64 n, U8 *value)
+{
+    if (n < 1 || n > AWK_FIELD_MAX) return;
+
+    // Extend fields if needed
+    while (awk->nf < n) {
+        awk->fields[awk->nf] = StrNew("");
+        awk->nf++;
+    }
+
+    if (awk->fields[n - 1])
+        Free(awk->fields[n - 1]);
+    awk->fields[n - 1] = StrNew(value);
+
+    // Rebuild $0
+    awk->line[0] = 0;
+    for (I64 i = 0; i < awk->nf; i++) {
+        if (i > 0) strcat(awk->line, awk->ofs);
+        strcat(awk->line, awk->fields[i]);
+    }
+}
+
+// ============================================================================
+// FIELD SPLITTING
+// ============================================================================
+
+U0 AwkSplitLine(CAwkState *awk)
+{
+    // Free old fields
+    for (I64 i = 0; i < awk->nf; i++) {
+        if (awk->fields[i]) {
+            Free(awk->fields[i]);
+            awk->fields[i] = NULL;
+        }
+    }
+    awk->nf = 0;
+
+    U8 *p = awk->line;
+    U8 field[AWK_LINE_SIZE];
+
+    if (strlen(awk->fs) == 1) {
+        // Single character separator
+        U8 sep = awk->fs[0];
+
+        if (sep == ' ') {
+            // Special: whitespace splitting (skip leading, collapse multiple)
+            while (*p) {
+                while (*p == ' ' || *p == '\t') p++;
+                if (!*p) break;
+
+                I64 i = 0;
+                while (*p && *p != ' ' && *p != '\t' && i < AWK_LINE_SIZE - 1)
+                    field[i++] = *p++;
+                field[i] = 0;
+
+                if (awk->nf < AWK_FIELD_MAX)
+                    awk->fields[awk->nf++] = StrNew(field);
+            }
+        } else {
+            // Regular single char separator
+            while (*p) {
+                I64 i = 0;
+                while (*p && *p != sep && i < AWK_LINE_SIZE - 1)
+                    field[i++] = *p++;
+                field[i] = 0;
+
+                if (awk->nf < AWK_FIELD_MAX)
+                    awk->fields[awk->nf++] = StrNew(field);
+
+                if (*p == sep) p++;
+            }
+        }
+    } else {
+        // Multi-char FS - treat as regex (simplified: literal match)
+        I64 fs_len = strlen(awk->fs);
+        while (*p) {
+            I64 i = 0;
+            while (*p && strncmp(p, awk->fs, fs_len) != 0 && i < AWK_LINE_SIZE - 1)
+                field[i++] = *p++;
+            field[i] = 0;
+
+            if (awk->nf < AWK_FIELD_MAX)
+                awk->fields[awk->nf++] = StrNew(field);
+
+            if (strncmp(p, awk->fs, fs_len) == 0)
+                p += fs_len;
+        }
+    }
+}
+
+// ============================================================================
+// LEXER
+// ============================================================================
+
+class CAwkLexer {
+    U8 *input;
+    I64 pos;
+    I64 line;
+    I64 token;
+    U8 value[AWK_LINE_SIZE];
+    F64 num_value;
+};
+
+I64 AwkLexerPeek(CAwkLexer *lex)
+{
+    return lex->input[lex->pos];
+}
+
+I64 AwkLexerGet(CAwkLexer *lex)
+{
+    I64 c = lex->input[lex->pos];
+    if (c) {
+        lex->pos++;
+        if (c == '\n') lex->line++;
+    }
+    return c;
+}
+
+U0 AwkLexerSkipWS(CAwkLexer *lex)
+{
+    while (lex->input[lex->pos] == ' ' || lex->input[lex->pos] == '\t')
+        lex->pos++;
+
+    // Skip comments
+    if (lex->input[lex->pos] == '#') {
+        while (lex->input[lex->pos] && lex->input[lex->pos] != '\n')
+            lex->pos++;
+    }
+}
+
+I64 AwkLexerNext(CAwkLexer *lex)
+{
+    AwkLexerSkipWS(lex);
+
+    lex->value[0] = 0;
+    lex->num_value = 0;
+
+    I64 c = AwkLexerPeek(lex);
+
+    if (!c) {
+        lex->token = ATOK_EOF;
+        return lex->token;
+    }
+
+    // Newline
+    if (c == '\n') {
+        AwkLexerGet(lex);
+        lex->token = ATOK_NEWLINE;
+        return lex->token;
+    }
+
+    // String literal
+    if (c == '"') {
+        AwkLexerGet(lex);
+        I64 i = 0;
+        while ((c = AwkLexerPeek(lex)) && c != '"' && i < AWK_LINE_SIZE - 1) {
+            if (c == '\\') {
+                AwkLexerGet(lex);
+                c = AwkLexerGet(lex);
+                switch (c) {
+                    case 'n': lex->value[i++] = '\n'; break;
+                    case 't': lex->value[i++] = '\t'; break;
+                    case 'r': lex->value[i++] = '\r'; break;
+                    case '\\': lex->value[i++] = '\\'; break;
+                    case '"': lex->value[i++] = '"'; break;
+                    default: lex->value[i++] = c;
+                }
+            } else {
+                lex->value[i++] = AwkLexerGet(lex);
+            }
+        }
+        lex->value[i] = 0;
+        if (c == '"') AwkLexerGet(lex);
+        lex->token = ATOK_STR;
+        return lex->token;
+    }
+
+    // Regex
+    if (c == '/') {
+        AwkLexerGet(lex);
+        I64 i = 0;
+        while ((c = AwkLexerPeek(lex)) && c != '/' && c != '\n' && i < AWK_LINE_SIZE - 1) {
+            if (c == '\\') {
+                lex->value[i++] = AwkLexerGet(lex);
+                if (AwkLexerPeek(lex))
+                    lex->value[i++] = AwkLexerGet(lex);
+            } else {
+                lex->value[i++] = AwkLexerGet(lex);
+            }
+        }
+        lex->value[i] = 0;
+        if (c == '/') AwkLexerGet(lex);
+        lex->token = ATOK_REGEX;
+        return lex->token;
+    }
+
+    // Number
+    if (isdigit(c) || (c == '.' && isdigit(lex->input[lex->pos + 1]))) {
+        I64 i = 0;
+        while ((isdigit(AwkLexerPeek(lex)) || AwkLexerPeek(lex) == '.') && i < 63)
+            lex->value[i++] = AwkLexerGet(lex);
+        // Handle exponent
+        if ((AwkLexerPeek(lex) == 'e' || AwkLexerPeek(lex) == 'E') && i < 60) {
+            lex->value[i++] = AwkLexerGet(lex);
+            if (AwkLexerPeek(lex) == '+' || AwkLexerPeek(lex) == '-')
+                lex->value[i++] = AwkLexerGet(lex);
+            while (isdigit(AwkLexerPeek(lex)) && i < 63)
+                lex->value[i++] = AwkLexerGet(lex);
+        }
+        lex->value[i] = 0;
+        lex->num_value = strtod(lex->value, NULL);
+        lex->token = ATOK_NUM;
+        return lex->token;
+    }
+
+    // Field reference
+    if (c == '$') {
+        AwkLexerGet(lex);
+        lex->token = ATOK_FIELD;
+        return lex->token;
+    }
+
+    // Identifier or keyword
+    if (isalpha(c) || c == '_') {
+        I64 i = 0;
+        while ((isalnum(AwkLexerPeek(lex)) || AwkLexerPeek(lex) == '_') && i < 127)
+            lex->value[i++] = AwkLexerGet(lex);
+        lex->value[i] = 0;
+
+        // Check keywords
+        if (strcmp(lex->value, "BEGIN") == 0) lex->token = ATOK_BEGIN;
+        else if (strcmp(lex->value, "END") == 0) lex->token = ATOK_END;
+        else if (strcmp(lex->value, "if") == 0) lex->token = ATOK_IF;
+        else if (strcmp(lex->value, "else") == 0) lex->token = ATOK_ELSE;
+        else if (strcmp(lex->value, "while") == 0) lex->token = ATOK_WHILE;
+        else if (strcmp(lex->value, "for") == 0) lex->token = ATOK_FOR;
+        else if (strcmp(lex->value, "do") == 0) lex->token = ATOK_DO;
+        else if (strcmp(lex->value, "break") == 0) lex->token = ATOK_BREAK;
+        else if (strcmp(lex->value, "continue") == 0) lex->token = ATOK_CONTINUE;
+        else if (strcmp(lex->value, "next") == 0) lex->token = ATOK_NEXT;
+        else if (strcmp(lex->value, "exit") == 0) lex->token = ATOK_EXIT;
+        else if (strcmp(lex->value, "return") == 0) lex->token = ATOK_RETURN;
+        else if (strcmp(lex->value, "delete") == 0) lex->token = ATOK_DELETE;
+        else if (strcmp(lex->value, "print") == 0) lex->token = ATOK_PRINT;
+        else if (strcmp(lex->value, "printf") == 0) lex->token = ATOK_PRINTF;
+        else if (strcmp(lex->value, "getline") == 0) lex->token = ATOK_GETLINE;
+        else if (strcmp(lex->value, "function") == 0) lex->token = ATOK_FUNCTION;
+        else if (strcmp(lex->value, "in") == 0) lex->token = ATOK_IN;
+        else lex->token = ATOK_IDENT;
+
+        return lex->token;
+    }
+
+    // Operators
+    AwkLexerGet(lex);
+
+    switch (c) {
+        case '+':
+            if (AwkLexerPeek(lex) == '+') { AwkLexerGet(lex); lex->token = ATOK_INC; }
+            else if (AwkLexerPeek(lex) == '=') { AwkLexerGet(lex); lex->token = ATOK_PLUSEQ; }
+            else lex->token = ATOK_PLUS;
+            break;
+        case '-':
+            if (AwkLexerPeek(lex) == '-') { AwkLexerGet(lex); lex->token = ATOK_DEC; }
+            else if (AwkLexerPeek(lex) == '=') { AwkLexerGet(lex); lex->token = ATOK_MINUSEQ; }
+            else lex->token = ATOK_MINUS;
+            break;
+        case '*':
+            if (AwkLexerPeek(lex) == '=') { AwkLexerGet(lex); lex->token = ATOK_MULEQ; }
+            else if (AwkLexerPeek(lex) == '*') { AwkLexerGet(lex); lex->token = ATOK_POW; }
+            else lex->token = ATOK_MUL;
+            break;
+        case '/':
+            if (AwkLexerPeek(lex) == '=') { AwkLexerGet(lex); lex->token = ATOK_DIVEQ; }
+            else lex->token = ATOK_DIV;
+            break;
+        case '%':
+            if (AwkLexerPeek(lex) == '=') { AwkLexerGet(lex); lex->token = ATOK_MODEQ; }
+            else lex->token = ATOK_MOD;
+            break;
+        case '^': lex->token = ATOK_POW; break;
+        case '=':
+            if (AwkLexerPeek(lex) == '=') { AwkLexerGet(lex); lex->token = ATOK_EQ; }
+            else lex->token = ATOK_ASSIGN;
+            break;
+        case '!':
+            if (AwkLexerPeek(lex) == '=') { AwkLexerGet(lex); lex->token = ATOK_NE; }
+            else if (AwkLexerPeek(lex) == '~') { AwkLexerGet(lex); lex->token = ATOK_NMATCH; }
+            else lex->token = ATOK_NOT;
+            break;
+        case '<':
+            if (AwkLexerPeek(lex) == '=') { AwkLexerGet(lex); lex->token = ATOK_LE; }
+            else lex->token = ATOK_LT;
+            break;
+        case '>':
+            if (AwkLexerPeek(lex) == '=') { AwkLexerGet(lex); lex->token = ATOK_GE; }
+            else lex->token = ATOK_GT;
+            break;
+        case '~': lex->token = ATOK_MATCH; break;
+        case '&':
+            if (AwkLexerPeek(lex) == '&') { AwkLexerGet(lex); lex->token = ATOK_AND; }
+            else lex->token = ATOK_AND;  // Bitwise and logical same in awk
+            break;
+        case '|':
+            if (AwkLexerPeek(lex) == '|') { AwkLexerGet(lex); lex->token = ATOK_OR; }
+            else lex->token = ATOK_OR;
+            break;
+        case '?': lex->token = ATOK_TERNARY; break;
+        case ':': lex->token = ATOK_COLON; break;
+        case ',': lex->token = ATOK_COMMA; break;
+        case ';': lex->token = ATOK_SEMI; break;
+        case '(': lex->token = ATOK_LPAREN; break;
+        case ')': lex->token = ATOK_RPAREN; break;
+        case '{': lex->token = ATOK_LBRACE; break;
+        case '}': lex->token = ATOK_RBRACE; break;
+        case '[': lex->token = ATOK_LBRACKET; break;
+        case ']': lex->token = ATOK_RBRACKET; break;
+        default: lex->token = ATOK_EOF;
+    }
+
+    return lex->token;
+}
+
+// ============================================================================
+// EXPRESSION EVALUATOR
+// ============================================================================
+
+CAwkValue *AwkEvalExpr(CAwkState *awk, CAwkLexer *lex, CAwkValue *result);
+
+// Built-in functions
+CAwkValue *AwkCallBuiltin(CAwkState *awk, U8 *name, CAwkValue *args, I64 argc, CAwkValue *result)
+{
+    U8 buf[AWK_LINE_SIZE];
+
+    if (strcmp(name, "length") == 0) {
+        if (argc == 0) {
+            AwkSetNum(result, strlen(awk->line));
+        } else {
+            AwkToStr(&args[0], buf);
+            AwkSetNum(result, strlen(buf));
+        }
+        return result;
+    }
+
+    if (strcmp(name, "substr") == 0) {
+        if (argc < 2) { AwkSetStr(result, ""); return result; }
+        AwkToStr(&args[0], buf);
+        I64 start = (I64)AwkToNum(&args[1]) - 1;
+        I64 len = (argc >= 3) ? (I64)AwkToNum(&args[2]) : strlen(buf);
+
+        if (start < 0) start = 0;
+        I64 slen = strlen(buf);
+        if (start >= slen) { AwkSetStr(result, ""); return result; }
+        if (start + len > slen) len = slen - start;
+
+        U8 tmp[AWK_LINE_SIZE];
+        strncpy(tmp, buf + start, len);
+        tmp[len] = 0;
+        AwkSetStr(result, tmp);
+        return result;
+    }
+
+    if (strcmp(name, "index") == 0) {
+        if (argc < 2) { AwkSetNum(result, 0); return result; }
+        U8 buf2[AWK_LINE_SIZE];
+        AwkToStr(&args[0], buf);
+        AwkToStr(&args[1], buf2);
+        U8 *pos = strstr(buf, buf2);
+        AwkSetNum(result, pos ? (pos - buf + 1) : 0);
+        return result;
+    }
+
+    if (strcmp(name, "split") == 0) {
+        // split(string, array, sep)
+        // Simplified - just return count
+        if (argc < 2) { AwkSetNum(result, 0); return result; }
+        AwkToStr(&args[0], buf);
+
+        U8 sep[64] = " ";
+        if (argc >= 3) AwkToStr(&args[2], sep);
+
+        I64 count = 1;
+        for (U8 *p = buf; *p; p++) {
+            if (strchr(sep, *p)) count++;
+        }
+        AwkSetNum(result, count);
+        return result;
+    }
+
+    if (strcmp(name, "sprintf") == 0) {
+        // Simplified sprintf
+        if (argc < 1) { AwkSetStr(result, ""); return result; }
+        U8 fmt[AWK_LINE_SIZE];
+        AwkToStr(&args[0], fmt);
+        // Very simplified - just use first arg as result
+        AwkSetStr(result, fmt);
+        return result;
+    }
+
+    if (strcmp(name, "sub") == 0 || strcmp(name, "gsub") == 0) {
+        Bool global = (strcmp(name, "gsub") == 0);
+        if (argc < 2) { AwkSetNum(result, 0); return result; }
+
+        U8 pattern[256], replacement[AWK_LINE_SIZE];
+        AwkToStr(&args[0], pattern);
+        AwkToStr(&args[1], replacement);
+
+        // Target is $0 or third arg
+        U8 *target = awk->line;
+        // Simplified substitution
+        U8 *pos = strstr(target, pattern);
+        I64 count = 0;
+        if (pos) {
+            U8 tmp[AWK_LINE_SIZE];
+            I64 prefix_len = pos - target;
+            strncpy(tmp, target, prefix_len);
+            tmp[prefix_len] = 0;
+            strcat(tmp, replacement);
+            strcat(tmp, pos + strlen(pattern));
+            strcpy(target, tmp);
+            count = 1;
+        }
+        AwkSetNum(result, count);
+        return result;
+    }
+
+    if (strcmp(name, "tolower") == 0) {
+        if (argc < 1) { AwkSetStr(result, ""); return result; }
+        AwkToStr(&args[0], buf);
+        for (U8 *p = buf; *p; p++) *p = tolower(*p);
+        AwkSetStr(result, buf);
+        return result;
+    }
+
+    if (strcmp(name, "toupper") == 0) {
+        if (argc < 1) { AwkSetStr(result, ""); return result; }
+        AwkToStr(&args[0], buf);
+        for (U8 *p = buf; *p; p++) *p = toupper(*p);
+        AwkSetStr(result, buf);
+        return result;
+    }
+
+    if (strcmp(name, "sin") == 0) {
+        AwkSetNum(result, argc >= 1 ? Sin(AwkToNum(&args[0])) : 0);
+        return result;
+    }
+
+    if (strcmp(name, "cos") == 0) {
+        AwkSetNum(result, argc >= 1 ? Cos(AwkToNum(&args[0])) : 0);
+        return result;
+    }
+
+    if (strcmp(name, "sqrt") == 0) {
+        AwkSetNum(result, argc >= 1 ? Sqrt(AwkToNum(&args[0])) : 0);
+        return result;
+    }
+
+    if (strcmp(name, "log") == 0) {
+        AwkSetNum(result, argc >= 1 ? Ln(AwkToNum(&args[0])) : 0);
+        return result;
+    }
+
+    if (strcmp(name, "exp") == 0) {
+        AwkSetNum(result, argc >= 1 ? Exp(AwkToNum(&args[0])) : 0);
+        return result;
+    }
+
+    if (strcmp(name, "int") == 0) {
+        AwkSetNum(result, argc >= 1 ? (I64)AwkToNum(&args[0]) : 0);
+        return result;
+    }
+
+    if (strcmp(name, "rand") == 0) {
+        AwkSetNum(result, RandU64 / (F64)U64_MAX);
+        return result;
+    }
+
+    if (strcmp(name, "srand") == 0) {
+        // Seed random - simplified
+        AwkSetNum(result, 0);
+        return result;
+    }
+
+    // Unknown function
+    AwkSetStr(result, "");
+    return result;
+}
+
+// Primary expression
+CAwkValue *AwkEvalPrimary(CAwkState *awk, CAwkLexer *lex, CAwkValue *result)
+{
+    if (lex->token == ATOK_NUM) {
+        AwkSetNum(result, lex->num_value);
+        AwkLexerNext(lex);
+        return result;
+    }
+
+    if (lex->token == ATOK_STR) {
+        AwkSetStr(result, lex->value);
+        AwkLexerNext(lex);
+        return result;
+    }
+
+    if (lex->token == ATOK_REGEX) {
+        // Match against $0
+        U8 *match = strstr(awk->line, lex->value);
+        AwkSetNum(result, match ? 1 : 0);
+        AwkLexerNext(lex);
+        return result;
+    }
+
+    if (lex->token == ATOK_FIELD) {
+        AwkLexerNext(lex);
+        CAwkValue idx;
+        AwkEvalExpr(awk, lex, &idx);
+        I64 n = (I64)AwkToNum(&idx);
+        return AwkGetField(awk, n, result);
+    }
+
+    if (lex->token == ATOK_IDENT) {
+        U8 name[128];
+        strcpy(name, lex->value);
+        AwkLexerNext(lex);
+
+        // Check for function call
+        if (lex->token == ATOK_LPAREN) {
+            AwkLexerNext(lex);
+            CAwkValue args[16];
+            I64 argc = 0;
+
+            while (lex->token != ATOK_RPAREN && lex->token != ATOK_EOF) {
+                if (argc > 0) {
+                    if (lex->token == ATOK_COMMA)
+                        AwkLexerNext(lex);
+                }
+                AwkEvalExpr(awk, lex, &args[argc++]);
+                if (argc >= 16) break;
+            }
+
+            if (lex->token == ATOK_RPAREN)
+                AwkLexerNext(lex);
+
+            return AwkCallBuiltin(awk, name, args, argc, result);
+        }
+
+        // Check for array subscript
+        if (lex->token == ATOK_LBRACKET) {
+            AwkLexerNext(lex);
+            CAwkValue idx;
+            AwkEvalExpr(awk, lex, &idx);
+            if (lex->token == ATOK_RBRACKET)
+                AwkLexerNext(lex);
+
+            // Simplified array access
+            AwkSetStr(result, "");
+            return result;
+        }
+
+        // Regular variable
+        // Check built-in variables
+        if (strcmp(name, "NF") == 0) {
+            AwkSetNum(result, awk->nf);
+        } else if (strcmp(name, "NR") == 0) {
+            AwkSetNum(result, awk->nr);
+        } else if (strcmp(name, "FNR") == 0) {
+            AwkSetNum(result, awk->fnr);
+        } else if (strcmp(name, "FS") == 0) {
+            AwkSetStr(result, awk->fs);
+        } else if (strcmp(name, "RS") == 0) {
+            AwkSetStr(result, awk->rs);
+        } else if (strcmp(name, "OFS") == 0) {
+            AwkSetStr(result, awk->ofs);
+        } else if (strcmp(name, "ORS") == 0) {
+            AwkSetStr(result, awk->ors);
+        } else {
+            CAwkVar *var = AwkVarFind(awk, name);
+            if (var) {
+                *result = var->val;
+            } else {
+                AwkSetStr(result, "");
+            }
+        }
+        return result;
+    }
+
+    if (lex->token == ATOK_LPAREN) {
+        AwkLexerNext(lex);
+        AwkEvalExpr(awk, lex, result);
+        if (lex->token == ATOK_RPAREN)
+            AwkLexerNext(lex);
+        return result;
+    }
+
+    if (lex->token == ATOK_NOT) {
+        AwkLexerNext(lex);
+        AwkEvalPrimary(awk, lex, result);
+        AwkSetNum(result, AwkToNum(result) == 0 ? 1 : 0);
+        return result;
+    }
+
+    if (lex->token == ATOK_MINUS) {
+        AwkLexerNext(lex);
+        AwkEvalPrimary(awk, lex, result);
+        AwkSetNum(result, -AwkToNum(result));
+        return result;
+    }
+
+    if (lex->token == ATOK_PLUS) {
+        AwkLexerNext(lex);
+        AwkEvalPrimary(awk, lex, result);
+        AwkSetNum(result, AwkToNum(result));
+        return result;
+    }
+
+    if (lex->token == ATOK_INC || lex->token == ATOK_DEC) {
+        Bool inc = (lex->token == ATOK_INC);
+        AwkLexerNext(lex);
+        // Simplified - just evaluate next
+        AwkEvalPrimary(awk, lex, result);
+        AwkSetNum(result, AwkToNum(result) + (inc ? 1 : -1));
+        return result;
+    }
+
+    AwkSetStr(result, "");
+    return result;
+}
+
+// Full expression with operators
+CAwkValue *AwkEvalExpr(CAwkState *awk, CAwkLexer *lex, CAwkValue *result)
+{
+    AwkEvalPrimary(awk, lex, result);
+
+    while (1) {
+        I64 op = lex->token;
+
+        if (op == ATOK_MUL || op == ATOK_DIV || op == ATOK_MOD || op == ATOK_POW) {
+            AwkLexerNext(lex);
+            CAwkValue right;
+            AwkEvalPrimary(awk, lex, &right);
+
+            F64 l = AwkToNum(result);
+            F64 r = AwkToNum(&right);
+
+            if (op == ATOK_MUL) AwkSetNum(result, l * r);
+            else if (op == ATOK_DIV) AwkSetNum(result, r != 0 ? l / r : 0);
+            else if (op == ATOK_MOD) AwkSetNum(result, r != 0 ? (I64)l % (I64)r : 0);
+            else if (op == ATOK_POW) AwkSetNum(result, Pow(l, r));
+        }
+        else if (op == ATOK_PLUS || op == ATOK_MINUS) {
+            AwkLexerNext(lex);
+            CAwkValue right;
+            AwkEvalPrimary(awk, lex, &right);
+
+            F64 l = AwkToNum(result);
+            F64 r = AwkToNum(&right);
+
+            if (op == ATOK_PLUS) AwkSetNum(result, l + r);
+            else AwkSetNum(result, l - r);
+        }
+        else if (op == ATOK_LT || op == ATOK_LE || op == ATOK_GT || op == ATOK_GE ||
+                 op == ATOK_EQ || op == ATOK_NE) {
+            AwkLexerNext(lex);
+            CAwkValue right;
+            AwkEvalPrimary(awk, lex, &right);
+
+            F64 l = AwkToNum(result);
+            F64 r = AwkToNum(&right);
+            Bool res = FALSE;
+
+            if (op == ATOK_LT) res = (l < r);
+            else if (op == ATOK_LE) res = (l <= r);
+            else if (op == ATOK_GT) res = (l > r);
+            else if (op == ATOK_GE) res = (l >= r);
+            else if (op == ATOK_EQ) res = (l == r);
+            else if (op == ATOK_NE) res = (l != r);
+
+            AwkSetNum(result, res ? 1 : 0);
+        }
+        else if (op == ATOK_AND) {
+            AwkLexerNext(lex);
+            CAwkValue right;
+            AwkEvalExpr(awk, lex, &right);
+            AwkSetNum(result, (AwkToNum(result) != 0 && AwkToNum(&right) != 0) ? 1 : 0);
+        }
+        else if (op == ATOK_OR) {
+            AwkLexerNext(lex);
+            CAwkValue right;
+            AwkEvalExpr(awk, lex, &right);
+            AwkSetNum(result, (AwkToNum(result) != 0 || AwkToNum(&right) != 0) ? 1 : 0);
+        }
+        else if (op == ATOK_ASSIGN) {
+            // Would need lvalue tracking - simplified
+            AwkLexerNext(lex);
+            AwkEvalExpr(awk, lex, result);
+        }
+        else {
+            break;
+        }
+    }
+
+    return result;
+}
+
+// ============================================================================
+// STATEMENT EXECUTION
+// ============================================================================
+
+U0 AwkExecStatement(CAwkState *awk, CAwkLexer *lex);
+
+U0 AwkExecBlock(CAwkState *awk, CAwkLexer *lex)
+{
+    if (lex->token == ATOK_LBRACE) {
+        AwkLexerNext(lex);
+        while (lex->token != ATOK_RBRACE && lex->token != ATOK_EOF) {
+            while (lex->token == ATOK_NEWLINE || lex->token == ATOK_SEMI)
+                AwkLexerNext(lex);
+            if (lex->token == ATOK_RBRACE) break;
+            AwkExecStatement(awk, lex);
+            if (awk->next_flag || awk->exit_flag || awk->break_flag || awk->continue_flag)
+                break;
+        }
+        if (lex->token == ATOK_RBRACE)
+            AwkLexerNext(lex);
+    } else {
+        AwkExecStatement(awk, lex);
+    }
+}
+
+U0 AwkExecStatement(CAwkState *awk, CAwkLexer *lex)
+{
+    while (lex->token == ATOK_NEWLINE || lex->token == ATOK_SEMI)
+        AwkLexerNext(lex);
+
+    if (lex->token == ATOK_EOF) return;
+
+    if (lex->token == ATOK_LBRACE) {
+        AwkExecBlock(awk, lex);
+        return;
+    }
+
+    if (lex->token == ATOK_PRINT) {
+        AwkLexerNext(lex);
+
+        if (lex->token == ATOK_NEWLINE || lex->token == ATOK_SEMI ||
+            lex->token == ATOK_RBRACE || lex->token == ATOK_EOF) {
+            // print with no args = print $0
+            printf("%s%s", awk->line, awk->ors);
+        } else {
+            Bool first = TRUE;
+            while (lex->token != ATOK_NEWLINE && lex->token != ATOK_SEMI &&
+                   lex->token != ATOK_RBRACE && lex->token != ATOK_EOF) {
+                if (!first) printf("%s", awk->ofs);
+                CAwkValue val;
+                AwkEvalExpr(awk, lex, &val);
+                U8 buf[AWK_LINE_SIZE];
+                printf("%s", AwkToStr(&val, buf));
+                first = FALSE;
+                if (lex->token == ATOK_COMMA) AwkLexerNext(lex);
+                else break;
+            }
+            printf("%s", awk->ors);
+        }
+        return;
+    }
+
+    if (lex->token == ATOK_PRINTF) {
+        AwkLexerNext(lex);
+        // Simplified printf - just print args
+        while (lex->token != ATOK_NEWLINE && lex->token != ATOK_SEMI &&
+               lex->token != ATOK_RBRACE && lex->token != ATOK_EOF) {
+            CAwkValue val;
+            AwkEvalExpr(awk, lex, &val);
+            U8 buf[AWK_LINE_SIZE];
+            printf("%s", AwkToStr(&val, buf));
+            if (lex->token == ATOK_COMMA) AwkLexerNext(lex);
+            else break;
+        }
+        return;
+    }
+
+    if (lex->token == ATOK_IF) {
+        AwkLexerNext(lex);
+        if (lex->token == ATOK_LPAREN) AwkLexerNext(lex);
+        CAwkValue cond;
+        AwkEvalExpr(awk, lex, &cond);
+        if (lex->token == ATOK_RPAREN) AwkLexerNext(lex);
+
+        while (lex->token == ATOK_NEWLINE) AwkLexerNext(lex);
+
+        if (AwkToNum(&cond) != 0) {
+            AwkExecBlock(awk, lex);
+            // Skip else
+            while (lex->token == ATOK_NEWLINE) AwkLexerNext(lex);
+            if (lex->token == ATOK_ELSE) {
+                AwkLexerNext(lex);
+                // Skip else block
+                I64 depth = 0;
+                if (lex->token == ATOK_LBRACE) {
+                    depth = 1;
+                    AwkLexerNext(lex);
+                    while (depth > 0 && lex->token != ATOK_EOF) {
+                        if (lex->token == ATOK_LBRACE) depth++;
+                        else if (lex->token == ATOK_RBRACE) depth--;
+                        AwkLexerNext(lex);
+                    }
+                } else {
+                    while (lex->token != ATOK_NEWLINE && lex->token != ATOK_SEMI &&
+                           lex->token != ATOK_EOF)
+                        AwkLexerNext(lex);
+                }
+            }
+        } else {
+            // Skip if block
+            if (lex->token == ATOK_LBRACE) {
+                I64 depth = 1;
+                AwkLexerNext(lex);
+                while (depth > 0 && lex->token != ATOK_EOF) {
+                    if (lex->token == ATOK_LBRACE) depth++;
+                    else if (lex->token == ATOK_RBRACE) depth--;
+                    AwkLexerNext(lex);
+                }
+            } else {
+                while (lex->token != ATOK_NEWLINE && lex->token != ATOK_SEMI &&
+                       lex->token != ATOK_EOF)
+                    AwkLexerNext(lex);
+            }
+            // Execute else
+            while (lex->token == ATOK_NEWLINE) AwkLexerNext(lex);
+            if (lex->token == ATOK_ELSE) {
+                AwkLexerNext(lex);
+                while (lex->token == ATOK_NEWLINE) AwkLexerNext(lex);
+                AwkExecBlock(awk, lex);
+            }
+        }
+        return;
+    }
+
+    if (lex->token == ATOK_WHILE) {
+        AwkLexerNext(lex);
+        I64 cond_pos = lex->pos;
+
+        while (1) {
+            lex->pos = cond_pos;
+            AwkLexerNext(lex);
+
+            if (lex->token == ATOK_LPAREN) AwkLexerNext(lex);
+            CAwkValue cond;
+            AwkEvalExpr(awk, lex, &cond);
+            if (lex->token == ATOK_RPAREN) AwkLexerNext(lex);
+
+            if (AwkToNum(&cond) == 0) break;
+
+            while (lex->token == ATOK_NEWLINE) AwkLexerNext(lex);
+            AwkExecBlock(awk, lex);
+
+            if (awk->break_flag) { awk->break_flag = FALSE; break; }
+            if (awk->continue_flag) { awk->continue_flag = FALSE; continue; }
+            if (awk->next_flag || awk->exit_flag) break;
+        }
+
+        // Skip to end of while
+        while (lex->token != ATOK_NEWLINE && lex->token != ATOK_SEMI &&
+               lex->token != ATOK_RBRACE && lex->token != ATOK_EOF)
+            AwkLexerNext(lex);
+        return;
+    }
+
+    if (lex->token == ATOK_FOR) {
+        AwkLexerNext(lex);
+        if (lex->token == ATOK_LPAREN) AwkLexerNext(lex);
+
+        // Init
+        if (lex->token != ATOK_SEMI) {
+            CAwkValue dummy;
+            AwkEvalExpr(awk, lex, &dummy);
+        }
+        if (lex->token == ATOK_SEMI) AwkLexerNext(lex);
+
+        I64 cond_pos = lex->pos;
+
+        while (1) {
+            // Condition
+            lex->pos = cond_pos;
+            AwkLexerNext(lex);
+
+            CAwkValue cond;
+            if (lex->token != ATOK_SEMI) {
+                AwkEvalExpr(awk, lex, &cond);
+                if (AwkToNum(&cond) == 0) break;
+            }
+            if (lex->token == ATOK_SEMI) AwkLexerNext(lex);
+
+            // Skip increment for now
+            I64 inc_pos = lex->pos;
+            while (lex->token != ATOK_RPAREN && lex->token != ATOK_EOF)
+                AwkLexerNext(lex);
+            if (lex->token == ATOK_RPAREN) AwkLexerNext(lex);
+
+            while (lex->token == ATOK_NEWLINE) AwkLexerNext(lex);
+
+            // Execute body
+            I64 body_end = lex->pos;
+            AwkExecBlock(awk, lex);
+            body_end = lex->pos;
+
+            if (awk->break_flag) { awk->break_flag = FALSE; break; }
+            if (awk->continue_flag) awk->continue_flag = FALSE;
+            if (awk->next_flag || awk->exit_flag) break;
+
+            // Execute increment
+            lex->pos = inc_pos;
+            AwkLexerNext(lex);
+            if (lex->token != ATOK_RPAREN) {
+                CAwkValue dummy;
+                AwkEvalExpr(awk, lex, &dummy);
+            }
+        }
+        return;
+    }
+
+    if (lex->token == ATOK_NEXT) {
+        AwkLexerNext(lex);
+        awk->next_flag = TRUE;
+        return;
+    }
+
+    if (lex->token == ATOK_EXIT) {
+        AwkLexerNext(lex);
+        awk->exit_flag = TRUE;
+        if (lex->token == ATOK_NUM || lex->token == ATOK_IDENT) {
+            CAwkValue val;
+            AwkEvalExpr(awk, lex, &val);
+            awk->exit_code = (I64)AwkToNum(&val);
+        }
+        return;
+    }
+
+    if (lex->token == ATOK_BREAK) {
+        AwkLexerNext(lex);
+        awk->break_flag = TRUE;
+        return;
+    }
+
+    if (lex->token == ATOK_CONTINUE) {
+        AwkLexerNext(lex);
+        awk->continue_flag = TRUE;
+        return;
+    }
+
+    // Expression statement (including assignment)
+    CAwkValue val;
+    AwkEvalExpr(awk, lex, &val);
+}
+
+// ============================================================================
+// MAIN PROGRAM EXECUTION
+// ============================================================================
+
+class CAwkRule {
+    Bool is_begin;
+    Bool is_end;
+    U8 pattern[AWK_LINE_SIZE];
+    U8 action[AWK_LINE_SIZE * 4];
+};
+
+I64 awk_main(I64 argc, U8 **argv)
+{
+    U8 *programs[16];
+    I64 program_count = 0;
+    U8 *files[64];
+    I64 file_count = 0;
+    U8 fs[64] = " ";
+    I64 start = 1;
+
+    // Parse options
+    while (start < argc && argv[start][0] == '-') {
+        U8 *arg = argv[start];
+
+        if (strcmp(arg, "--help") == 0) {
+            printf("Usage: awk [OPTIONS] 'PROGRAM' [FILE...]\n");
+            printf("  or:  awk [OPTIONS] -f PROGFILE [FILE...]\n\n");
+            printf("  -F FS         set field separator\n");
+            printf("  -v VAR=VALUE  set variable\n");
+            printf("  -f PROGFILE   read program from file\n");
+            printf("      --help    display this help and exit\n");
+            printf("      --version output version information and exit\n");
+            return 0;
+        }
+
+        if (strcmp(arg, "--version") == 0) {
+            printf("awk (ZealOS) 1.0\n");
+            return 0;
+        }
+
+        if (strncmp(arg, "-F", 2) == 0) {
+            if (arg[2]) strcpy(fs, &arg[2]);
+            else if (start + 1 < argc) { start++; strcpy(fs, argv[start]); }
+            start++;
+            continue;
+        }
+
+        if (strncmp(arg, "-f", 2) == 0) {
+            U8 *filename;
+            if (arg[2]) filename = &arg[2];
+            else if (start + 1 < argc) { start++; filename = argv[start]; }
+            else { start++; continue; }
+
+            FILE *fp = fopen(filename, "r");
+            if (fp) {
+                U8 *prog = MAlloc(65536);
+                I64 len = fread(prog, 1, 65535, fp);
+                prog[len] = 0;
+                fclose(fp);
+                programs[program_count++] = prog;
+            }
+            start++;
+            continue;
+        }
+
+        if (strncmp(arg, "-v", 2) == 0) {
+            // Variable assignment - handled after state init
+            start++;
+            continue;
+        }
+
+        if (strcmp(arg, "--") == 0) {
+            start++;
+            break;
+        }
+
+        break;
+    }
+
+    // First non-option is program if no -f
+    if (program_count == 0 && start < argc) {
+        programs[program_count++] = argv[start++];
+    }
+
+    // Rest are files
+    while (start < argc) {
+        files[file_count++] = argv[start++];
+    }
+
+    if (program_count == 0) {
+        fprintf(stderr, "awk: no program given\n");
+        return 1;
+    }
+
+    // Initialize state
+    CAwkState awk;
+    MemSet(&awk, 0, sizeof(CAwkState));
+    strcpy(awk.fs, fs);
+    strcpy(awk.rs, "\n");
+    strcpy(awk.ofs, " ");
+    strcpy(awk.ors, "\n");
+
+    g_awk = &awk;
+
+    // Parse program into rules
+    CAwkRule rules[64];
+    I64 rule_count = 0;
+
+    for (I64 p = 0; p < program_count; p++) {
+        CAwkLexer lex;
+        lex.input = programs[p];
+        lex.pos = 0;
+        lex.line = 1;
+        AwkLexerNext(&lex);
+
+        while (lex.token != ATOK_EOF && rule_count < 64) {
+            while (lex.token == ATOK_NEWLINE || lex.token == ATOK_SEMI)
+                AwkLexerNext(&lex);
+            if (lex.token == ATOK_EOF) break;
+
+            CAwkRule *rule = &rules[rule_count];
+            MemSet(rule, 0, sizeof(CAwkRule));
+
+            // Check for BEGIN/END
+            if (lex.token == ATOK_BEGIN) {
+                rule->is_begin = TRUE;
+                AwkLexerNext(&lex);
+            } else if (lex.token == ATOK_END) {
+                rule->is_end = TRUE;
+                AwkLexerNext(&lex);
+            } else if (lex.token != ATOK_LBRACE) {
+                // Pattern
+                I64 pat_start = lex.pos - strlen(lex.value);
+                while (lex.token != ATOK_LBRACE && lex.token != ATOK_NEWLINE &&
+                       lex.token != ATOK_EOF)
+                    AwkLexerNext(&lex);
+                I64 pat_len = lex.pos - pat_start;
+                if (lex.token == ATOK_LBRACE) pat_len--;
+                strncpy(rule->pattern, programs[p] + pat_start, pat_len);
+            }
+
+            while (lex.token == ATOK_NEWLINE) AwkLexerNext(&lex);
+
+            // Action
+            if (lex.token == ATOK_LBRACE) {
+                I64 act_start = lex.pos - 1;
+                I64 depth = 1;
+                AwkLexerNext(&lex);
+                while (depth > 0 && lex.token != ATOK_EOF) {
+                    if (lex.token == ATOK_LBRACE) depth++;
+                    else if (lex.token == ATOK_RBRACE) depth--;
+                    AwkLexerNext(&lex);
+                }
+                I64 act_len = lex.pos - act_start;
+                strncpy(rule->action, programs[p] + act_start, act_len);
+            } else {
+                // Default action: print
+                strcpy(rule->action, "{ print }");
+            }
+
+            rule_count++;
+        }
+    }
+
+    // Execute BEGIN rules
+    for (I64 r = 0; r < rule_count; r++) {
+        if (rules[r].is_begin) {
+            CAwkLexer lex;
+            lex.input = rules[r].action;
+            lex.pos = 0;
+            lex.line = 1;
+            AwkLexerNext(&lex);
+            AwkExecBlock(&awk, &lex);
+        }
+    }
+
+    // Process files
+    FILE *fp;
+    if (file_count == 0) {
+        fp = stdin;
+        file_count = 1;
+        files[0] = "-";
+    }
+
+    for (I64 f = 0; f < file_count && !awk.exit_flag; f++) {
+        if (strcmp(files[f], "-") == 0) {
+            fp = stdin;
+        } else {
+            fp = fopen(files[f], "r");
+            if (!fp) {
+                fprintf(stderr, "awk: can't open '%s'\n", files[f]);
+                continue;
+            }
+        }
+
+        awk.fnr = 0;
+
+        while (fgets(awk.line, AWK_LINE_SIZE, fp) && !awk.exit_flag) {
+            // Remove trailing newline
+            I64 len = strlen(awk.line);
+            if (len > 0 && awk.line[len-1] == '\n')
+                awk.line[len-1] = 0;
+
+            awk.nr++;
+            awk.fnr++;
+            AwkSplitLine(&awk);
+            awk.next_flag = FALSE;
+
+            // Execute matching rules
+            for (I64 r = 0; r < rule_count && !awk.next_flag && !awk.exit_flag; r++) {
+                if (rules[r].is_begin || rules[r].is_end) continue;
+
+                Bool matches = TRUE;
+                if (rules[r].pattern[0]) {
+                    // Evaluate pattern
+                    CAwkLexer plex;
+                    plex.input = rules[r].pattern;
+                    plex.pos = 0;
+                    plex.line = 1;
+                    AwkLexerNext(&plex);
+
+                    CAwkValue result;
+                    AwkEvalExpr(&awk, &plex, &result);
+                    matches = (AwkToNum(&result) != 0);
+                }
+
+                if (matches) {
+                    CAwkLexer lex;
+                    lex.input = rules[r].action;
+                    lex.pos = 0;
+                    lex.line = 1;
+                    AwkLexerNext(&lex);
+                    AwkExecBlock(&awk, &lex);
+                }
+            }
+        }
+
+        if (fp != stdin) fclose(fp);
+    }
+
+    // Execute END rules
+    for (I64 r = 0; r < rule_count && !awk.exit_flag; r++) {
+        if (rules[r].is_end) {
+            CAwkLexer lex;
+            lex.input = rules[r].action;
+            lex.pos = 0;
+            lex.line = 1;
+            AwkLexerNext(&lex);
+            AwkExecBlock(&awk, &lex);
+        }
+    }
+
+    // Cleanup
+    for (I64 i = 0; i < awk.nf; i++) {
+        if (awk.fields[i]) Free(awk.fields[i]);
+    }
+
+    g_awk = NULL;
+    return awk.exit_code;
+}
+
+U0 GnuAwkRegister()
+{
+    "GNU 'awk' utility loaded.\n";
+}

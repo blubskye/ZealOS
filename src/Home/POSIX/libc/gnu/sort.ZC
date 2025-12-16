@@ -1,0 +1,358 @@
+// sort.ZC - GNU coreutils 'sort' implementation
+// Sort lines of text files
+
+#define SORT_MAX_LINES 65536
+#define SORT_LINE_SIZE 4096
+
+// C-style main function
+I64 sort_main(I64 argc, U8 **argv)
+{
+    Bool reverse = FALSE;        // -r
+    Bool numeric = FALSE;        // -n
+    Bool ignore_case = FALSE;    // -f
+    Bool unique = FALSE;         // -u
+    Bool check = FALSE;          // -c
+    Bool stable = FALSE;         // -s
+    Bool ignore_blanks = FALSE;  // -b
+    Bool dictionary = FALSE;     // -d
+    Bool human_numeric = FALSE;  // -h
+    Bool month_sort = FALSE;     // -M
+    Bool version_sort = FALSE;   // -V
+    I64 key_field = 0;           // -k
+    U8 *output_file = NULL;      // -o
+    U8 field_sep = 0;            // -t
+    I64 start = 1;
+
+    // Parse options
+    while (start < argc && argv[start][0] == '-' && argv[start][1]) {
+        U8 *arg = argv[start];
+
+        if (strcmp(arg, "--help") == 0) {
+            printf("Usage: sort [OPTION]... [FILE]...\n");
+            printf("Write sorted concatenation of all FILE(s) to standard output.\n\n");
+            printf("  -b, --ignore-leading-blanks  ignore leading blanks\n");
+            printf("  -c, --check                  check for sorted input\n");
+            printf("  -d, --dictionary-order       consider only blanks and alphanumeric\n");
+            printf("  -f, --ignore-case            fold lower case to upper case\n");
+            printf("  -h, --human-numeric-sort     compare human readable numbers\n");
+            printf("  -k, --key=POS                sort via a key; POS gives field number\n");
+            printf("  -M, --month-sort             compare (unknown) < 'JAN' < ... < 'DEC'\n");
+            printf("  -n, --numeric-sort           compare according to string numerical value\n");
+            printf("  -o, --output=FILE            write result to FILE instead of stdout\n");
+            printf("  -r, --reverse                reverse the result of comparisons\n");
+            printf("  -s, --stable                 stabilize sort by disabling comparison\n");
+            printf("  -t, --field-separator=SEP    use SEP instead of non-blank to blank\n");
+            printf("  -u, --unique                 output only unique lines\n");
+            printf("  -V, --version-sort           natural sort of version numbers\n");
+            printf("      --help                   display this help and exit\n");
+            printf("      --version                output version information and exit\n");
+            return 0;
+        }
+
+        if (strcmp(arg, "--version") == 0) {
+            printf("sort (ZealOS coreutils) 1.0\n");
+            return 0;
+        }
+
+        if (strcmp(arg, "-r") == 0 || strcmp(arg, "--reverse") == 0) {
+            reverse = TRUE; start++; continue;
+        }
+        if (strcmp(arg, "-n") == 0 || strcmp(arg, "--numeric-sort") == 0) {
+            numeric = TRUE; start++; continue;
+        }
+        if (strcmp(arg, "-f") == 0 || strcmp(arg, "--ignore-case") == 0) {
+            ignore_case = TRUE; start++; continue;
+        }
+        if (strcmp(arg, "-u") == 0 || strcmp(arg, "--unique") == 0) {
+            unique = TRUE; start++; continue;
+        }
+        if (strcmp(arg, "-c") == 0 || strcmp(arg, "--check") == 0) {
+            check = TRUE; start++; continue;
+        }
+        if (strcmp(arg, "-s") == 0 || strcmp(arg, "--stable") == 0) {
+            stable = TRUE; start++; continue;
+        }
+        if (strcmp(arg, "-b") == 0 || strcmp(arg, "--ignore-leading-blanks") == 0) {
+            ignore_blanks = TRUE; start++; continue;
+        }
+        if (strcmp(arg, "-d") == 0 || strcmp(arg, "--dictionary-order") == 0) {
+            dictionary = TRUE; start++; continue;
+        }
+        if (strcmp(arg, "-h") == 0 || strcmp(arg, "--human-numeric-sort") == 0) {
+            human_numeric = TRUE; start++; continue;
+        }
+        if (strcmp(arg, "-M") == 0 || strcmp(arg, "--month-sort") == 0) {
+            month_sort = TRUE; start++; continue;
+        }
+        if (strcmp(arg, "-V") == 0 || strcmp(arg, "--version-sort") == 0) {
+            version_sort = TRUE; start++; continue;
+        }
+
+        if (strncmp(arg, "-k", 2) == 0) {
+            U8 *key_str = &arg[2];
+            if (!*key_str && start + 1 < argc) {
+                start++;
+                key_str = argv[start];
+            }
+            key_field = atoi(key_str);
+            start++;
+            continue;
+        }
+
+        if (strncmp(arg, "-o", 2) == 0) {
+            if (arg[2]) {
+                output_file = &arg[2];
+            } else if (start + 1 < argc) {
+                start++;
+                output_file = argv[start];
+            }
+            start++;
+            continue;
+        }
+
+        if (strncmp(arg, "-t", 2) == 0) {
+            if (arg[2]) {
+                field_sep = arg[2];
+            } else if (start + 1 < argc) {
+                start++;
+                field_sep = argv[start][0];
+            }
+            start++;
+            continue;
+        }
+
+        // Combined short options
+        if (arg[0] == '-' && arg[1] != '-') {
+            for (I64 i = 1; arg[i]; i++) {
+                switch (arg[i]) {
+                    case 'r': reverse = TRUE; break;
+                    case 'n': numeric = TRUE; break;
+                    case 'f': ignore_case = TRUE; break;
+                    case 'u': unique = TRUE; break;
+                    case 'c': check = TRUE; break;
+                    case 's': stable = TRUE; break;
+                    case 'b': ignore_blanks = TRUE; break;
+                    case 'd': dictionary = TRUE; break;
+                    case 'h': human_numeric = TRUE; break;
+                    case 'M': month_sort = TRUE; break;
+                    case 'V': version_sort = TRUE; break;
+                    default:
+                        fprintf(stderr, "sort: invalid option -- '%c'\n", arg[i]);
+                        return 2;
+                }
+            }
+            start++;
+            continue;
+        }
+
+        if (strcmp(arg, "--") == 0) {
+            start++;
+            break;
+        }
+
+        break;
+    }
+
+    // Get field from line
+    auto get_field = [](U8 *line, I64 field, U8 sep, Bool ignore_blanks) -> U8* {
+        if (field <= 0) {
+            if (ignore_blanks) {
+                while (*line == ' ' || *line == '\t') line++;
+            }
+            return line;
+        }
+
+        I64 f = 1;
+        U8 *p = line;
+
+        if (ignore_blanks) {
+            while (*p == ' ' || *p == '\t') p++;
+        }
+
+        while (f < field && *p) {
+            if (sep) {
+                while (*p && *p != sep) p++;
+                if (*p) p++;
+            } else {
+                while (*p && *p != ' ' && *p != '\t') p++;
+                while (*p == ' ' || *p == '\t') p++;
+            }
+            f++;
+        }
+
+        if (ignore_blanks) {
+            while (*p == ' ' || *p == '\t') p++;
+        }
+
+        return p;
+    };
+
+    // Numeric comparison helper
+    auto compare_numeric = [](U8 *a, U8 *b) -> I64 {
+        // Skip leading whitespace
+        while (*a == ' ' || *a == '\t') a++;
+        while (*b == ' ' || *b == '\t') b++;
+
+        I64 na = strtol(a, NULL, 10);
+        I64 nb = strtol(b, NULL, 10);
+
+        if (na < nb) return -1;
+        if (na > nb) return 1;
+        return 0;
+    };
+
+    // String comparison (case-insensitive if needed)
+    auto compare_string = [](U8 *a, U8 *b, Bool ignore_case, Bool dictionary) -> I64 {
+        while (*a && *b) {
+            U8 ca = *a;
+            U8 cb = *b;
+
+            if (dictionary) {
+                // Skip non-alphanumeric, non-blank
+                while (*a && !isalnum(*a) && *a != ' ' && *a != '\t') a++;
+                while (*b && !isalnum(*b) && *b != ' ' && *b != '\t') b++;
+                if (!*a || !*b) break;
+                ca = *a;
+                cb = *b;
+            }
+
+            if (ignore_case) {
+                ca = toupper(ca);
+                cb = toupper(cb);
+            }
+
+            if (ca < cb) return -1;
+            if (ca > cb) return 1;
+
+            a++;
+            b++;
+        }
+
+        if (*a) return 1;
+        if (*b) return -1;
+        return 0;
+    };
+
+    // Compare two lines
+    auto compare_lines = [&](U8 *a, U8 *b) -> I64 {
+        U8 *fa = get_field(a, key_field, field_sep, ignore_blanks);
+        U8 *fb = get_field(b, key_field, field_sep, ignore_blanks);
+
+        I64 result;
+        if (numeric || human_numeric) {
+            result = compare_numeric(fa, fb);
+        } else {
+            result = compare_string(fa, fb, ignore_case, dictionary);
+        }
+
+        if (reverse) result = -result;
+        return result;
+    };
+
+    // Read lines from file
+    U8 **lines = MAlloc(SORT_MAX_LINES * sizeof(U8*));
+    I64 line_count = 0;
+
+    auto read_file = [&](U8 *filename) -> I64 {
+        FILE *fp;
+        if (strcmp(filename, "-") == 0) {
+            fp = stdin;
+        } else {
+            fp = fopen(filename, "r");
+            if (!fp) {
+                fprintf(stderr, "sort: cannot read '%s': %s\n", filename, strerror(errno));
+                return -1;
+            }
+        }
+
+        U8 *buf = MAlloc(SORT_LINE_SIZE);
+        while (line_count < SORT_MAX_LINES && fgets(buf, SORT_LINE_SIZE, fp)) {
+            // Remove newline
+            I64 len = strlen(buf);
+            if (len > 0 && buf[len-1] == '\n')
+                buf[len-1] = 0;
+
+            lines[line_count] = StrNew(buf);
+            line_count++;
+        }
+        Free(buf);
+
+        if (fp != stdin)
+            fclose(fp);
+        return 0;
+    };
+
+    // Read all input files
+    if (start >= argc) {
+        read_file("-");
+    } else {
+        for (I64 i = start; i < argc; i++) {
+            if (read_file(argv[i]) < 0)
+                return 2;
+        }
+    }
+
+    // Check mode
+    if (check) {
+        for (I64 i = 1; i < line_count; i++) {
+            if (compare_lines(lines[i-1], lines[i]) > 0) {
+                fprintf(stderr, "sort: -:  disorder: %s\n", lines[i]);
+                // Free memory
+                for (I64 j = 0; j < line_count; j++) Free(lines[j]);
+                Free(lines);
+                return 1;
+            }
+        }
+        // Free memory
+        for (I64 j = 0; j < line_count; j++) Free(lines[j]);
+        Free(lines);
+        return 0;
+    }
+
+    // Sort (bubble sort - simple but slow for large data)
+    for (I64 i = 0; i < line_count - 1; i++) {
+        for (I64 j = 0; j < line_count - i - 1; j++) {
+            if (compare_lines(lines[j], lines[j+1]) > 0) {
+                U8 *tmp = lines[j];
+                lines[j] = lines[j+1];
+                lines[j+1] = tmp;
+            }
+        }
+    }
+
+    // Output
+    FILE *out_fp = stdout;
+    if (output_file) {
+        out_fp = fopen(output_file, "w");
+        if (!out_fp) {
+            fprintf(stderr, "sort: cannot create '%s': %s\n", output_file, strerror(errno));
+            for (I64 i = 0; i < line_count; i++) Free(lines[i]);
+            Free(lines);
+            return 2;
+        }
+    }
+
+    U8 *prev_line = NULL;
+    for (I64 i = 0; i < line_count; i++) {
+        if (unique) {
+            if (prev_line && compare_lines(prev_line, lines[i]) == 0)
+                continue;
+        }
+        fprintf(out_fp, "%s\n", lines[i]);
+        prev_line = lines[i];
+    }
+
+    if (output_file)
+        fclose(out_fp);
+
+    // Free memory
+    for (I64 i = 0; i < line_count; i++) Free(lines[i]);
+    Free(lines);
+
+    return 0;
+}
+
+U0 GnuSortRegister()
+{
+    "GNU 'sort' utility loaded.\n";
+}

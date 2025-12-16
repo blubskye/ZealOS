@@ -1,0 +1,761 @@
+// HTTPClient.ZC - HTTP/HTTPS Client Implementation
+// Part of ZealOS TLS/HTTP/WebSocket implementation
+// Supports HTTP/1.1 over TLS (HTTPS)
+
+// ============================================================================
+// URL PARSING
+// ============================================================================
+
+// Parse a URL into components
+// Returns HTTP_OK or error code
+I64 HTTPParseURL(U8 *url, U8 **host_out, U8 **path_out, U16 *port_out, Bool *tls_out)
+{
+	U8 *p = url;
+	U8 *host_start;
+	U8 *host_end;
+	U8 *path_start;
+	I64 host_len;
+	I64 path_len;
+	U16 port = 0;
+	Bool use_tls = FALSE;
+
+	// Check scheme
+	if (StrNCmp(p, "https://", 8) == 0) {
+		use_tls = TRUE;
+		port = HTTPS_DEFAULT_PORT;
+		p += 8;
+	} else if (StrNCmp(p, "http://", 7) == 0) {
+		use_tls = FALSE;
+		port = HTTP_DEFAULT_PORT;
+		p += 7;
+	} else {
+		// Assume HTTPS if no scheme
+		use_tls = TRUE;
+		port = HTTPS_DEFAULT_PORT;
+	}
+
+	// Find host
+	host_start = p;
+
+	// Find end of host (: or / or end of string)
+	while (*p && *p != ':' && *p != '/') {
+		p++;
+	}
+	host_end = p;
+	host_len = host_end - host_start;
+
+	if (host_len == 0) {
+		return HTTP_ERR_INVALID_URL;
+	}
+
+	// Check for port
+	if (*p == ':') {
+		p++;
+		port = 0;
+		while (*p >= '0' && *p <= '9') {
+			port = port * 10 + (*p - '0');
+			p++;
+		}
+		if (port == 0) {
+			port = use_tls ? HTTPS_DEFAULT_PORT : HTTP_DEFAULT_PORT;
+		}
+	}
+
+	// Get path (defaults to "/")
+	if (*p == '/') {
+		path_start = p;
+		path_len = StrLen(p);
+	} else {
+		path_start = "/";
+		path_len = 1;
+	}
+
+	// Allocate and copy host
+	*host_out = MAlloc(host_len + 1);
+	MemCpy(*host_out, host_start, host_len);
+	(*host_out)[host_len] = 0;
+
+	// Allocate and copy path
+	*path_out = MAlloc(path_len + 1);
+	MemCpy(*path_out, path_start, path_len);
+	(*path_out)[path_len] = 0;
+
+	*port_out = port;
+	*tls_out = use_tls;
+
+	return HTTP_OK;
+}
+
+// ============================================================================
+// HTTP CLIENT CREATION/DESTRUCTION
+// ============================================================================
+
+// Create a new HTTP client
+CHTTPClient *HTTPClientNew()
+{
+	CHTTPClient *client = MAlloc(sizeof(CHTTPClient));
+	MemSet(client, 0, sizeof(CHTTPClient));
+	client->timeout = 30000;  // 30 second default timeout
+	return client;
+}
+
+// Free an HTTP client
+U0 HTTPClientFree(CHTTPClient *client)
+{
+	if (!client) return;
+
+	if (client->connected) {
+		if (client->use_tls && client->tls_socket) {
+			TLSClose(client->tls_socket);
+			Free(client->tls_socket);
+		} else if (client->tcp_socket) {
+			TCPSocketClose(client->tcp_socket);
+		}
+	}
+
+	if (client->current_host) {
+		Free(client->current_host);
+	}
+
+	Free(client);
+}
+
+// ============================================================================
+// REQUEST CREATION/DESTRUCTION
+// ============================================================================
+
+// Create a new HTTP request
+CHTTPRequest *HTTPRequestNew(I64 method, U8 *url)
+{
+	CHTTPRequest *req = MAlloc(sizeof(CHTTPRequest));
+	MemSet(req, 0, sizeof(CHTTPRequest));
+
+	req->method = method;
+	req->url = StrNew(url);
+
+	// Parse URL
+	I64 result = HTTPParseURL(url, &req->host, &req->path, &req->port, &req->use_tls);
+	if (result != HTTP_OK) {
+		Free(req->url);
+		Free(req);
+		return NULL;
+	}
+
+	return req;
+}
+
+// Add a header to request
+U0 HTTPRequestAddHeader(CHTTPRequest *req, U8 *name, U8 *value)
+{
+	if (req->header_count >= HTTP_MAX_HEADERS) return;
+
+	req->headers[req->header_count].name = StrNew(name);
+	req->headers[req->header_count].value = StrNew(value);
+	req->header_count++;
+}
+
+// Set request body
+U0 HTTPRequestSetBody(CHTTPRequest *req, U8 *body, I64 length)
+{
+	if (req->body) {
+		Free(req->body);
+	}
+	req->body = MAlloc(length);
+	MemCpy(req->body, body, length);
+	req->body_length = length;
+}
+
+// Free an HTTP request
+U0 HTTPRequestFree(CHTTPRequest *req)
+{
+	I64 i;
+	if (!req) return;
+
+	if (req->url) Free(req->url);
+	if (req->host) Free(req->host);
+	if (req->path) Free(req->path);
+	if (req->body) Free(req->body);
+
+	for (i = 0; i < req->header_count; i++) {
+		if (req->headers[i].name) Free(req->headers[i].name);
+		if (req->headers[i].value) Free(req->headers[i].value);
+	}
+
+	Free(req);
+}
+
+// ============================================================================
+// RESPONSE CREATION/DESTRUCTION
+// ============================================================================
+
+// Create a new HTTP response
+CHTTPResponse *HTTPResponseNew()
+{
+	CHTTPResponse *resp = MAlloc(sizeof(CHTTPResponse));
+	MemSet(resp, 0, sizeof(CHTTPResponse));
+	resp->content_length = -1;
+	return resp;
+}
+
+// Free an HTTP response
+U0 HTTPResponseFree(CHTTPResponse *resp)
+{
+	I64 i;
+	if (!resp) return;
+
+	if (resp->status_text) Free(resp->status_text);
+	if (resp->body) Free(resp->body);
+
+	for (i = 0; i < resp->header_count; i++) {
+		if (resp->headers[i].name) Free(resp->headers[i].name);
+		if (resp->headers[i].value) Free(resp->headers[i].value);
+	}
+
+	Free(resp);
+}
+
+// Get a response header value
+U8 *HTTPResponseGetHeader(CHTTPResponse *resp, U8 *name)
+{
+	I64 i;
+	for (i = 0; i < resp->header_count; i++) {
+		if (StrICmp(resp->headers[i].name, name) == 0) {
+			return resp->headers[i].value;
+		}
+	}
+	return NULL;
+}
+
+// ============================================================================
+// REQUEST SENDING
+// ============================================================================
+
+// Build HTTP request string
+I64 HTTPBuildRequest(CHTTPRequest *req, U8 *buffer, I64 buffer_size)
+{
+	I64 pos = 0;
+	I64 i;
+	U8 *method_str = HTTPMethodString(req->method);
+
+	// Request line: METHOD PATH HTTP/1.1\r\n
+	pos += StrPrint(&buffer[pos], "%s %s HTTP/1.1\r\n", method_str, req->path);
+
+	// Host header (required for HTTP/1.1)
+	if (req->port == 80 || req->port == 443) {
+		pos += StrPrint(&buffer[pos], "Host: %s\r\n", req->host);
+	} else {
+		pos += StrPrint(&buffer[pos], "Host: %s:%d\r\n", req->host, req->port);
+	}
+
+	// User-Agent
+	pos += StrPrint(&buffer[pos], "User-Agent: ZealOS/1.0\r\n");
+
+	// Content-Length if body present
+	if (req->body && req->body_length > 0) {
+		pos += StrPrint(&buffer[pos], "Content-Length: %d\r\n", req->body_length);
+	}
+
+	// Connection header
+	pos += StrPrint(&buffer[pos], "Connection: keep-alive\r\n");
+
+	// Accept header
+	pos += StrPrint(&buffer[pos], "Accept: */*\r\n");
+
+	// Custom headers
+	for (i = 0; i < req->header_count; i++) {
+		pos += StrPrint(&buffer[pos], "%s: %s\r\n",
+		               req->headers[i].name, req->headers[i].value);
+	}
+
+	// End of headers
+	pos += StrPrint(&buffer[pos], "\r\n");
+
+	return pos;
+}
+
+// Send data over connection (TLS or plain)
+I64 HTTPSend(CHTTPClient *client, U8 *data, I64 length)
+{
+	if (client->use_tls) {
+		return TLSSocketSend(client->tls_socket, data, length);
+	} else {
+		return TCPSocketSend(client->tcp_socket, data, length);
+	}
+}
+
+// Receive data from connection (TLS or plain)
+I64 HTTPRecv(CHTTPClient *client, U8 *buffer, I64 length)
+{
+	if (client->use_tls) {
+		return TLSSocketRecv(client->tls_socket, buffer, length);
+	} else {
+		return TCPSocketRecv(client->tcp_socket, buffer, length);
+	}
+}
+
+// ============================================================================
+// RESPONSE PARSING
+// ============================================================================
+
+// Parse HTTP status line
+// Returns status code or negative error
+I64 HTTPParseStatusLine(U8 *line, I64 length, CHTTPResponse *resp)
+{
+	U8 *p = line;
+	U8 *end = line + length;
+	I64 status_code = 0;
+	U8 *status_text_start;
+	I64 status_text_len;
+
+	// Skip HTTP version (HTTP/1.x)
+	while (p < end && *p != ' ') p++;
+	if (p >= end) return HTTP_ERR_INVALID_RESPONSE;
+	p++;  // Skip space
+
+	// Parse status code
+	while (p < end && *p >= '0' && *p <= '9') {
+		status_code = status_code * 10 + (*p - '0');
+		p++;
+	}
+	if (status_code == 0) return HTTP_ERR_INVALID_RESPONSE;
+	if (p >= end) return HTTP_ERR_INVALID_RESPONSE;
+	p++;  // Skip space
+
+	// Status text
+	status_text_start = p;
+	while (p < end && *p != '\r' && *p != '\n') p++;
+	status_text_len = p - status_text_start;
+
+	resp->status_code = status_code;
+	resp->status_text = MAlloc(status_text_len + 1);
+	MemCpy(resp->status_text, status_text_start, status_text_len);
+	resp->status_text[status_text_len] = 0;
+
+	return status_code;
+}
+
+// Parse a header line
+I64 HTTPParseHeaderLine(U8 *line, I64 length, CHTTPResponse *resp)
+{
+	U8 *colon;
+	U8 *name_start = line;
+	U8 *value_start;
+	I64 name_len;
+	I64 value_len;
+
+	// Find colon
+	colon = line;
+	while (colon < line + length && *colon != ':') colon++;
+	if (colon >= line + length) return -1;
+
+	name_len = colon - name_start;
+
+	// Skip colon and whitespace
+	value_start = colon + 1;
+	while (value_start < line + length && (*value_start == ' ' || *value_start == '\t')) {
+		value_start++;
+	}
+
+	// Find end of value (strip trailing CRLF)
+	U8 *value_end = line + length;
+	while (value_end > value_start && (*(value_end-1) == '\r' || *(value_end-1) == '\n')) {
+		value_end--;
+	}
+	value_len = value_end - value_start;
+
+	if (resp->header_count >= HTTP_MAX_HEADERS) return 0;
+
+	// Store header
+	resp->headers[resp->header_count].name = MAlloc(name_len + 1);
+	MemCpy(resp->headers[resp->header_count].name, name_start, name_len);
+	resp->headers[resp->header_count].name[name_len] = 0;
+
+	resp->headers[resp->header_count].value = MAlloc(value_len + 1);
+	MemCpy(resp->headers[resp->header_count].value, value_start, value_len);
+	resp->headers[resp->header_count].value[value_len] = 0;
+
+	// Check for special headers
+	U8 *name = resp->headers[resp->header_count].name;
+	U8 *value = resp->headers[resp->header_count].value;
+
+	if (StrICmp(name, "Content-Length") == 0) {
+		resp->content_length = Str2I64(value);
+	} else if (StrICmp(name, "Transfer-Encoding") == 0) {
+		if (StrIMatch(value, "chunked")) {
+			resp->chunked = TRUE;
+		}
+	} else if (StrICmp(name, "Connection") == 0) {
+		if (StrICmp(value, "keep-alive") == 0) {
+			resp->keep_alive = TRUE;
+		}
+	}
+
+	resp->header_count++;
+	return 0;
+}
+
+// Read until we find \r\n\r\n (end of headers)
+I64 HTTPReadHeaders(CHTTPClient *client, U8 *buffer, I64 buffer_size)
+{
+	I64 total = 0;
+	I64 result;
+
+	while (total < buffer_size - 1) {
+		result = HTTPRecv(client, &buffer[total], 1);
+		if (result <= 0) {
+			return result < 0 ? result : HTTP_ERR_RECV_FAILED;
+		}
+		total++;
+
+		// Check for end of headers
+		if (total >= 4 &&
+		    buffer[total-4] == '\r' && buffer[total-3] == '\n' &&
+		    buffer[total-2] == '\r' && buffer[total-1] == '\n') {
+			buffer[total] = 0;
+			return total;
+		}
+	}
+
+	return HTTP_ERR_BUFFER_OVERFLOW;
+}
+
+// Parse chunked transfer encoding
+I64 HTTPReadChunkedBody(CHTTPClient *client, CHTTPResponse *resp)
+{
+	U8 chunk_header[32];
+	I64 chunk_size;
+	I64 pos;
+	I64 result;
+	U8 crlf[2];
+
+	resp->body = NULL;
+	resp->body_length = 0;
+	resp->body_capacity = 0;
+
+	while (TRUE) {
+		// Read chunk size line
+		pos = 0;
+		while (pos < 30) {
+			result = HTTPRecv(client, &chunk_header[pos], 1);
+			if (result <= 0) return HTTP_ERR_RECV_FAILED;
+
+			if (pos > 0 && chunk_header[pos-1] == '\r' && chunk_header[pos] == '\n') {
+				chunk_header[pos-1] = 0;  // Null terminate
+				break;
+			}
+			pos++;
+		}
+
+		// Parse hex chunk size
+		chunk_size = 0;
+		for (pos = 0; chunk_header[pos]; pos++) {
+			U8 c = chunk_header[pos];
+			if (c >= '0' && c <= '9') {
+				chunk_size = chunk_size * 16 + (c - '0');
+			} else if (c >= 'a' && c <= 'f') {
+				chunk_size = chunk_size * 16 + (c - 'a' + 10);
+			} else if (c >= 'A' && c <= 'F') {
+				chunk_size = chunk_size * 16 + (c - 'A' + 10);
+			} else {
+				break;  // Stop at extension or end
+			}
+		}
+
+		// Last chunk?
+		if (chunk_size == 0) {
+			// Read trailing CRLF
+			HTTPRecv(client, crlf, 2);
+			break;
+		}
+
+		// Expand body buffer if needed
+		if (resp->body_length + chunk_size > resp->body_capacity) {
+			I64 new_cap = resp->body_capacity * 2;
+			if (new_cap < resp->body_length + chunk_size) {
+				new_cap = resp->body_length + chunk_size + 4096;
+			}
+			U8 *new_body = MAlloc(new_cap);
+			if (resp->body) {
+				MemCpy(new_body, resp->body, resp->body_length);
+				Free(resp->body);
+			}
+			resp->body = new_body;
+			resp->body_capacity = new_cap;
+		}
+
+		// Read chunk data
+		I64 read = 0;
+		while (read < chunk_size) {
+			result = HTTPRecv(client, &resp->body[resp->body_length + read], chunk_size - read);
+			if (result <= 0) return HTTP_ERR_RECV_FAILED;
+			read += result;
+		}
+		resp->body_length += chunk_size;
+
+		// Read trailing CRLF
+		HTTPRecv(client, crlf, 2);
+	}
+
+	return HTTP_OK;
+}
+
+// Read Content-Length body
+I64 HTTPReadContentLengthBody(CHTTPClient *client, CHTTPResponse *resp, I64 length)
+{
+	I64 result;
+	I64 read = 0;
+
+	resp->body = MAlloc(length + 1);
+	resp->body_length = length;
+	resp->body_capacity = length + 1;
+
+	while (read < length) {
+		result = HTTPRecv(client, &resp->body[read], length - read);
+		if (result <= 0) {
+			return HTTP_ERR_RECV_FAILED;
+		}
+		read += result;
+	}
+
+	resp->body[length] = 0;  // Null terminate
+	return HTTP_OK;
+}
+
+// ============================================================================
+// MAIN REQUEST FUNCTION
+// ============================================================================
+
+// Perform an HTTP request
+// Returns response or NULL on error
+CHTTPResponse *HTTPRequest(CHTTPClient *client, CHTTPRequest *req)
+{
+	U8 *request_buf;
+	U8 *header_buf;
+	I64 request_len;
+	I64 header_len;
+	I64 result;
+	CHTTPResponse *resp;
+
+	// Check if we need to connect/reconnect
+	Bool need_connect = !client->connected;
+
+	if (client->connected) {
+		// Check if host/port changed
+		if (!client->current_host ||
+		    StrCmp(client->current_host, req->host) != 0 ||
+		    client->current_port != req->port ||
+		    client->use_tls != req->use_tls) {
+			// Close existing connection
+			if (client->use_tls && client->tls_socket) {
+				TLSClose(client->tls_socket);
+				Free(client->tls_socket);
+				client->tls_socket = NULL;
+			} else if (client->tcp_socket) {
+				TCPSocketClose(client->tcp_socket);
+				client->tcp_socket = NULL;
+			}
+			if (client->current_host) {
+				Free(client->current_host);
+				client->current_host = NULL;
+			}
+			client->connected = FALSE;
+			need_connect = TRUE;
+		}
+	}
+
+	// Connect if needed
+	if (need_connect) {
+		client->use_tls = req->use_tls;
+
+		if (req->use_tls) {
+			// HTTPS connection
+			client->tls_socket = MAlloc(sizeof(CTLSSocket));
+			MemSet(client->tls_socket, 0, sizeof(CTLSSocket));
+
+			result = TLSConnect(client->tls_socket, req->host, req->port, client->timeout);
+			if (result != TLS_OK) {
+				Free(client->tls_socket);
+				client->tls_socket = NULL;
+				return NULL;
+			}
+		} else {
+			// Plain HTTP connection
+			client->tcp_socket = TCPSocket();
+			if (!client->tcp_socket) {
+				return NULL;
+			}
+
+			result = TCPSocketConnect(client->tcp_socket, req->host, req->port);
+			if (result < 0) {
+				TCPSocketClose(client->tcp_socket);
+				client->tcp_socket = NULL;
+				return NULL;
+			}
+		}
+
+		client->connected = TRUE;
+		client->current_host = StrNew(req->host);
+		client->current_port = req->port;
+	}
+
+	// Build request
+	request_buf = MAlloc(HTTP_MAX_HEADER_SIZE);
+	request_len = HTTPBuildRequest(req, request_buf, HTTP_MAX_HEADER_SIZE);
+
+	// Send request headers
+	result = HTTPSend(client, request_buf, request_len);
+	Free(request_buf);
+
+	if (result < 0) {
+		client->connected = FALSE;
+		return NULL;
+	}
+
+	// Send body if present
+	if (req->body && req->body_length > 0) {
+		result = HTTPSend(client, req->body, req->body_length);
+		if (result < 0) {
+			client->connected = FALSE;
+			return NULL;
+		}
+	}
+
+	// Read response headers
+	header_buf = MAlloc(HTTP_MAX_HEADER_SIZE);
+	header_len = HTTPReadHeaders(client, header_buf, HTTP_MAX_HEADER_SIZE);
+
+	if (header_len < 0) {
+		Free(header_buf);
+		client->connected = FALSE;
+		return NULL;
+	}
+
+	// Parse response
+	resp = HTTPResponseNew();
+
+	// Parse status line
+	U8 *line = header_buf;
+	U8 *line_end = StrStr(line, "\r\n");
+	if (!line_end) {
+		Free(header_buf);
+		HTTPResponseFree(resp);
+		return NULL;
+	}
+
+	result = HTTPParseStatusLine(line, line_end - line, resp);
+	if (result < 0) {
+		Free(header_buf);
+		HTTPResponseFree(resp);
+		return NULL;
+	}
+
+	// Parse headers
+	line = line_end + 2;
+	while (line < header_buf + header_len) {
+		line_end = StrStr(line, "\r\n");
+		if (!line_end) break;
+
+		if (line_end == line) break;  // Empty line = end of headers
+
+		HTTPParseHeaderLine(line, line_end - line, resp);
+		line = line_end + 2;
+	}
+
+	Free(header_buf);
+
+	// Read body
+	if (req->method != HTTP_METHOD_HEAD) {
+		if (resp->chunked) {
+			result = HTTPReadChunkedBody(client, resp);
+		} else if (resp->content_length > 0) {
+			result = HTTPReadContentLengthBody(client, resp, resp->content_length);
+		} else if (resp->content_length == 0) {
+			// No body
+			resp->body = NULL;
+			resp->body_length = 0;
+		} else {
+			// Read until connection close (not ideal but works)
+			// For keep-alive connections this would hang, so skip
+			resp->body = NULL;
+			resp->body_length = 0;
+		}
+	}
+
+	return resp;
+}
+
+// ============================================================================
+// CONVENIENCE FUNCTIONS
+// ============================================================================
+
+// Simple GET request
+CHTTPResponse *HTTPGet(U8 *url)
+{
+	CHTTPClient *client = HTTPClientNew();
+	CHTTPRequest *req = HTTPRequestNew(HTTP_METHOD_GET, url);
+	CHTTPResponse *resp = NULL;
+
+	if (req) {
+		resp = HTTPRequest(client, req);
+		HTTPRequestFree(req);
+	}
+
+	HTTPClientFree(client);
+	return resp;
+}
+
+// Simple POST request with JSON body
+CHTTPResponse *HTTPPostJSON(U8 *url, U8 *json_body)
+{
+	CHTTPClient *client = HTTPClientNew();
+	CHTTPRequest *req = HTTPRequestNew(HTTP_METHOD_POST, url);
+	CHTTPResponse *resp = NULL;
+
+	if (req) {
+		HTTPRequestAddHeader(req, "Content-Type", "application/json");
+		if (json_body) {
+			HTTPRequestSetBody(req, json_body, StrLen(json_body));
+		}
+		resp = HTTPRequest(client, req);
+		HTTPRequestFree(req);
+	}
+
+	HTTPClientFree(client);
+	return resp;
+}
+
+// ============================================================================
+// TEST FUNCTION
+// ============================================================================
+
+// Test HTTP client with a simple HTTPS request
+Bool HTTPTest()
+{
+	"====== HTTP Client Test ======\n\n";
+
+	"Fetching https://httpbin.org/get ...\n";
+
+	CHTTPResponse *resp = HTTPGet("https://httpbin.org/get");
+
+	if (!resp) {
+		"Request failed!\n";
+		return FALSE;
+	}
+
+	"Status: %d %s\n", resp->status_code, resp->status_text;
+	"Headers:\n";
+
+	I64 i;
+	for (i = 0; i < resp->header_count; i++) {
+		"  %s: %s\n", resp->headers[i].name, resp->headers[i].value;
+	}
+
+	if (resp->body) {
+		"\nBody (%d bytes):\n%s\n", resp->body_length, resp->body;
+	}
+
+	HTTPResponseFree(resp);
+
+	"\nHTTP test passed!\n";
+	return TRUE;
+}

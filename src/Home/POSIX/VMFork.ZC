@@ -1,0 +1,444 @@
+// VMFork.ZC - Integration of Virtual Memory with POSIX Fork
+// Provides true fork() with copy-on-write semantics
+
+#include "VM.HH"
+
+// ============================================================================
+// FORWARD DECLARATIONS
+// ============================================================================
+
+extern class CPosixProcess;
+extern CPosixProcess *posix_current;
+extern CPosixProcess *posix_processes[];
+extern I64 posix_next_pid;
+extern I64 posix_process_count;
+
+// ============================================================================
+// VM-AWARE FORK IMPLEMENTATION
+// ============================================================================
+
+// Create a VM context for a POSIX process
+U0 PosixVMContextCreate(CPosixProcess *proc)
+{
+    CVMContext *ctx;
+
+    if (!proc)
+        return;
+
+    ctx = VMContextNew();
+    if (!ctx) {
+        "VMFork: Failed to create VM context for pid %d\n", proc->pid;
+        return;
+    }
+
+    proc->vm_context = ctx(U64);
+}
+
+// Free a process's VM context
+U0 PosixVMContextFree(CPosixProcess *proc)
+{
+    CVMContext *ctx;
+
+    if (!proc || !proc->vm_context)
+        return;
+
+    ctx = proc->vm_context(CVMContext *);
+    VMContextFree(ctx);
+    proc->vm_context = 0;
+}
+
+// Fork with copy-on-write VM
+// Returns: child pid in parent, 0 in child, -1 on error
+I64 PosixVMFork()
+{
+    CPosixProcess *parent, *child;
+    CVMContext *parent_ctx, *child_ctx;
+    I64 child_pid, i;
+    CTask *child_task;
+
+    parent = posix_current;
+    if (!parent) {
+        posix_errno = ESRCH;
+        return -1;
+    }
+
+    // Allocate child process structure
+    child = MAlloc(sizeof(CPosixProcess));
+    if (!child) {
+        posix_errno = ENOMEM;
+        return -1;
+    }
+    MemSet(child, 0, sizeof(CPosixProcess));
+
+    // Assign PID
+    child_pid = posix_next_pid++;
+    child->pid = child_pid;
+    child->ppid = parent->pid;
+    child->pgid = parent->pgid;
+    child->sid = parent->sid;
+
+    // Fork VM context with COW
+    parent_ctx = parent->vm_context(CVMContext *);
+    if (parent_ctx) {
+        child_ctx = VMContextFork(parent_ctx);
+        if (!child_ctx) {
+            Free(child);
+            posix_errno = ENOMEM;
+            return -1;
+        }
+        child->vm_context = child_ctx(U64);
+    } else {
+        // No VM context, create fresh one
+        child_ctx = VMContextNew();
+        if (child_ctx)
+            child->vm_context = child_ctx(U64);
+    }
+
+    // Copy file descriptors (with reference counting)
+    for (i = 0; i < POSIX_OPEN_MAX; i++) {
+        if (parent->fd_table[i]) {
+            // Share the FD structure, increment ref count
+            child->fd_table[i] = parent->fd_table[i];
+            child->fd_table[i]->ref_count++;
+        }
+    }
+    child->fd_count = parent->fd_count;
+
+    // Copy environment
+    if (parent->environ && parent->environ_count > 0) {
+        child->environ_capacity = parent->environ_capacity;
+        child->environ = MAlloc(child->environ_capacity * sizeof(U8 *));
+        for (i = 0; i < parent->environ_count; i++) {
+            child->environ[i] = StrNew(parent->environ[i]);
+        }
+        child->environ_count = parent->environ_count;
+    }
+
+    // Copy CWD
+    if (parent->cwd)
+        child->cwd = StrNew(parent->cwd);
+
+    // Copy signal handlers (but not pending signals)
+    MemCpy(&child->sigactions, &parent->sigactions, sizeof(parent->sigactions));
+    child->sigmask = parent->sigmask;
+    child->sigpending.bits = 0;
+
+    // Copy command info
+    if (parent->argv0)
+        child->argv0 = StrNew(parent->argv0);
+    if (parent->argv && parent->argc > 0) {
+        child->argv = MAlloc((parent->argc + 1) * sizeof(U8 *));
+        for (i = 0; i < parent->argc; i++) {
+            child->argv[i] = StrNew(parent->argv[i]);
+        }
+        child->argv[parent->argc] = NULL;
+        child->argc = parent->argc;
+    }
+
+    // Link to parent
+    child->parent = parent;
+    child->next_sibling = parent->first_child;
+    parent->first_child = child;
+    if (parent->child_count < POSIX_CHILD_MAX)
+        parent->children[parent->child_count++] = child;
+
+    // Register in process table
+    for (i = 0; i < POSIX_CHILD_MAX; i++) {
+        if (!posix_processes[i]) {
+            posix_processes[i] = child;
+            posix_process_count++;
+            break;
+        }
+    }
+
+    // Create the child task
+    // This is where it gets tricky - we need to spawn a task that will
+    // continue execution after the fork() call with return value 0
+
+    // For now, we use ZealOS Spawn() and the child runs a continuation
+    // The child task needs to:
+    // 1. Set up its POSIX process context
+    // 2. Switch to its VM context
+    // 3. Return 0 from fork()
+
+    // Store child process for the spawned task to find
+    child->task = NULL; // Will be set when child task starts
+
+    // The actual task spawning happens through the callback mechanism
+    // See PosixVMForkChild below
+
+    return child_pid;
+}
+
+// Child task entry point for VM fork
+// This is called in the context of the newly spawned task
+U0 PosixVMForkChildEntry(CPosixProcess *child)
+{
+    CVMContext *ctx;
+
+    if (!child)
+        return;
+
+    // Set up process context
+    child->task = Fs; // Current task
+    posix_current = child;
+
+    // Switch to child's VM context
+    ctx = child->vm_context(CVMContext *);
+    if (ctx) {
+        VMSwitchContext(ctx);
+    }
+
+    // Note: The actual continuation of execution after fork() depends on
+    // how the calling code handles the spawned task. In a true fork(),
+    // we'd need to copy the entire call stack, which is complex.
+    // This is a simplified version that works for fork+exec patterns.
+}
+
+// ============================================================================
+// PAGE FAULT HANDLER INTEGRATION
+// ============================================================================
+
+// This would be called from an interrupt handler for page faults
+// For now, it's callable from POSIX code when COW faults occur
+I64 PosixHandlePageFault(U64 fault_addr, U64 error_code)
+{
+    CVMContext *ctx;
+    CPosixProcess *proc;
+
+    proc = posix_current;
+    if (!proc || !proc->vm_context)
+        return -1;
+
+    ctx = proc->vm_context(CVMContext *);
+    return VMPageFault(ctx, fault_addr, error_code);
+}
+
+// ============================================================================
+// MEMORY ALLOCATION FOR PROCESSES
+// ============================================================================
+
+// Allocate memory in process's virtual address space
+U64 PosixMmap(U64 addr, U64 length, I64 prot, I64 flags)
+{
+    CVMContext *ctx;
+    CPosixProcess *proc;
+    U8 vm_flags;
+
+    proc = posix_current;
+    if (!proc || !proc->vm_context)
+        return -1;
+
+    ctx = proc->vm_context(CVMContext *);
+
+    // Convert POSIX prot to VM flags
+    vm_flags = 0;
+    if (prot & PROT_READ)
+        vm_flags |= VM_FLAG_READ;
+    if (prot & PROT_WRITE)
+        vm_flags |= VM_FLAG_WRITE;
+    if (prot & PROT_EXEC)
+        vm_flags |= VM_FLAG_EXEC;
+
+    return VMMmap(ctx, addr, length, vm_flags);
+}
+
+// Free memory in process's virtual address space
+I64 PosixMunmap(U64 addr, U64 length)
+{
+    CVMContext *ctx;
+    CPosixProcess *proc;
+
+    proc = posix_current;
+    if (!proc || !proc->vm_context)
+        return -1;
+
+    ctx = proc->vm_context(CVMContext *);
+    VMMunmap(ctx, addr, length);
+    return 0;
+}
+
+// brk/sbrk for heap management
+U64 PosixBrk(U64 addr)
+{
+    CVMContext *ctx;
+    CPosixProcess *proc;
+
+    proc = posix_current;
+    if (!proc || !proc->vm_context)
+        return -1;
+
+    ctx = proc->vm_context(CVMContext *);
+    return VMBrk(ctx, addr);
+}
+
+U64 PosixSbrk(I64 increment)
+{
+    CVMContext *ctx;
+    CPosixProcess *proc;
+    U64 old_brk;
+
+    proc = posix_current;
+    if (!proc || !proc->vm_context)
+        return -1;
+
+    ctx = proc->vm_context(CVMContext *);
+    old_brk = ctx->heap_end;
+
+    if (increment == 0)
+        return old_brk;
+
+    if (VMBrk(ctx, old_brk + increment) == old_brk + increment)
+        return old_brk;
+
+    return -1;
+}
+
+// ============================================================================
+// CONTEXT SWITCHING HOOKS
+// ============================================================================
+
+// Called when switching to a POSIX process
+U0 PosixVMContextEnter(CPosixProcess *proc)
+{
+    CVMContext *ctx;
+
+    if (!proc || !proc->vm_context)
+        return;
+
+    ctx = proc->vm_context(CVMContext *);
+    VMSwitchContext(ctx);
+}
+
+// Called when switching away from a POSIX process
+U0 PosixVMContextLeave(CPosixProcess *proc)
+{
+    // Switch back to kernel page tables
+    if (vm_kernel_pml4) {
+        VMWriteCR3(vm_kernel_pml4(U64));
+    }
+}
+
+// ============================================================================
+// EXEC SUPPORT
+// ============================================================================
+
+// Reset VM context for exec() - clears all mappings
+U0 PosixVMExecReset(CPosixProcess *proc)
+{
+    CVMContext *old_ctx, *new_ctx;
+
+    if (!proc)
+        return;
+
+    // Free old context
+    if (proc->vm_context) {
+        old_ctx = proc->vm_context(CVMContext *);
+        VMContextFree(old_ctx);
+    }
+
+    // Create fresh context
+    new_ctx = VMContextNew();
+    proc->vm_context = new_ctx(U64);
+}
+
+// Load code/data into process VM (for exec)
+I64 PosixVMLoadSegment(CPosixProcess *proc, U64 virt_addr, U8 *data, U64 size, U8 flags)
+{
+    CVMContext *ctx;
+    U64 start, end, virt, phys;
+    U64 pte_flags;
+    I64 offset;
+
+    if (!proc || !proc->vm_context)
+        return -1;
+
+    ctx = proc->vm_context(CVMContext *);
+
+    // Align addresses
+    start = virt_addr & ~(PAGE_SIZE - 1);
+    end = (virt_addr + size + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
+
+    // Build PTE flags
+    pte_flags = PTE_USER;
+    if (flags & VM_FLAG_WRITE)
+        pte_flags |= PTE_WRITE;
+    if (!(flags & VM_FLAG_EXEC))
+        pte_flags |= PTE_NX;
+
+    // Map and copy data
+    for (virt = start; virt < end; virt += PAGE_SIZE) {
+        phys = VMAllocPage();
+        if (!phys)
+            return -1;
+
+        // Copy data to page
+        offset = virt - virt_addr;
+        if (offset < 0)
+            offset = 0;
+
+        if (offset < size) {
+            I64 copy_size = PAGE_SIZE;
+            if (virt < virt_addr)
+                copy_size -= (virt_addr - virt);
+            if (offset + copy_size > size)
+                copy_size = size - offset;
+
+            if (copy_size > 0) {
+                MemCpy(phys(U8 *) + (virt < virt_addr ? virt_addr - virt : 0),
+                       data + offset,
+                       copy_size);
+            }
+        }
+
+        VMMapPage(ctx, virt, phys, pte_flags);
+        VMPhysPageRef(phys);
+        ctx->total_pages++;
+    }
+
+    // Add region
+    VMRegionAdd(ctx, start, end,
+                (flags & VM_FLAG_EXEC) ? VM_REGION_CODE : VM_REGION_DATA,
+                flags);
+
+    return 0;
+}
+
+// ============================================================================
+// DEBUG
+// ============================================================================
+
+U0 PosixVMDump(CPosixProcess *proc)
+{
+    CVMContext *ctx;
+
+    if (!proc) {
+        "PosixVMDump: NULL process\n";
+        return;
+    }
+
+    "POSIX Process %d VM Info:\n", proc->pid;
+
+    if (!proc->vm_context) {
+        "  No VM context\n";
+        return;
+    }
+
+    ctx = proc->vm_context(CVMContext *);
+    VMDumpContext(ctx);
+}
+
+// ============================================================================
+// MMAP PROT FLAGS
+// ============================================================================
+
+#define PROT_NONE   0x0
+#define PROT_READ   0x1
+#define PROT_WRITE  0x2
+#define PROT_EXEC   0x4
+
+#define MAP_SHARED      0x01
+#define MAP_PRIVATE     0x02
+#define MAP_FIXED       0x10
+#define MAP_ANONYMOUS   0x20
+#define MAP_ANON        MAP_ANONYMOUS

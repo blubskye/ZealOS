@@ -1,0 +1,306 @@
+// test.ZC - GNU coreutils 'test' (and '[') implementation
+// Check file types and compare values
+
+// C-style main function
+I64 test_main(I64 argc, U8 **argv)
+{
+    // Check if invoked as '['
+    Bool bracket_mode = FALSE;
+    if (argc > 0 && argv[0][strlen(argv[0]) - 1] == '[') {
+        bracket_mode = TRUE;
+        // Verify closing bracket
+        if (argc < 2 || strcmp(argv[argc - 1], "]") != 0) {
+            fprintf(stderr, "[: missing ']'\n");
+            return 2;
+        }
+        argc--;  // Remove ']' from consideration
+    }
+
+    if (argc <= 1) {
+        return 1;  // No expression = false
+    }
+
+    if (strcmp(argv[1], "--help") == 0) {
+        printf("Usage: test EXPRESSION\n");
+        printf("  or:  test\n");
+        printf("  or:  [ EXPRESSION ]\n");
+        printf("  or:  [ ]\n");
+        printf("  or:  [ OPTION\n");
+        printf("Exit with the status determined by EXPRESSION.\n\n");
+        printf("  --help      display this help and exit\n");
+        printf("  --version   output version information and exit\n");
+        printf("\nFile tests:\n");
+        printf("  -e FILE     FILE exists\n");
+        printf("  -f FILE     FILE exists and is a regular file\n");
+        printf("  -d FILE     FILE exists and is a directory\n");
+        printf("  -r FILE     FILE exists and read permission is granted\n");
+        printf("  -w FILE     FILE exists and write permission is granted\n");
+        printf("  -x FILE     FILE exists and execute permission is granted\n");
+        printf("  -s FILE     FILE exists and has size greater than zero\n");
+        printf("  -L FILE     FILE exists and is a symbolic link\n");
+        printf("\nString tests:\n");
+        printf("  -z STRING   length of STRING is zero\n");
+        printf("  -n STRING   length of STRING is nonzero\n");
+        printf("  STRING1 = STRING2   strings are equal\n");
+        printf("  STRING1 != STRING2  strings are not equal\n");
+        printf("\nInteger comparisons:\n");
+        printf("  INT1 -eq INT2   INT1 is equal to INT2\n");
+        printf("  INT1 -ne INT2   INT1 is not equal to INT2\n");
+        printf("  INT1 -lt INT2   INT1 is less than INT2\n");
+        printf("  INT1 -le INT2   INT1 is less than or equal to INT2\n");
+        printf("  INT1 -gt INT2   INT1 is greater than INT2\n");
+        printf("  INT1 -ge INT2   INT1 is greater than or equal to INT2\n");
+        printf("\nLogical operators:\n");
+        printf("  ! EXPRESSION    EXPRESSION is false\n");
+        printf("  EXPR1 -a EXPR2  both EXPR1 and EXPR2 are true\n");
+        printf("  EXPR1 -o EXPR2  either EXPR1 or EXPR2 is true\n");
+        printf("  ( EXPRESSION )  EXPRESSION is true\n");
+        return 0;
+    }
+
+    if (strcmp(argv[1], "--version") == 0) {
+        printf("test (ZealOS coreutils) 1.0\n");
+        return 0;
+    }
+
+    I64 pos = 1;
+
+    // Forward declarations
+    Bool eval_or();
+    Bool eval_and();
+    Bool eval_not();
+    Bool eval_primary();
+
+    // OR expression (EXPR1 -o EXPR2)
+    eval_or = [&]() -> Bool {
+        Bool result = eval_and();
+
+        while (pos < argc && strcmp(argv[pos], "-o") == 0) {
+            pos++;
+            Bool right = eval_and();
+            result = result || right;
+        }
+
+        return result;
+    };
+
+    // AND expression (EXPR1 -a EXPR2)
+    eval_and = [&]() -> Bool {
+        Bool result = eval_not();
+
+        while (pos < argc && strcmp(argv[pos], "-a") == 0) {
+            pos++;
+            Bool right = eval_not();
+            result = result && right;
+        }
+
+        return result;
+    };
+
+    // NOT expression (! EXPR)
+    eval_not = [&]() -> Bool {
+        if (pos < argc && strcmp(argv[pos], "!") == 0) {
+            pos++;
+            return !eval_not();
+        }
+        return eval_primary();
+    };
+
+    // Primary expression
+    eval_primary = [&]() -> Bool {
+        if (pos >= argc) {
+            return FALSE;
+        }
+
+        U8 *token = argv[pos];
+
+        // Parenthesized expression
+        if (strcmp(token, "(") == 0) {
+            pos++;
+            Bool result = eval_or();
+            if (pos < argc && strcmp(argv[pos], ")") == 0) {
+                pos++;
+            }
+            return result;
+        }
+
+        // Unary file tests
+        if (token[0] == '-' && token[1] && !token[2]) {
+            U8 test_type = token[1];
+            pos++;
+
+            if (pos >= argc) {
+                return FALSE;
+            }
+
+            U8 *filename = argv[pos++];
+            CPosixStat st;
+
+            switch (test_type) {
+                case 'e':  // File exists
+                    return (PosixStat(filename, &st) == 0);
+
+                case 'f':  // Regular file
+                    return (PosixStat(filename, &st) == 0 && S_ISREG(st.st_mode));
+
+                case 'd':  // Directory
+                    return (PosixStat(filename, &st) == 0 && S_ISDIR(st.st_mode));
+
+                case 'r':  // Readable
+                    return (PosixAccess(filename, R_OK) == 0);
+
+                case 'w':  // Writable
+                    return (PosixAccess(filename, W_OK) == 0);
+
+                case 'x':  // Executable
+                    return (PosixAccess(filename, X_OK) == 0);
+
+                case 's':  // Size > 0
+                    return (PosixStat(filename, &st) == 0 && st.st_size > 0);
+
+                case 'L':
+                case 'h':  // Symbolic link
+                    return (PosixLstat(filename, &st) == 0 && S_ISLNK(st.st_mode));
+
+                case 'b':  // Block device
+                    return (PosixStat(filename, &st) == 0 && S_ISBLK(st.st_mode));
+
+                case 'c':  // Character device
+                    return (PosixStat(filename, &st) == 0 && S_ISCHR(st.st_mode));
+
+                case 'p':  // Named pipe
+                    return (PosixStat(filename, &st) == 0 && S_ISFIFO(st.st_mode));
+
+                case 'S':  // Socket
+                    return (PosixStat(filename, &st) == 0 && S_ISSOCK(st.st_mode));
+
+                case 'z':  // String length is zero
+                    return (strlen(filename) == 0);
+
+                case 'n':  // String length is nonzero
+                    return (strlen(filename) > 0);
+
+                default:
+                    pos--;  // Not a recognized test
+                    break;
+            }
+        }
+
+        // Binary operators
+        if (pos + 1 < argc) {
+            U8 *op = argv[pos + 1];
+
+            // String comparison
+            if (strcmp(op, "=") == 0 || strcmp(op, "==") == 0) {
+                U8 *left = argv[pos];
+                pos += 2;
+                if (pos >= argc) return FALSE;
+                U8 *right = argv[pos++];
+                return (strcmp(left, right) == 0);
+            }
+
+            if (strcmp(op, "!=") == 0) {
+                U8 *left = argv[pos];
+                pos += 2;
+                if (pos >= argc) return FALSE;
+                U8 *right = argv[pos++];
+                return (strcmp(left, right) != 0);
+            }
+
+            // Integer comparison
+            if (strcmp(op, "-eq") == 0) {
+                I64 left = atol(argv[pos]);
+                pos += 2;
+                if (pos >= argc) return FALSE;
+                I64 right = atol(argv[pos++]);
+                return (left == right);
+            }
+
+            if (strcmp(op, "-ne") == 0) {
+                I64 left = atol(argv[pos]);
+                pos += 2;
+                if (pos >= argc) return FALSE;
+                I64 right = atol(argv[pos++]);
+                return (left != right);
+            }
+
+            if (strcmp(op, "-lt") == 0) {
+                I64 left = atol(argv[pos]);
+                pos += 2;
+                if (pos >= argc) return FALSE;
+                I64 right = atol(argv[pos++]);
+                return (left < right);
+            }
+
+            if (strcmp(op, "-le") == 0) {
+                I64 left = atol(argv[pos]);
+                pos += 2;
+                if (pos >= argc) return FALSE;
+                I64 right = atol(argv[pos++]);
+                return (left <= right);
+            }
+
+            if (strcmp(op, "-gt") == 0) {
+                I64 left = atol(argv[pos]);
+                pos += 2;
+                if (pos >= argc) return FALSE;
+                I64 right = atol(argv[pos++]);
+                return (left > right);
+            }
+
+            if (strcmp(op, "-ge") == 0) {
+                I64 left = atol(argv[pos]);
+                pos += 2;
+                if (pos >= argc) return FALSE;
+                I64 right = atol(argv[pos++]);
+                return (left >= right);
+            }
+
+            // File comparison
+            if (strcmp(op, "-nt") == 0) {  // Newer than
+                CPosixStat st1, st2;
+                U8 *file1 = argv[pos];
+                pos += 2;
+                if (pos >= argc) return FALSE;
+                U8 *file2 = argv[pos++];
+                if (PosixStat(file1, &st1) < 0) return FALSE;
+                if (PosixStat(file2, &st2) < 0) return TRUE;
+                return (st1.st_mtime > st2.st_mtime);
+            }
+
+            if (strcmp(op, "-ot") == 0) {  // Older than
+                CPosixStat st1, st2;
+                U8 *file1 = argv[pos];
+                pos += 2;
+                if (pos >= argc) return FALSE;
+                U8 *file2 = argv[pos++];
+                if (PosixStat(file1, &st1) < 0) return TRUE;
+                if (PosixStat(file2, &st2) < 0) return FALSE;
+                return (st1.st_mtime < st2.st_mtime);
+            }
+
+            if (strcmp(op, "-ef") == 0) {  // Same file
+                CPosixStat st1, st2;
+                U8 *file1 = argv[pos];
+                pos += 2;
+                if (pos >= argc) return FALSE;
+                U8 *file2 = argv[pos++];
+                if (PosixStat(file1, &st1) < 0) return FALSE;
+                if (PosixStat(file2, &st2) < 0) return FALSE;
+                return (st1.st_dev == st2.st_dev && st1.st_ino == st2.st_ino);
+            }
+        }
+
+        // Single string - true if non-empty
+        pos++;
+        return (strlen(token) > 0);
+    };
+
+    Bool result = eval_or();
+    return result ? 0 : 1;
+}
+
+U0 GnuTestRegister()
+{
+    "GNU 'test' utility loaded.\n";
+}

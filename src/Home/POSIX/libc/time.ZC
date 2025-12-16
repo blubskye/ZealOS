@@ -1,0 +1,731 @@
+// time.ZC - Time functions for ZealOS
+// Part of the POSIX compatibility layer
+
+// ============================================================================
+// TIME STRUCTURES
+// ============================================================================
+
+// Time value with seconds and microseconds
+class timeval {
+    I64     tv_sec;     // Seconds
+    I64     tv_usec;    // Microseconds
+};
+
+// Time value with seconds and nanoseconds
+class timespec {
+    I64     tv_sec;     // Seconds
+    I64     tv_nsec;    // Nanoseconds
+};
+
+// Broken-down time structure
+class tm {
+    I64     tm_sec;     // Seconds [0-60] (60 for leap seconds)
+    I64     tm_min;     // Minutes [0-59]
+    I64     tm_hour;    // Hours [0-23]
+    I64     tm_mday;    // Day of month [1-31]
+    I64     tm_mon;     // Month [0-11]
+    I64     tm_year;    // Years since 1900
+    I64     tm_wday;    // Day of week [0-6] (Sunday = 0)
+    I64     tm_yday;    // Day of year [0-365]
+    I64     tm_isdst;   // Daylight saving time flag
+};
+
+// Timezone structure (obsolete but sometimes needed)
+class timezone_s {
+    I64     tz_minuteswest;
+    I64     tz_dsttime;
+};
+
+// Clock IDs
+#define CLOCK_REALTIME              0
+#define CLOCK_MONOTONIC             1
+#define CLOCK_PROCESS_CPUTIME_ID    2
+#define CLOCK_THREAD_CPUTIME_ID     3
+#define CLOCK_MONOTONIC_RAW         4
+#define CLOCK_REALTIME_COARSE       5
+#define CLOCK_MONOTONIC_COARSE      6
+#define CLOCK_BOOTTIME              7
+
+// Timer flags
+#define TIMER_ABSTIME               1
+
+// ============================================================================
+// TIME TYPE
+// ============================================================================
+
+typedef I64 time_t;
+typedef I64 clock_t;
+typedef I64 suseconds_t;
+
+#define CLOCKS_PER_SEC      1000000
+
+// ============================================================================
+// HELPER FUNCTIONS
+// ============================================================================
+
+// Days in each month (non-leap year)
+I64 days_in_month[12] = {31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31};
+
+// Is leap year?
+Bool IsLeapYear(I64 year)
+{
+    return (year % 4 == 0 && year % 100 != 0) || (year % 400 == 0);
+}
+
+// Days in a given year
+I64 DaysInYear(I64 year)
+{
+    return IsLeapYear(year) ? 366 : 365;
+}
+
+// Days in a given month
+I64 DaysInMonth(I64 year, I64 month)
+{
+    if (month == 1 && IsLeapYear(year))  // February
+        return 29;
+    return days_in_month[month];
+}
+
+// Day of week (0 = Sunday) using Zeller's congruence
+I64 DayOfWeek(I64 year, I64 month, I64 day)
+{
+    // Adjust for January and February
+    if (month < 2) {
+        month += 12;
+        year--;
+    }
+
+    I64 q = day;
+    I64 m = month + 1;
+    I64 k = year % 100;
+    I64 j = year / 100;
+
+    I64 h = (q + (13 * (m + 1)) / 5 + k + k / 4 + j / 4 - 2 * j) % 7;
+    return ((h + 6) % 7);  // Convert to Sunday = 0
+}
+
+// Day of year (0-365)
+I64 DayOfYear(I64 year, I64 month, I64 day)
+{
+    I64 yday = day - 1;
+    for (I64 m = 0; m < month; m++) {
+        yday += DaysInMonth(year, m);
+    }
+    return yday;
+}
+
+// ============================================================================
+// BASIC TIME FUNCTIONS
+// ============================================================================
+
+// Get current time in seconds since epoch
+time_t time(time_t *tloc)
+{
+    // ZealOS has tS (time in seconds, floating point)
+    time_t t = tS;
+
+    if (tloc)
+        *tloc = t;
+
+    return t;
+}
+
+// Get time with microsecond precision
+I64 gettimeofday(timeval *tv, timezone_s *tz)
+{
+    if (tv) {
+        // tS gives seconds since some epoch
+        F64 now = tS;
+        tv->tv_sec = now(I64);
+        tv->tv_usec = ((now - tv->tv_sec) * 1000000)(I64);
+    }
+
+    if (tz) {
+        tz->tz_minuteswest = 0;  // UTC
+        tz->tz_dsttime = 0;
+    }
+
+    return 0;
+}
+
+// Set time (requires privileges, stub)
+I64 settimeofday(timeval *tv, timezone_s *tz)
+{
+    posix_errno = EPERM;
+    return -1;
+}
+
+// ============================================================================
+// CLOCK FUNCTIONS
+// ============================================================================
+
+// Get time from specified clock
+I64 clock_gettime(I64 clk_id, timespec *tp)
+{
+    if (!tp) {
+        posix_errno = EFAULT;
+        return -1;
+    }
+
+    F64 now;
+
+    switch (clk_id) {
+        case CLOCK_REALTIME:
+        case CLOCK_REALTIME_COARSE:
+            now = tS;
+            break;
+
+        case CLOCK_MONOTONIC:
+        case CLOCK_MONOTONIC_RAW:
+        case CLOCK_MONOTONIC_COARSE:
+        case CLOCK_BOOTTIME:
+            // ZealOS tS is monotonic enough for our purposes
+            now = tS;
+            break;
+
+        case CLOCK_PROCESS_CPUTIME_ID:
+        case CLOCK_THREAD_CPUTIME_ID:
+            // CPU time - use tS as approximation
+            now = tS;
+            break;
+
+        default:
+            posix_errno = EINVAL;
+            return -1;
+    }
+
+    tp->tv_sec = now(I64);
+    tp->tv_nsec = ((now - tp->tv_sec) * 1000000000)(I64);
+
+    return 0;
+}
+
+// Set time of specified clock (stub)
+I64 clock_settime(I64 clk_id, timespec *tp)
+{
+    posix_errno = EPERM;
+    return -1;
+}
+
+// Get clock resolution
+I64 clock_getres(I64 clk_id, timespec *res)
+{
+    if (!res) {
+        posix_errno = EFAULT;
+        return -1;
+    }
+
+    // ZealOS timer resolution is approximately 1ms
+    res->tv_sec = 0;
+    res->tv_nsec = 1000000;  // 1ms
+
+    return 0;
+}
+
+// CPU clock
+clock_t clock()
+{
+    return (tS * CLOCKS_PER_SEC)(clock_t);
+}
+
+// ============================================================================
+// TIME CONVERSION FUNCTIONS
+// ============================================================================
+
+// Static buffer for gmtime/localtime results
+tm time_tm_buf;
+
+// Convert time_t to broken-down time (UTC)
+tm *gmtime(time_t *timer)
+{
+    if (!timer)
+        return NULL;
+
+    return gmtime_r(timer, &time_tm_buf);
+}
+
+// Thread-safe version
+tm *gmtime_r(time_t *timer, tm *result)
+{
+    if (!timer || !result)
+        return NULL;
+
+    I64 t = *timer;
+
+    // Calculate days since epoch (1970-01-01)
+    I64 days = t / 86400;
+    I64 remaining = t % 86400;
+
+    if (remaining < 0) {
+        days--;
+        remaining += 86400;
+    }
+
+    // Time of day
+    result->tm_hour = remaining / 3600;
+    remaining %= 3600;
+    result->tm_min = remaining / 60;
+    result->tm_sec = remaining % 60;
+
+    // Day of week (1970-01-01 was Thursday)
+    result->tm_wday = (days + 4) % 7;
+    if (result->tm_wday < 0)
+        result->tm_wday += 7;
+
+    // Calculate year and day of year
+    I64 year = 1970;
+
+    if (days >= 0) {
+        while (days >= DaysInYear(year)) {
+            days -= DaysInYear(year);
+            year++;
+        }
+    } else {
+        while (days < 0) {
+            year--;
+            days += DaysInYear(year);
+        }
+    }
+
+    result->tm_year = year - 1900;
+    result->tm_yday = days;
+
+    // Calculate month and day of month
+    I64 month = 0;
+    while (days >= DaysInMonth(year, month)) {
+        days -= DaysInMonth(year, month);
+        month++;
+    }
+
+    result->tm_mon = month;
+    result->tm_mday = days + 1;
+    result->tm_isdst = 0;
+
+    return result;
+}
+
+// Convert time_t to broken-down local time
+// (Same as gmtime for ZealOS - no timezone support)
+tm *localtime(time_t *timer)
+{
+    return gmtime(timer);
+}
+
+tm *localtime_r(time_t *timer, tm *result)
+{
+    return gmtime_r(timer, result);
+}
+
+// Convert broken-down time to time_t
+time_t mktime(tm *timeptr)
+{
+    if (!timeptr)
+        return -1;
+
+    // Normalize values
+    I64 year = timeptr->tm_year + 1900;
+    I64 month = timeptr->tm_mon;
+    I64 day = timeptr->tm_mday;
+    I64 hour = timeptr->tm_hour;
+    I64 min = timeptr->tm_min;
+    I64 sec = timeptr->tm_sec;
+
+    // Handle overflow/underflow
+    while (sec >= 60) { sec -= 60; min++; }
+    while (sec < 0) { sec += 60; min--; }
+    while (min >= 60) { min -= 60; hour++; }
+    while (min < 0) { min += 60; hour--; }
+    while (hour >= 24) { hour -= 24; day++; }
+    while (hour < 0) { hour += 24; day--; }
+    while (month >= 12) { month -= 12; year++; }
+    while (month < 0) { month += 12; year--; }
+
+    // Normalize day
+    while (day > DaysInMonth(year, month)) {
+        day -= DaysInMonth(year, month);
+        month++;
+        if (month >= 12) { month = 0; year++; }
+    }
+    while (day < 1) {
+        month--;
+        if (month < 0) { month = 11; year--; }
+        day += DaysInMonth(year, month);
+    }
+
+    // Calculate days since epoch
+    I64 days = 0;
+
+    if (year >= 1970) {
+        for (I64 y = 1970; y < year; y++)
+            days += DaysInYear(y);
+    } else {
+        for (I64 y = year; y < 1970; y++)
+            days -= DaysInYear(y);
+    }
+
+    for (I64 m = 0; m < month; m++)
+        days += DaysInMonth(year, m);
+
+    days += day - 1;
+
+    // Convert to seconds
+    time_t result = days * 86400 + hour * 3600 + min * 60 + sec;
+
+    // Update timeptr
+    timeptr->tm_year = year - 1900;
+    timeptr->tm_mon = month;
+    timeptr->tm_mday = day;
+    timeptr->tm_hour = hour;
+    timeptr->tm_min = min;
+    timeptr->tm_sec = sec;
+    timeptr->tm_wday = DayOfWeek(year, month, day);
+    timeptr->tm_yday = DayOfYear(year, month, day);
+
+    return result;
+}
+
+// Convert to string (ctime)
+U8 *time_ctime_buf[26];
+
+U8 *ctime(time_t *timer)
+{
+    return asctime(localtime(timer));
+}
+
+U8 *ctime_r(time_t *timer, U8 *buf)
+{
+    tm result;
+    return asctime_r(localtime_r(timer, &result), buf);
+}
+
+// Convert tm to string
+U8 *asctime(tm *timeptr)
+{
+    return asctime_r(timeptr, time_ctime_buf);
+}
+
+U8 *asctime_r(tm *timeptr, U8 *buf)
+{
+    if (!timeptr || !buf)
+        return NULL;
+
+    U8 *wday_name[] = {"Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"};
+    U8 *mon_name[] = {"Jan", "Feb", "Mar", "Apr", "May", "Jun",
+                      "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"};
+
+    StrPrint(buf, "%s %s %2d %02d:%02d:%02d %d\n",
+             wday_name[timeptr->tm_wday % 7],
+             mon_name[timeptr->tm_mon % 12],
+             timeptr->tm_mday,
+             timeptr->tm_hour, timeptr->tm_min, timeptr->tm_sec,
+             timeptr->tm_year + 1900);
+
+    return buf;
+}
+
+// ============================================================================
+// STRFTIME
+// ============================================================================
+
+I64 strftime(U8 *s, I64 max, U8 *format, tm *timeptr)
+{
+    if (!s || !format || !timeptr || max == 0)
+        return 0;
+
+    U8 *wday_full[] = {"Sunday", "Monday", "Tuesday", "Wednesday",
+                       "Thursday", "Friday", "Saturday"};
+    U8 *wday_abbr[] = {"Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"};
+    U8 *mon_full[] = {"January", "February", "March", "April", "May", "June",
+                      "July", "August", "September", "October", "November", "December"};
+    U8 *mon_abbr[] = {"Jan", "Feb", "Mar", "Apr", "May", "Jun",
+                      "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"};
+
+    U8 *out = s;
+    U8 *end = s + max - 1;
+    U8 *p = format;
+    U8 buf[64];
+
+    while (*p && out < end) {
+        if (*p != '%') {
+            *out++ = *p++;
+            continue;
+        }
+
+        p++;  // Skip %
+
+        // Handle modifiers (simplified)
+        while (*p == 'E' || *p == 'O')
+            p++;
+
+        switch (*p) {
+            case 'a':  // Abbreviated weekday
+                StrCpy(buf, wday_abbr[timeptr->tm_wday % 7]);
+                break;
+            case 'A':  // Full weekday
+                StrCpy(buf, wday_full[timeptr->tm_wday % 7]);
+                break;
+            case 'b':
+            case 'h':  // Abbreviated month
+                StrCpy(buf, mon_abbr[timeptr->tm_mon % 12]);
+                break;
+            case 'B':  // Full month
+                StrCpy(buf, mon_full[timeptr->tm_mon % 12]);
+                break;
+            case 'c':  // Date and time
+                StrPrint(buf, "%s %s %2d %02d:%02d:%02d %d",
+                        wday_abbr[timeptr->tm_wday % 7],
+                        mon_abbr[timeptr->tm_mon % 12],
+                        timeptr->tm_mday,
+                        timeptr->tm_hour, timeptr->tm_min, timeptr->tm_sec,
+                        timeptr->tm_year + 1900);
+                break;
+            case 'C':  // Century
+                StrPrint(buf, "%02d", (timeptr->tm_year + 1900) / 100);
+                break;
+            case 'd':  // Day of month (01-31)
+                StrPrint(buf, "%02d", timeptr->tm_mday);
+                break;
+            case 'D':  // %m/%d/%y
+                StrPrint(buf, "%02d/%02d/%02d",
+                        timeptr->tm_mon + 1, timeptr->tm_mday,
+                        timeptr->tm_year % 100);
+                break;
+            case 'e':  // Day of month ( 1-31)
+                StrPrint(buf, "%2d", timeptr->tm_mday);
+                break;
+            case 'F':  // %Y-%m-%d
+                StrPrint(buf, "%04d-%02d-%02d",
+                        timeptr->tm_year + 1900, timeptr->tm_mon + 1,
+                        timeptr->tm_mday);
+                break;
+            case 'H':  // Hour (00-23)
+                StrPrint(buf, "%02d", timeptr->tm_hour);
+                break;
+            case 'I':  // Hour (01-12)
+                StrPrint(buf, "%02d", ((timeptr->tm_hour + 11) % 12) + 1);
+                break;
+            case 'j':  // Day of year (001-366)
+                StrPrint(buf, "%03d", timeptr->tm_yday + 1);
+                break;
+            case 'm':  // Month (01-12)
+                StrPrint(buf, "%02d", timeptr->tm_mon + 1);
+                break;
+            case 'M':  // Minute (00-59)
+                StrPrint(buf, "%02d", timeptr->tm_min);
+                break;
+            case 'n':  // Newline
+                StrCpy(buf, "\n");
+                break;
+            case 'p':  // AM/PM
+                StrCpy(buf, timeptr->tm_hour >= 12 ? "PM" : "AM");
+                break;
+            case 'P':  // am/pm
+                StrCpy(buf, timeptr->tm_hour >= 12 ? "pm" : "am");
+                break;
+            case 'r':  // 12-hour time
+                StrPrint(buf, "%02d:%02d:%02d %s",
+                        ((timeptr->tm_hour + 11) % 12) + 1,
+                        timeptr->tm_min, timeptr->tm_sec,
+                        timeptr->tm_hour >= 12 ? "PM" : "AM");
+                break;
+            case 'R':  // %H:%M
+                StrPrint(buf, "%02d:%02d", timeptr->tm_hour, timeptr->tm_min);
+                break;
+            case 'S':  // Second (00-60)
+                StrPrint(buf, "%02d", timeptr->tm_sec);
+                break;
+            case 't':  // Tab
+                StrCpy(buf, "\t");
+                break;
+            case 'T':  // %H:%M:%S
+                StrPrint(buf, "%02d:%02d:%02d",
+                        timeptr->tm_hour, timeptr->tm_min, timeptr->tm_sec);
+                break;
+            case 'u':  // Day of week (1-7, Monday = 1)
+                StrPrint(buf, "%d", ((timeptr->tm_wday + 6) % 7) + 1);
+                break;
+            case 'w':  // Day of week (0-6, Sunday = 0)
+                StrPrint(buf, "%d", timeptr->tm_wday);
+                break;
+            case 'x':  // Date representation
+                StrPrint(buf, "%02d/%02d/%02d",
+                        timeptr->tm_mon + 1, timeptr->tm_mday,
+                        timeptr->tm_year % 100);
+                break;
+            case 'X':  // Time representation
+                StrPrint(buf, "%02d:%02d:%02d",
+                        timeptr->tm_hour, timeptr->tm_min, timeptr->tm_sec);
+                break;
+            case 'y':  // Year (00-99)
+                StrPrint(buf, "%02d", timeptr->tm_year % 100);
+                break;
+            case 'Y':  // Year with century
+                StrPrint(buf, "%04d", timeptr->tm_year + 1900);
+                break;
+            case 'z':  // Timezone offset
+                StrCpy(buf, "+0000");  // UTC
+                break;
+            case 'Z':  // Timezone name
+                StrCpy(buf, "UTC");
+                break;
+            case '%':  // Literal %
+                StrCpy(buf, "%");
+                break;
+            default:
+                buf[0] = '%';
+                buf[1] = *p;
+                buf[2] = 0;
+                break;
+        }
+
+        // Copy to output
+        U8 *b = buf;
+        while (*b && out < end)
+            *out++ = *b++;
+
+        p++;
+    }
+
+    *out = 0;
+    return out - s;
+}
+
+// ============================================================================
+// SLEEP FUNCTIONS
+// ============================================================================
+
+// Sleep for seconds
+U32 sleep(U32 seconds)
+{
+    I64 ms = seconds * 1000;
+    Sleep(ms);
+    return 0;
+}
+
+// Sleep for microseconds
+I64 usleep(I64 usec)
+{
+    I64 ms = (usec + 999) / 1000;
+    Sleep(ms);
+    return 0;
+}
+
+// Sleep with nanosecond precision
+I64 nanosleep(timespec *req, timespec *rem)
+{
+    if (!req) {
+        posix_errno = EFAULT;
+        return -1;
+    }
+
+    I64 ms = req->tv_sec * 1000 + req->tv_nsec / 1000000;
+    Sleep(ms);
+
+    if (rem) {
+        rem->tv_sec = 0;
+        rem->tv_nsec = 0;
+    }
+
+    return 0;
+}
+
+// High-resolution sleep
+I64 clock_nanosleep(I64 clock_id, I64 flags, timespec *request, timespec *remain)
+{
+    if (!request) {
+        posix_errno = EFAULT;
+        return EFAULT;
+    }
+
+    if (flags & TIMER_ABSTIME) {
+        // Absolute time - calculate relative delay
+        timespec now;
+        clock_gettime(clock_id, &now);
+        I64 delay_ns = (request->tv_sec - now.tv_sec) * 1000000000 +
+                       (request->tv_nsec - now.tv_nsec);
+        if (delay_ns > 0) {
+            I64 ms = delay_ns / 1000000;
+            Sleep(ms);
+        }
+    } else {
+        // Relative time
+        I64 ms = request->tv_sec * 1000 + request->tv_nsec / 1000000;
+        Sleep(ms);
+    }
+
+    if (remain) {
+        remain->tv_sec = 0;
+        remain->tv_nsec = 0;
+    }
+
+    return 0;
+}
+
+// ============================================================================
+// TIMER FUNCTIONS (simplified stubs)
+// ============================================================================
+
+// Timer ID type
+typedef I64 timer_t;
+
+// itimerspec structure
+class itimerspec {
+    timespec it_interval;   // Timer interval
+    timespec it_value;      // Initial expiration
+};
+
+// sigevent structure (simplified)
+class sigevent {
+    I64     sigev_notify;
+    I64     sigev_signo;
+    I64     sigev_value;
+    void    (*sigev_notify_function)(I64);
+};
+
+#define SIGEV_NONE      0
+#define SIGEV_SIGNAL    1
+#define SIGEV_THREAD    2
+
+// Create timer (stub)
+I64 timer_create(I64 clockid, sigevent *sevp, timer_t *timerid)
+{
+    posix_errno = ENOSYS;
+    return -1;
+}
+
+// Delete timer (stub)
+I64 timer_delete(timer_t timerid)
+{
+    posix_errno = ENOSYS;
+    return -1;
+}
+
+// Set timer (stub)
+I64 timer_settime(timer_t timerid, I64 flags, itimerspec *new_value,
+                  itimerspec *old_value)
+{
+    posix_errno = ENOSYS;
+    return -1;
+}
+
+// Get timer (stub)
+I64 timer_gettime(timer_t timerid, itimerspec *curr_value)
+{
+    posix_errno = ENOSYS;
+    return -1;
+}
+
+// ============================================================================
+// DIFFTIME
+// ============================================================================
+
+F64 difftime(time_t time1, time_t time0)
+{
+    return (time1 - time0)(F64);
+}
+
+// ============================================================================
+// INITIALIZATION
+// ============================================================================
+
+"time functions loaded\n";

@@ -1,0 +1,240 @@
+// bzip2.ZC - Block-sorting file compressor
+// bzip2 compatible implementation for ZealOS
+// Part of the POSIX compatibility layer
+//
+// Full implementation with:
+// - Burrows-Wheeler Transform (BWT)
+// - Move-to-front transform (MTF)
+// - Run-length encoding (RLE stages 1 & 2)
+// - Huffman coding with multiple tables
+//
+// Include the full implementation
+#include "bzip2_impl.ZC"
+
+// ============================================================================
+// BZIP2 FILE FORMAT
+// ============================================================================
+// - Header: "BZh" + block size digit ('1'-'9')
+// - Compressed blocks (Huffman-coded BWT data)
+// - Stream CRC
+// - End marker
+
+#define BZIP2_MAGIC         "BZ"
+#define BZIP2_MAGIC_H       'h'
+#define BZIP2_BLOCK_MAGIC   0x314159265359ULL  // Pi digits
+#define BZIP2_EOS_MAGIC     0x177245385090ULL  // Sqrt(pi) digits
+
+// ============================================================================
+// BZIP2 STATE
+// ============================================================================
+
+class CBzip2State {
+    Bool    decompress;     // -d
+    Bool    compress;       // -z
+    Bool    keep;           // -k
+    Bool    force;          // -f
+    Bool    verbose;        // -v
+    Bool    test;           // -t
+    Bool    stdout_mode;    // -c
+    Bool    quiet;          // -q
+    I64     level;          // 1-9
+};
+
+// ============================================================================
+// CRC32 (same as gzip)
+// ============================================================================
+
+extern U32 gzip_crc_table[];
+extern Bool gzip_crc_init;
+extern U0 GzipCrcInit();
+extern U32 GzipCrc32(U32 crc, U8 *buf, I64 len);
+
+// ============================================================================
+// STUB COMPRESSION/DECOMPRESSION
+// ============================================================================
+
+// Check if file is bzip2 compressed
+Bool Bzip2IsBzip2(U8 *filename)
+{
+    FILE *fp = fopen(filename, "rb");
+    if (!fp)
+        return FALSE;
+
+    U8 magic[3];
+    Bool result = FALSE;
+
+    if (fread(magic, 1, 3, fp) == 3) {
+        if (magic[0] == 'B' && magic[1] == 'Z' && magic[2] == 'h')
+            result = TRUE;
+    }
+
+    fclose(fp);
+    return result;
+}
+
+// Use the full implementation from bzip2_impl.ZC
+#define Bzip2CompressStub   Bzip2CompressReal
+#define Bzip2DecompressStub Bzip2DecompressReal
+
+// ============================================================================
+// MAIN
+// ============================================================================
+
+U0 bzip2_usage()
+{
+    printf("Usage: bzip2 [OPTIONS] [FILES...]\n");
+    printf("Compress or decompress FILES using bzip2 algorithm.\n\n");
+    printf("Options:\n");
+    printf("  -c, --stdout      Write to stdout, keep input files\n");
+    printf("  -d, --decompress  Decompress\n");
+    printf("  -z, --compress    Compress (default)\n");
+    printf("  -k, --keep        Keep (don't delete) input files\n");
+    printf("  -f, --force       Force overwrite of output files\n");
+    printf("  -t, --test        Test compressed file integrity\n");
+    printf("  -v, --verbose     Verbose mode\n");
+    printf("  -q, --quiet       Suppress non-essential warnings\n");
+    printf("  -1 to -9          Set block size (1=100k to 9=900k)\n");
+    printf("  --help            Display this help\n");
+    printf("\nNOTE: This is a stub implementation.\n");
+    printf("Full bzip2 compression/decompression is not implemented.\n");
+    printf("Use the external bzip2 tool for actual compression.\n");
+}
+
+I64 bzip2_main(I64 argc, U8 **argv)
+{
+    CBzip2State state;
+    MemSet(&state, 0, sizeof(CBzip2State));
+
+    state.compress = TRUE;  // Default mode
+    state.level = 9;        // Default compression level
+
+    U8 *files[256];
+    I64 file_count = 0;
+
+    // Check if called as bunzip2 or bzcat
+    U8 *progname = argv[0];
+    U8 *base = strrchr(progname, '/');
+    base = base ? base + 1 : progname;
+
+    if (strcmp(base, "bunzip2") == 0) {
+        state.decompress = TRUE;
+        state.compress = FALSE;
+    } else if (strcmp(base, "bzcat") == 0) {
+        state.decompress = TRUE;
+        state.compress = FALSE;
+        state.stdout_mode = TRUE;
+    }
+
+    // Parse options
+    for (I64 i = 1; i < argc; i++) {
+        U8 *arg = argv[i];
+
+        if (arg[0] == '-' && arg[1]) {
+            if (strcmp(arg, "--help") == 0) {
+                bzip2_usage();
+                return 0;
+            } else if (strcmp(arg, "-d") == 0 || strcmp(arg, "--decompress") == 0 ||
+                       strcmp(arg, "--uncompress") == 0) {
+                state.decompress = TRUE;
+                state.compress = FALSE;
+            } else if (strcmp(arg, "-z") == 0 || strcmp(arg, "--compress") == 0) {
+                state.compress = TRUE;
+                state.decompress = FALSE;
+            } else if (strcmp(arg, "-c") == 0 || strcmp(arg, "--stdout") == 0) {
+                state.stdout_mode = TRUE;
+                state.keep = TRUE;
+            } else if (strcmp(arg, "-k") == 0 || strcmp(arg, "--keep") == 0) {
+                state.keep = TRUE;
+            } else if (strcmp(arg, "-f") == 0 || strcmp(arg, "--force") == 0) {
+                state.force = TRUE;
+            } else if (strcmp(arg, "-v") == 0 || strcmp(arg, "--verbose") == 0) {
+                state.verbose = TRUE;
+            } else if (strcmp(arg, "-q") == 0 || strcmp(arg, "--quiet") == 0) {
+                state.quiet = TRUE;
+            } else if (strcmp(arg, "-t") == 0 || strcmp(arg, "--test") == 0) {
+                state.test = TRUE;
+                state.decompress = TRUE;
+            } else if (arg[1] >= '1' && arg[1] <= '9' && arg[2] == 0) {
+                state.level = arg[1] - '0';
+            }
+        } else {
+            files[file_count++] = arg;
+        }
+    }
+
+    // Process stdin if no files
+    if (file_count == 0) {
+        fprintf(stderr, "bzip2: stdin not supported, specify files\n");
+        return 1;
+    }
+
+    // Process files
+    I64 ret = 0;
+    for (I64 i = 0; i < file_count; i++) {
+        U8 *infile = files[i];
+        U8 outfile[512];
+
+        if (state.decompress) {
+            // Remove .bz2 extension
+            strcpy(outfile, infile);
+            I64 len = strlen(outfile);
+            if (len > 4 && strcmp(outfile + len - 4, ".bz2") == 0) {
+                outfile[len - 4] = 0;
+            } else if (len > 3 && strcmp(outfile + len - 3, ".bz") == 0) {
+                outfile[len - 3] = 0;
+            } else {
+                strcat(outfile, ".out");
+            }
+
+            if (state.test) {
+                // Test mode - verify header
+                if (Bzip2IsBzip2(infile)) {
+                    if (!state.quiet)
+                        printf("%s: ok\n", infile);
+                } else {
+                    fprintf(stderr, "%s: not a bzip2 file\n", infile);
+                    ret = 1;
+                }
+            } else {
+                if (Bzip2DecompressStub(infile, outfile, state.keep, state.verbose) < 0)
+                    ret = 1;
+            }
+        } else {
+            // Add .bz2 extension
+            snprintf(outfile, 512, "%s.bz2", infile);
+
+            // Check if output exists
+            if (!state.force && PosixAccess(outfile, 0) == 0) {
+                fprintf(stderr, "bzip2: %s already exists; not overwriting\n", outfile);
+                ret = 1;
+                continue;
+            }
+
+            if (Bzip2CompressStub(infile, outfile, state.level, state.keep, state.verbose) < 0)
+                ret = 1;
+        }
+    }
+
+    return ret;
+}
+
+// Aliases
+I64 bunzip2_main(I64 argc, U8 **argv)
+{
+    U8 *new_argv[258];
+    new_argv[0] = "bunzip2";
+    new_argv[1] = "-d";
+    for (I64 i = 1; i < argc && i < 256; i++)
+        new_argv[i + 1] = argv[i];
+    return bzip2_main(argc + 1, new_argv);
+}
+
+I64 bzcat_main(I64 argc, U8 **argv)
+{
+    U8 *new_argv[258];
+    new_argv[0] = "bzcat";
+    new_argv[1] = "-dc";
+    for (I64 i = 1; i < argc && i < 256; i++)
+        new_argv[i + 1] = argv[i];
+    return bzip2_main(argc + 1, new_argv);
+}

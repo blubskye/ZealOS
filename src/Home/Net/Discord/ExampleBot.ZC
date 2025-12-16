@@ -1,0 +1,119 @@
+// ExampleBot.ZC - Example Discord Bot for ZealOS
+// Demonstrates basic Discord bot functionality
+
+// This example bot responds to !ping and !hello commands
+
+// ============================================================================
+// EVENT HANDLERS
+// ============================================================================
+
+// Called when the bot is ready and connected
+U0 OnReady(CDiscordClient *client, CDiscordUser *user)
+{
+	"Bot connected as: %s#%s\n", user->username, user->discriminator;
+	"Bot ID: %llu\n", user->id;
+	"Ready to receive messages!\n";
+}
+
+// Called when a message is received
+U0 OnMessageCreate(CDiscordClient *client, CDiscordMessage *msg)
+{
+	// Ignore messages from bots (including ourselves)
+	if (msg->author.bot) return;
+
+	// Debug output
+	"[%s] %s: %s\n",
+		msg->guild_id ? "Guild" : "DM",
+		msg->author.username,
+		msg->content;
+
+	// Check for commands
+	if (StrNCmp(msg->content, "!ping", 5) == 0) {
+		I64 ping = DiscordGetPing(client);
+		U8 response[64];
+
+		if (ping >= 0) {
+			StrPrint(response, "Pong! Latency: %dms", ping);
+		} else {
+			StrPrint(response, "Pong!");
+		}
+
+		DiscordReplyMessage(client, msg, response);
+	}
+	else if (StrNCmp(msg->content, "!hello", 6) == 0) {
+		U8 response[128];
+		StrPrint(response, "Hello, %s! I'm running on ZealOS!", msg->author.username);
+		DiscordReplyMessage(client, msg, response);
+	}
+	else if (StrNCmp(msg->content, "!info", 5) == 0) {
+		U8 response[256];
+		CDiscordUser *self = DiscordGetSelf(client);
+		StrPrint(response,
+			"**ZealOS Discord Bot**\n"
+			"Running on: ZealOS (64-bit)\n"
+			"Bot: %s#%s\n"
+			"ID: %llu",
+			self->username, self->discriminator, self->id);
+		DiscordSendMessage(client, msg->channel_id, response);
+	}
+}
+
+// Called on errors
+U0 OnError(CDiscordClient *client, I64 error, U8 *message)
+{
+	"Error %d: %s\n", error, message;
+}
+
+// ============================================================================
+// MAIN
+// ============================================================================
+
+// Run the example bot
+// Usage: ExampleBotRun("YOUR_BOT_TOKEN_HERE");
+U0 ExampleBotRun(U8 *token)
+{
+	"Starting ZealOS Discord Bot...\n";
+
+	// Create client
+	CDiscordClient *client = DiscordInit(token);
+
+	// Set intents (we need message content intent for commands)
+	DiscordSetIntents(client,
+		DISCORD_INTENT_GUILDS |
+		DISCORD_INTENT_GUILD_MESSAGES |
+		DISCORD_INTENT_MESSAGE_CONTENT |
+		DISCORD_INTENT_DIRECT_MESSAGES);
+
+	// Register event handlers
+	DiscordOnReady(client, &OnReady);
+	DiscordOnMessage(client, &OnMessageCreate);
+	DiscordOnError(client, &OnError);
+
+	"Connecting to Discord Gateway...\n";
+
+	// Run the bot (blocking)
+	I64 result = DiscordRun(client);
+
+	if (result != DISCORD_OK) {
+		"Bot stopped with error: %s\n", DiscordErrorString(result);
+	} else {
+		"Bot stopped normally.\n";
+	}
+
+	// Cleanup
+	DiscordCleanup(client);
+}
+
+// Quick test function
+U0 DiscordTest()
+{
+	"====== Discord Bot Test ======\n\n";
+	"To run the bot, call:\n";
+	"  ExampleBotRun(\"YOUR_BOT_TOKEN\");\n\n";
+	"The bot responds to these commands:\n";
+	"  !ping  - Responds with latency\n";
+	"  !hello - Greets the user\n";
+	"  !info  - Shows bot information\n\n";
+	"Make sure you have enabled MESSAGE_CONTENT intent\n";
+	"in the Discord Developer Portal!\n";
+}

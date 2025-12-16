@@ -1,0 +1,285 @@
+// MakeLibc.ZC - ZealOS libc Loader
+// Include this file to load the C standard library compatibility layer
+
+Cd(__DIR__);;
+
+// ============================================================================
+// CORE POSIX LAYER (required)
+// ============================================================================
+
+// Make sure POSIX layer is loaded first
+Cd("..");;
+#include "MakePOSIX"
+Cd("libc");;
+
+// ============================================================================
+// TYPE DEFINITIONS
+// ============================================================================
+
+#include "stddef.h"ZC"
+#include "stdint.h.ZC"
+#include "limits.h.ZC"
+#include "sys_types.h.ZC"
+
+// ============================================================================
+// VARIABLE ARGUMENTS
+// ============================================================================
+
+#include "stdarg.h.ZC"
+
+// ============================================================================
+// ERROR HANDLING
+// ============================================================================
+
+#include "errno.h.ZC"
+
+// ============================================================================
+// CHARACTER CLASSIFICATION
+// ============================================================================
+
+#include "ctype.h.ZC"
+
+// ============================================================================
+// STRING OPERATIONS
+// ============================================================================
+
+#include "string.h.ZC"
+
+// ============================================================================
+// STANDARD LIBRARY
+// ============================================================================
+
+#include "stdlib.h.ZC"
+
+// ============================================================================
+// PRINTF IMPLEMENTATION
+// ============================================================================
+
+#include "printf.ZC"
+
+// ============================================================================
+// STANDARD I/O
+// ============================================================================
+
+#include "stdio.h.ZC"
+
+// ============================================================================
+// UNIX SYSTEM CALLS
+// ============================================================================
+
+#include "unistd.h.ZC"
+
+// ============================================================================
+// PROCESS I/O (popen, pclose, system, posix_spawn)
+// ============================================================================
+
+#include "popen.ZC"
+
+// ============================================================================
+// TIME AND DATE
+// ============================================================================
+
+#include "time.ZC"
+
+// ============================================================================
+// POLL, SELECT, EPOLL
+// ============================================================================
+
+#include "poll.ZC"
+
+// ============================================================================
+// MEMORY MAPPING
+// ============================================================================
+
+#include "mman.ZC"
+
+// ============================================================================
+// POSIX THREADS
+// ============================================================================
+
+#include "pthread.ZC"
+
+// ============================================================================
+// MATH LIBRARY
+// ============================================================================
+
+#include "math.ZC"
+
+// ============================================================================
+// NETWORK DATABASE (DNS, getaddrinfo, gethostbyname)
+// ============================================================================
+
+#include "netdb.ZC"
+
+// ============================================================================
+// TERMINAL I/O
+// ============================================================================
+
+#include "termios.ZC"
+
+// ============================================================================
+// CURSES LIBRARY
+// ============================================================================
+
+#include "curses.ZC"
+
+// ============================================================================
+// PASSWORD/GROUP DATABASE
+// ============================================================================
+
+#include "pwd.ZC"
+
+// ============================================================================
+// LOCALE SUPPORT
+// ============================================================================
+
+#include "locale.ZC"
+
+// ============================================================================
+// SIGNAL HANDLING
+// ============================================================================
+
+#include "signal.ZC"
+
+// ============================================================================
+// REGULAR EXPRESSIONS
+// ============================================================================
+
+#include "regex.ZC"
+
+// ============================================================================
+// C++ SUPPORT
+// ============================================================================
+
+// Stack unwinding (required for C++ exceptions)
+#include "unwind.ZC"
+
+// C++ ABI (__cxa_* functions)
+#include "cxxabi.ZC"
+
+// C++ new/delete operators
+#include "new.ZC"
+
+// ============================================================================
+// INITIALIZATION
+// ============================================================================
+
+U0 LibcInit()
+{
+    // Initialize POSIX layer if not already done
+    if (!posix_current)
+        PosixInit();
+
+    // Set up stdio buffers
+    if (!stdout->buf) {
+        stdout->buf = MAlloc(BUFSIZ);
+        stdout->buf_size = BUFSIZ;
+        stdout->flags |= _FILE_MYBUF;
+    }
+
+    "ZealOS libc loaded.\n";
+    "  - Standard types: size_t, int32_t, pid_t, etc.\n";
+    "  - String functions: strlen, strcpy, strcmp, etc.\n";
+    "  - Memory functions: malloc, free, memcpy, mmap, etc.\n";
+    "  - I/O functions: printf, fopen, fread, poll, select, etc.\n";
+    "  - Process functions: fork, exec, getpid, etc.\n";
+    "  - Threading: pthread_create, mutex, cond, rwlock, etc.\n";
+    "  - Time functions: time, gettimeofday, strftime, etc.\n";
+    "  - Math functions: sin, cos, tan, exp, log, sqrt, etc.\n";
+    "  - Network: getaddrinfo, gethostbyname, inet_pton, etc.\n";
+    "  - Terminal: termios, tcgetattr, tcsetattr, isatty, etc.\n";
+    "  - Curses: initscr, newwin, addch, printw, getch, etc.\n";
+    "  - User/Group: getpwuid, getpwnam, getgrgid, getgrnam, etc.\n";
+    "  - Locale: setlocale, localeconv, nl_langinfo, etc.\n";
+    "  - Signals: signal, sigaction, sigsetjmp, siglongjmp, etc.\n";
+    "  - Regex: regcomp, regexec, regfree (POSIX BRE/ERE)\n";
+    "  - C++ ABI: __cxa_*, operator new/delete, exceptions\n";
+    "\n";
+}
+
+// ============================================================================
+// C PROGRAM ENTRY POINT WRAPPER
+// ============================================================================
+
+// Global argc/argv for C programs
+I64 __argc = 0;
+U8 **__argv = NULL;
+U8 **__environ = NULL;
+
+// Wrapper to run a C-style main function
+I64 CMain(I64 (*main_func)(I64, U8 **), I64 argc, U8 **argv)
+{
+    I64 result;
+
+    // Set up globals
+    __argc = argc;
+    __argv = argv;
+    __environ = posix_current ? posix_current->environ : NULL;
+
+    // Initialize libc
+    LibcInit();
+
+    // Call main
+    try {
+        result = main_func(argc, argv);
+    } catch {
+        if (Fs->except_ch == 'EXIT')
+            result = Fs->except_rbp;  // Exit code
+        else
+            throw;
+    }
+
+    // Cleanup
+    fflush(stdout);
+    fflush(stderr);
+
+    return result;
+}
+
+// Parse command line and run C main
+I64 CRun(I64 (*main_func)(I64, U8 **), U8 *cmdline)
+{
+    // Parse command line into argc/argv
+    U8 *argv[256];
+    I64 argc = 0;
+    U8 *p = cmdline;
+    U8 *token_start;
+    Bool in_quote = FALSE;
+
+    while (*p && argc < 255) {
+        // Skip whitespace
+        while (*p == ' ' || *p == '\t')
+            p++;
+
+        if (!*p)
+            break;
+
+        token_start = p;
+
+        // Handle quoted strings
+        if (*p == '"') {
+            p++;
+            token_start = p;
+            while (*p && *p != '"')
+                p++;
+            if (*p == '"')
+                *p++ = 0;
+        } else {
+            while (*p && *p != ' ' && *p != '\t')
+                p++;
+            if (*p)
+                *p++ = 0;
+        }
+
+        argv[argc++] = StrNew(token_start);
+    }
+    argv[argc] = NULL;
+
+    I64 result = CMain(main_func, argc, argv);
+
+    // Free argv strings
+    for (I64 i = 0; i < argc; i++)
+        Free(argv[i]);
+
+    return result;
+}

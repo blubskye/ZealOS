@@ -1,0 +1,756 @@
+// TCC_OS.ZC - TCC OS Interface for ZealOS
+// Part of the POSIX compatibility layer
+//
+// This file provides the OS-specific functions that TCC needs
+// to operate on ZealOS.
+
+#include "TCC.HH"
+
+// ============================================================================
+// TCC STATE MANAGEMENT
+// ============================================================================
+
+CTCCState *tcc_new()
+{
+    CTCCState *s = MAlloc(sizeof(CTCCState));
+    if (!s)
+        return NULL;
+
+    MemSet(s, 0, sizeof(CTCCState));
+
+    // Set defaults
+    s->output_type = TCC_OUTPUT_MEMORY;
+    s->verbose = 0;
+    s->do_debug = FALSE;
+    s->do_bounds_check = FALSE;
+    s->nostdinc = FALSE;
+    s->nostdlib = FALSE;
+    s->static_link = TRUE;
+    s->optimize_level = 0;
+
+    // Allocate path arrays
+    s->include_paths = MAlloc(64 * sizeof(U8*));
+    s->sysinclude_paths = MAlloc(64 * sizeof(U8*));
+    s->library_paths = MAlloc(64 * sizeof(U8*));
+    s->defines = MAlloc(256 * sizeof(U8*));
+    s->undefines = MAlloc(64 * sizeof(U8*));
+    s->files = MAlloc(256 * sizeof(U8*));
+    s->file_types = MAlloc(256 * sizeof(I64));
+    s->libraries = MAlloc(64 * sizeof(U8*));
+
+    // Add default system include paths
+    tcc_add_sysinclude_path(s, "/Home/POSIX/libc");
+    tcc_add_sysinclude_path(s, "/Home/POSIX/include");
+    tcc_add_sysinclude_path(s, "/Home/POSIX/toolchain/tcc/include");
+
+    // Add default library paths
+    tcc_add_library_path(s, "/Home/POSIX/lib");
+    tcc_add_library_path(s, "/Home/POSIX/toolchain/tcc/lib");
+
+    // Define ZealOS-specific symbols
+    tcc_define_symbol(s, "__ZEALOS__", "1");
+    tcc_define_symbol(s, "__x86_64__", "1");
+    tcc_define_symbol(s, "__LP64__", "1");
+    tcc_define_symbol(s, "__STDC__", "1");
+    tcc_define_symbol(s, "__STDC_VERSION__", "199901L");
+
+    return s;
+}
+
+U0 tcc_delete(CTCCState *s)
+{
+    if (!s)
+        return;
+
+    // Free include paths
+    for (I64 i = 0; i < s->include_count; i++)
+        Free(s->include_paths[i]);
+    Free(s->include_paths);
+
+    // Free sysinclude paths
+    for (I64 i = 0; i < s->sysinclude_count; i++)
+        Free(s->sysinclude_paths[i]);
+    Free(s->sysinclude_paths);
+
+    // Free library paths
+    for (I64 i = 0; i < s->library_count; i++)
+        Free(s->library_paths[i]);
+    Free(s->library_paths);
+
+    // Free defines
+    for (I64 i = 0; i < s->define_count; i++)
+        Free(s->defines[i]);
+    Free(s->defines);
+
+    // Free undefines
+    for (I64 i = 0; i < s->undef_count; i++)
+        Free(s->undefines[i]);
+    Free(s->undefines);
+
+    // Free files
+    for (I64 i = 0; i < s->file_count; i++)
+        Free(s->files[i]);
+    Free(s->files);
+    Free(s->file_types);
+
+    // Free libraries
+    for (I64 i = 0; i < s->lib_count; i++)
+        Free(s->libraries[i]);
+    Free(s->libraries);
+
+    // Free output file
+    if (s->outfile)
+        Free(s->outfile);
+
+    // Free code memory
+    if (s->code_mem)
+        Free(s->code_mem);
+
+    Free(s);
+}
+
+// ============================================================================
+// ERROR HANDLING
+// ============================================================================
+
+U0 tcc_set_error_func(CTCCState *s, void *opaque, TCCErrorCallback func)
+{
+    if (s) {
+        s->error_func = func;
+        s->error_opaque = opaque;
+    }
+}
+
+U0 tcc_error(CTCCState *s, U8 *fmt, ...)
+{
+    U8 buf[1024];
+    // Format message (simplified - in real impl would use va_list)
+    StrCpy(buf, fmt);
+
+    if (s && s->error_func)
+        s->error_func(s->error_opaque, buf);
+    else
+        fprintf(stderr, "tcc: error: %s\n", buf);
+
+    if (s)
+        s->error_count++;
+}
+
+U0 tcc_warning(CTCCState *s, U8 *fmt, ...)
+{
+    U8 buf[1024];
+    StrCpy(buf, fmt);
+
+    if (s && s->error_func)
+        s->error_func(s->error_opaque, buf);
+    else
+        fprintf(stderr, "tcc: warning: %s\n", buf);
+
+    if (s)
+        s->warning_count++;
+}
+
+// ============================================================================
+// OUTPUT TYPE
+// ============================================================================
+
+I64 tcc_set_output_type(CTCCState *s, I64 output_type)
+{
+    if (!s)
+        return -1;
+
+    s->output_type = output_type;
+    return 0;
+}
+
+// ============================================================================
+// PREPROCESSOR SYMBOLS
+// ============================================================================
+
+U0 tcc_define_symbol(CTCCState *s, U8 *sym, U8 *value)
+{
+    if (!s || !sym)
+        return;
+
+    // Create define string: "SYM=VALUE" or just "SYM"
+    U8 *def;
+    if (value) {
+        def = MAlloc(StrLen(sym) + StrLen(value) + 2);
+        StrCpy(def, sym);
+        StrCat(def, "=");
+        StrCat(def, value);
+    } else {
+        def = StrNew(sym);
+    }
+
+    s->defines[s->define_count++] = def;
+}
+
+U0 tcc_undefine_symbol(CTCCState *s, U8 *sym)
+{
+    if (!s || !sym)
+        return;
+
+    s->undefines[s->undef_count++] = StrNew(sym);
+}
+
+// ============================================================================
+// INCLUDE/LIBRARY PATHS
+// ============================================================================
+
+I64 tcc_add_include_path(CTCCState *s, U8 *pathname)
+{
+    if (!s || !pathname)
+        return -1;
+
+    s->include_paths[s->include_count++] = StrNew(pathname);
+    return 0;
+}
+
+I64 tcc_add_sysinclude_path(CTCCState *s, U8 *pathname)
+{
+    if (!s || !pathname)
+        return -1;
+
+    s->sysinclude_paths[s->sysinclude_count++] = StrNew(pathname);
+    return 0;
+}
+
+I64 tcc_add_library_path(CTCCState *s, U8 *pathname)
+{
+    if (!s || !pathname)
+        return -1;
+
+    s->library_paths[s->library_count++] = StrNew(pathname);
+    return 0;
+}
+
+I64 tcc_add_library(CTCCState *s, U8 *libraryname)
+{
+    if (!s || !libraryname)
+        return -1;
+
+    s->libraries[s->lib_count++] = StrNew(libraryname);
+    return 0;
+}
+
+I64 tcc_set_lib_path(CTCCState *s, U8 *path)
+{
+    return tcc_add_library_path(s, path);
+}
+
+// ============================================================================
+// SET OPTIONS FROM STRING
+// ============================================================================
+
+I64 tcc_set_options(CTCCState *s, U8 *options)
+{
+    if (!s || !options)
+        return -1;
+
+    // Parse space-separated options
+    U8 *p = options;
+    U8 opt[256];
+    I64 i;
+
+    while (*p) {
+        // Skip whitespace
+        while (*p == ' ' || *p == '\t')
+            p++;
+
+        if (!*p)
+            break;
+
+        // Extract option
+        i = 0;
+        while (*p && *p != ' ' && *p != '\t' && i < 255)
+            opt[i++] = *p++;
+        opt[i] = 0;
+
+        // Process option
+        if (opt[0] == '-') {
+            if (opt[1] == 'I') {
+                tcc_add_include_path(s, opt + 2);
+            } else if (opt[1] == 'L') {
+                tcc_add_library_path(s, opt + 2);
+            } else if (opt[1] == 'D') {
+                U8 *eq = StrChr(opt + 2, '=');
+                if (eq) {
+                    *eq = 0;
+                    tcc_define_symbol(s, opt + 2, eq + 1);
+                } else {
+                    tcc_define_symbol(s, opt + 2, "1");
+                }
+            } else if (opt[1] == 'U') {
+                tcc_undefine_symbol(s, opt + 2);
+            } else if (opt[1] == 'l') {
+                tcc_add_library(s, opt + 2);
+            } else if (opt[1] == 'O') {
+                s->optimize_level = opt[2] ? opt[2] - '0' : 1;
+            } else if (opt[1] == 'g') {
+                s->do_debug = TRUE;
+            } else if (opt[1] == 'v') {
+                s->verbose++;
+            } else if (opt[1] == 'c') {
+                s->output_type = TCC_OUTPUT_OBJ;
+            } else if (StrCmp(opt, "-nostdinc") == 0) {
+                s->nostdinc = TRUE;
+            } else if (StrCmp(opt, "-nostdlib") == 0) {
+                s->nostdlib = TRUE;
+            } else if (StrCmp(opt, "-static") == 0) {
+                s->static_link = TRUE;
+            } else if (StrCmp(opt, "-shared") == 0) {
+                s->output_type = TCC_OUTPUT_DLL;
+            }
+        }
+    }
+
+    return 0;
+}
+
+// ============================================================================
+// FILE HANDLING
+// ============================================================================
+
+I64 tcc_get_file_type(U8 *filename)
+{
+    U8 *ext = strrchr(filename, '.');
+    if (!ext)
+        return TCC_FILETYPE_C;
+
+    if (strcmp(ext, ".c") == 0)
+        return TCC_FILETYPE_C;
+    if (strcmp(ext, ".h") == 0)
+        return TCC_FILETYPE_C;
+    if (strcmp(ext, ".s") == 0 || strcmp(ext, ".S") == 0)
+        return TCC_FILETYPE_ASM;
+    if (strcmp(ext, ".o") == 0)
+        return TCC_FILETYPE_BINARY;
+    if (strcmp(ext, ".a") == 0)
+        return TCC_FILETYPE_AR;
+
+    return TCC_FILETYPE_C;
+}
+
+I64 tcc_add_file(CTCCState *s, U8 *filename)
+{
+    if (!s || !filename)
+        return -1;
+
+    // Check file exists
+    if (PosixAccess(filename, 0) < 0) {
+        tcc_error(s, "file not found: %s", filename);
+        return -1;
+    }
+
+    s->files[s->file_count] = StrNew(filename);
+    s->file_types[s->file_count] = tcc_get_file_type(filename);
+    s->file_count++;
+
+    return 0;
+}
+
+// ============================================================================
+// COMPILATION (Stub - actual TCC would be linked)
+// ============================================================================
+
+I64 tcc_compile_string(CTCCState *s, U8 *buf)
+{
+    if (!s || !buf)
+        return -1;
+
+    // This would invoke the actual TCC compiler
+    // For now, this is a stub that demonstrates the interface
+
+    if (s->verbose)
+        printf("tcc: compiling string (%d bytes)\n", StrLen(buf));
+
+    // In a real implementation, this would:
+    // 1. Tokenize the source
+    // 2. Parse into AST
+    // 3. Generate code to s->code_mem
+
+    return 0;
+}
+
+// ============================================================================
+// SYMBOL TABLE
+// ============================================================================
+
+#define TCC_MAX_SYMBOLS 4096
+
+class CTCCSymbol {
+    U8      *name;
+    void    *value;
+    Bool    in_use;
+};
+
+CTCCSymbol tcc_symbols[TCC_MAX_SYMBOLS];
+Bool tcc_symbols_init = FALSE;
+
+U0 TccSymbolsInit()
+{
+    if (tcc_symbols_init)
+        return;
+    MemSet(tcc_symbols, 0, sizeof(tcc_symbols));
+    tcc_symbols_init = TRUE;
+}
+
+I64 tcc_add_symbol(CTCCState *s, U8 *name, void *val)
+{
+    TccSymbolsInit();
+
+    // Find free slot
+    for (I64 i = 0; i < TCC_MAX_SYMBOLS; i++) {
+        if (!tcc_symbols[i].in_use) {
+            tcc_symbols[i].name = StrNew(name);
+            tcc_symbols[i].value = val;
+            tcc_symbols[i].in_use = TRUE;
+            return 0;
+        }
+    }
+
+    tcc_error(s, "symbol table full");
+    return -1;
+}
+
+void *tcc_get_symbol(CTCCState *s, U8 *name)
+{
+    TccSymbolsInit();
+
+    for (I64 i = 0; i < TCC_MAX_SYMBOLS; i++) {
+        if (tcc_symbols[i].in_use && StrCmp(tcc_symbols[i].name, name) == 0) {
+            return tcc_symbols[i].value;
+        }
+    }
+
+    return NULL;
+}
+
+// ============================================================================
+// OUTPUT
+// ============================================================================
+
+I64 tcc_output_file(CTCCState *s, U8 *filename)
+{
+    if (!s || !filename)
+        return -1;
+
+    if (s->outfile)
+        Free(s->outfile);
+    s->outfile = StrNew(filename);
+
+    // In a real implementation, this would write the compiled code to file
+    if (s->verbose)
+        printf("tcc: output file: %s\n", filename);
+
+    return 0;
+}
+
+I64 tcc_relocate(CTCCState *s, void *ptr)
+{
+    if (!s)
+        return -1;
+
+    if (ptr == TCC_RELOCATE_AUTO) {
+        // Allocate memory for code
+        // In real impl, this would be the actual code size
+        s->code_size = 65536;  // 64KB placeholder
+        s->code_mem = MAlloc(s->code_size);
+        if (!s->code_mem)
+            return -1;
+        return 0;
+    }
+
+    // Relocate to provided address
+    s->code_mem = ptr;
+    return 0;
+}
+
+void *tcc_get_code(CTCCState *s, I64 *size)
+{
+    if (!s)
+        return NULL;
+
+    if (size)
+        *size = s->code_size;
+
+    return s->code_mem;
+}
+
+// ============================================================================
+// RUN COMPILED CODE
+// ============================================================================
+
+I64 tcc_run(CTCCState *s, I64 argc, U8 **argv)
+{
+    if (!s)
+        return -1;
+
+    // Get main function
+    void *main_ptr = tcc_get_symbol(s, "main");
+    if (!main_ptr) {
+        tcc_error(s, "main function not found");
+        return -1;
+    }
+
+    // Call main(argc, argv)
+    I64 (*main_func)(I64, U8**) = main_ptr;
+    return main_func(argc, argv);
+}
+
+// ============================================================================
+// CONVENIENCE FUNCTIONS
+// ============================================================================
+
+I64 tcc_run_string(U8 *code, I64 argc, U8 **argv)
+{
+    CTCCState *s = tcc_new();
+    if (!s)
+        return -1;
+
+    tcc_set_output_type(s, TCC_OUTPUT_MEMORY);
+
+    I64 ret = tcc_compile_string(s, code);
+    if (ret < 0) {
+        tcc_delete(s);
+        return ret;
+    }
+
+    ret = tcc_relocate(s, TCC_RELOCATE_AUTO);
+    if (ret < 0) {
+        tcc_delete(s);
+        return ret;
+    }
+
+    ret = tcc_run(s, argc, argv);
+
+    tcc_delete(s);
+    return ret;
+}
+
+void *tcc_compile_func(U8 *code, U8 *func_name)
+{
+    CTCCState *s = tcc_new();
+    if (!s)
+        return NULL;
+
+    tcc_set_output_type(s, TCC_OUTPUT_MEMORY);
+
+    if (tcc_compile_string(s, code) < 0) {
+        tcc_delete(s);
+        return NULL;
+    }
+
+    if (tcc_relocate(s, TCC_RELOCATE_AUTO) < 0) {
+        tcc_delete(s);
+        return NULL;
+    }
+
+    void *func = tcc_get_symbol(s, func_name);
+
+    // Note: We don't delete s here because the code is still in use
+    // The caller is responsible for the lifetime
+
+    return func;
+}
+
+// ============================================================================
+// REGISTER ZEALOS SYMBOLS FOR TCC
+// ============================================================================
+
+// Forward declarations of POSIX/libc functions
+extern I64 printf(U8 *fmt, ...);
+extern I64 fprintf(FILE *stream, U8 *fmt, ...);
+extern I64 sprintf(U8 *buf, U8 *fmt, ...);
+extern I64 snprintf(U8 *buf, I64 size, U8 *fmt, ...);
+extern void *malloc(I64 size);
+extern void *calloc(I64 nmemb, I64 size);
+extern void *realloc(void *ptr, I64 size);
+extern U0 free(void *ptr);
+extern I64 strlen(U8 *s);
+extern U8 *strcpy(U8 *dest, U8 *src);
+extern U8 *strncpy(U8 *dest, U8 *src, I64 n);
+extern I64 strcmp(U8 *s1, U8 *s2);
+extern I64 strncmp(U8 *s1, U8 *s2, I64 n);
+extern U8 *strcat(U8 *dest, U8 *src);
+extern U8 *strchr(U8 *s, I64 c);
+extern U8 *strrchr(U8 *s, I64 c);
+extern U8 *strstr(U8 *haystack, U8 *needle);
+extern U8 *strdup(U8 *s);
+extern void *memcpy(void *dest, void *src, I64 n);
+extern void *memmove(void *dest, void *src, I64 n);
+extern void *memset(void *s, I64 c, I64 n);
+extern I64 memcmp(void *s1, void *s2, I64 n);
+extern I64 atoi(U8 *s);
+extern I64 atol(U8 *s);
+extern F64 atof(U8 *s);
+extern I64 abs(I64 n);
+extern FILE *fopen(U8 *path, U8 *mode);
+extern I64 fclose(FILE *fp);
+extern I64 fread(void *ptr, I64 size, I64 nmemb, FILE *stream);
+extern I64 fwrite(void *ptr, I64 size, I64 nmemb, FILE *stream);
+extern I64 fseek(FILE *stream, I64 offset, I64 whence);
+extern I64 ftell(FILE *stream);
+extern I64 fgetc(FILE *stream);
+extern I64 fputc(I64 c, FILE *stream);
+extern U8 *fgets(U8 *s, I64 size, FILE *stream);
+extern I64 fputs(U8 *s, FILE *stream);
+extern I64 fflush(FILE *stream);
+extern I64 feof(FILE *stream);
+extern I64 ferror(FILE *stream);
+extern I64 getchar();
+extern I64 putchar(I64 c);
+extern I64 puts(U8 *s);
+extern U0 exit(I64 status);
+extern U0 abort();
+extern I64 getpid();
+extern I64 getppid();
+extern I64 getuid();
+extern I64 getgid();
+extern I64 fork();
+extern I64 execve(U8 *path, U8 **argv, U8 **envp);
+extern I64 execvp(U8 *file, U8 **argv);
+extern I64 waitpid(I64 pid, I64 *status, I64 options);
+extern I64 kill(I64 pid, I64 sig);
+extern U32 sleep(U32 seconds);
+extern I64 usleep(I64 usec);
+extern U8 *getenv(U8 *name);
+extern I64 setenv(U8 *name, U8 *value, I64 overwrite);
+extern I64 unsetenv(U8 *name);
+extern I64 open(U8 *path, I64 flags, ...);
+extern I64 close(I64 fd);
+extern I64 read(I64 fd, void *buf, I64 count);
+extern I64 write(I64 fd, void *buf, I64 count);
+extern I64 lseek(I64 fd, I64 offset, I64 whence);
+extern I64 dup(I64 oldfd);
+extern I64 dup2(I64 oldfd, I64 newfd);
+extern I64 pipe(I64 *pipefd);
+extern I64 stat(U8 *path, void *statbuf);
+extern I64 fstat(I64 fd, void *statbuf);
+extern I64 access(U8 *path, I64 mode);
+extern I64 unlink(U8 *path);
+extern I64 rename(U8 *oldpath, U8 *newpath);
+extern I64 mkdir(U8 *path, I64 mode);
+extern I64 rmdir(U8 *path);
+extern I64 chdir(U8 *path);
+extern U8 *getcwd(U8 *buf, I64 size);
+extern void *mmap(void *addr, I64 length, I64 prot, I64 flags, I64 fd, I64 offset);
+extern I64 munmap(void *addr, I64 length);
+extern I64 time(I64 *t);
+
+U0 TccRegisterZealOSSymbols(CTCCState *s)
+{
+    // Standard I/O
+    tcc_add_symbol(s, "printf", &printf);
+    tcc_add_symbol(s, "fprintf", &fprintf);
+    tcc_add_symbol(s, "sprintf", &sprintf);
+    tcc_add_symbol(s, "snprintf", &snprintf);
+    tcc_add_symbol(s, "puts", &puts);
+    tcc_add_symbol(s, "putchar", &putchar);
+    tcc_add_symbol(s, "getchar", &getchar);
+
+    // Memory
+    tcc_add_symbol(s, "malloc", &malloc);
+    tcc_add_symbol(s, "calloc", &calloc);
+    tcc_add_symbol(s, "realloc", &realloc);
+    tcc_add_symbol(s, "free", &free);
+
+    // String
+    tcc_add_symbol(s, "strlen", &strlen);
+    tcc_add_symbol(s, "strcpy", &strcpy);
+    tcc_add_symbol(s, "strncpy", &strncpy);
+    tcc_add_symbol(s, "strcmp", &strcmp);
+    tcc_add_symbol(s, "strncmp", &strncmp);
+    tcc_add_symbol(s, "strcat", &strcat);
+    tcc_add_symbol(s, "strchr", &strchr);
+    tcc_add_symbol(s, "strrchr", &strrchr);
+    tcc_add_symbol(s, "strstr", &strstr);
+    tcc_add_symbol(s, "strdup", &strdup);
+
+    // Memory operations
+    tcc_add_symbol(s, "memcpy", &memcpy);
+    tcc_add_symbol(s, "memmove", &memmove);
+    tcc_add_symbol(s, "memset", &memset);
+    tcc_add_symbol(s, "memcmp", &memcmp);
+
+    // Conversion
+    tcc_add_symbol(s, "atoi", &atoi);
+    tcc_add_symbol(s, "atol", &atol);
+    tcc_add_symbol(s, "atof", &atof);
+    tcc_add_symbol(s, "abs", &abs);
+
+    // File I/O
+    tcc_add_symbol(s, "fopen", &fopen);
+    tcc_add_symbol(s, "fclose", &fclose);
+    tcc_add_symbol(s, "fread", &fread);
+    tcc_add_symbol(s, "fwrite", &fwrite);
+    tcc_add_symbol(s, "fseek", &fseek);
+    tcc_add_symbol(s, "ftell", &ftell);
+    tcc_add_symbol(s, "fgetc", &fgetc);
+    tcc_add_symbol(s, "fputc", &fputc);
+    tcc_add_symbol(s, "fgets", &fgets);
+    tcc_add_symbol(s, "fputs", &fputs);
+    tcc_add_symbol(s, "fflush", &fflush);
+    tcc_add_symbol(s, "feof", &feof);
+    tcc_add_symbol(s, "ferror", &ferror);
+
+    // Process control
+    tcc_add_symbol(s, "exit", &exit);
+    tcc_add_symbol(s, "abort", &abort);
+    tcc_add_symbol(s, "getpid", &getpid);
+    tcc_add_symbol(s, "getppid", &getppid);
+    tcc_add_symbol(s, "getuid", &getuid);
+    tcc_add_symbol(s, "getgid", &getgid);
+    tcc_add_symbol(s, "fork", &fork);
+    tcc_add_symbol(s, "execve", &execve);
+    tcc_add_symbol(s, "execvp", &execvp);
+    tcc_add_symbol(s, "waitpid", &waitpid);
+    tcc_add_symbol(s, "kill", &kill);
+    tcc_add_symbol(s, "sleep", &sleep);
+    tcc_add_symbol(s, "usleep", &usleep);
+
+    // Environment
+    tcc_add_symbol(s, "getenv", &getenv);
+    tcc_add_symbol(s, "setenv", &setenv);
+    tcc_add_symbol(s, "unsetenv", &unsetenv);
+
+    // Low-level I/O
+    tcc_add_symbol(s, "open", &open);
+    tcc_add_symbol(s, "close", &close);
+    tcc_add_symbol(s, "read", &read);
+    tcc_add_symbol(s, "write", &write);
+    tcc_add_symbol(s, "lseek", &lseek);
+    tcc_add_symbol(s, "dup", &dup);
+    tcc_add_symbol(s, "dup2", &dup2);
+    tcc_add_symbol(s, "pipe", &pipe);
+
+    // File system
+    tcc_add_symbol(s, "stat", &stat);
+    tcc_add_symbol(s, "fstat", &fstat);
+    tcc_add_symbol(s, "access", &access);
+    tcc_add_symbol(s, "unlink", &unlink);
+    tcc_add_symbol(s, "rename", &rename);
+    tcc_add_symbol(s, "mkdir", &mkdir);
+    tcc_add_symbol(s, "rmdir", &rmdir);
+    tcc_add_symbol(s, "chdir", &chdir);
+    tcc_add_symbol(s, "getcwd", &getcwd);
+
+    // Memory mapping
+    tcc_add_symbol(s, "mmap", &mmap);
+    tcc_add_symbol(s, "munmap", &munmap);
+
+    // Time
+    tcc_add_symbol(s, "time", &time);
+
+    // Standard streams
+    tcc_add_symbol(s, "stdin", stdin);
+    tcc_add_symbol(s, "stdout", stdout);
+    tcc_add_symbol(s, "stderr", stderr);
+}
+
+// ============================================================================
+// INITIALIZATION
+// ============================================================================
+
+"TCC_OS loaded - TCC OS interface for ZealOS\n";

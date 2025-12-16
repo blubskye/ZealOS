@@ -1,0 +1,44 @@
+// MakeShell.ZC - POSIX Shell Loader for ZealOS
+// Part of ZealOS POSIX compatibility layer
+//
+// This loads the complete POSIX shell implementation.
+//
+// Usage:
+//   #include "../MakePOSIX"   // Load POSIX layer first
+//   #include "MakeShell"      // Load shell
+//
+//   CShellState *sh = ShellNew();
+//   ShellRun(sh, "echo hello");
+//   ShellInteractive(sh);
+//   ShellFree(sh);
+
+Cd(__DIR__);
+
+// Shell definitions
+#include "Shell.HH"
+
+// Lexer
+#include "Lexer"
+
+// Parser
+#include "Parser"
+
+// Builtins (must come before Execute which references them)
+#include "Builtins"
+
+// Execution engine
+#include "Execute"
+
+// ============================================================================
+// SHELL INITIALIZATION MESSAGE
+// ============================================================================
+
+"POSIX Shell loaded.\n";
+"  - Lexer: tokenization with quoting, operators, reserved words\n";
+"  - Parser: recursive descent, full POSIX grammar\n";
+"  - Execution: pipelines, redirections, control flow\n";
+"  - Builtins: cd, echo, test, export, read, etc.\n";
+"\n";
+"Use ShellNew() to create a shell instance.\n";
+"Use ShellRun(sh, \"command\") to run commands.\n";
+"Use ShellInteractive(sh) for interactive mode.\n";

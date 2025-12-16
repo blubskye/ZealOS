@@ -1,0 +1,796 @@
+// SysUtils.ZC - System Utilities for ZealOS POSIX Layer
+// Part of ZealOS POSIX compatibility layer
+
+// ============================================================================
+// BASENAME - Strip directory and suffix from filenames
+// ============================================================================
+
+I64 UtilBasename(I64 argc, U8 **argv)
+{
+	if (argc < 2) {
+		"basename: missing operand\n";
+		return 1;
+	}
+
+	U8 *path = argv[1];
+	U8 *suffix = (argc > 2) ? argv[2] : NULL;
+
+	// Find last component
+	I64 len = StrLen(path);
+
+	// Strip trailing slashes
+	while (len > 1 && path[len - 1] == '/')
+		len--;
+
+	// Find start of basename
+	I64 start = len;
+	while (start > 0 && path[start - 1] != '/')
+		start--;
+
+	// Copy basename
+	U8 result[1024];
+	I64 result_len = 0;
+	for (I64 i = start; i < len && result_len < sizeof(result) - 1; i++)
+		result[result_len++] = path[i];
+	result[result_len] = 0;
+
+	// Strip suffix if present
+	if (suffix) {
+		I64 suffix_len = StrLen(suffix);
+		if (result_len > suffix_len) {
+			if (!StrCmp(result + result_len - suffix_len, suffix))
+				result[result_len - suffix_len] = 0;
+		}
+	}
+
+	"%s\n", result;
+	return 0;
+}
+
+// ============================================================================
+// DIRNAME - Strip last component from file name
+// ============================================================================
+
+I64 UtilDirname(I64 argc, U8 **argv)
+{
+	if (argc < 2) {
+		"dirname: missing operand\n";
+		return 1;
+	}
+
+	U8 *path = argv[1];
+	I64 len = StrLen(path);
+
+	// Strip trailing slashes
+	while (len > 1 && path[len - 1] == '/')
+		len--;
+
+	// Find last slash
+	while (len > 0 && path[len - 1] != '/')
+		len--;
+
+	// Strip trailing slashes from dir
+	while (len > 1 && path[len - 1] == '/')
+		len--;
+
+	if (len == 0)
+		".";
+	else {
+		for (I64 i = 0; i < len; i++)
+			"%c", path[i];
+	}
+	"\n";
+
+	return 0;
+}
+
+// ============================================================================
+// ENV - Run a program in a modified environment
+// ============================================================================
+
+I64 UtilEnv(I64 argc, U8 **argv)
+{
+	Bool ignore_env = FALSE;
+	I64 arg_start = 1;
+
+	// Parse options
+	for (I64 i = 1; i < argc && argv[i][0] == '-'; i++) {
+		if (!StrCmp(argv[i], "-i"))
+			ignore_env = TRUE;
+		else if (!StrCmp(argv[i], "-"))
+			;  // Ignore
+		else {
+			"env: invalid option -- '%c'\n", argv[i][1];
+			return 1;
+		}
+		arg_start = i + 1;
+	}
+
+	// Process VAR=value assignments
+	while (arg_start < argc && StrFirstOcc(argv[arg_start], "=")) {
+		U8 *eq = StrFirstOcc(argv[arg_start], "=");
+		*eq = 0;
+		PosixSetenv(argv[arg_start], eq + 1, 1);
+		*eq = '=';
+		arg_start++;
+	}
+
+	// If no command, print environment
+	if (arg_start >= argc) {
+		// Print all environment variables
+		CPosixProcess *proc = PosixGetCurrent();
+		if (proc && proc->environ) {
+			for (I64 i = 0; proc->environ[i]; i++)
+				"%s\n", proc->environ[i];
+		}
+		return 0;
+	}
+
+	// Execute command
+	return PosixExecvp(argv[arg_start], &argv[arg_start]);
+}
+
+// ============================================================================
+// EXPR - Evaluate expressions
+// ============================================================================
+
+I64 UtilExpr(I64 argc, U8 **argv)
+{
+	if (argc < 2) {
+		"expr: missing operand\n";
+		return 1;
+	}
+
+	// Simple integer expression evaluator
+	if (argc == 2) {
+		// Single argument - just print it
+		"%s\n", argv[1];
+		return argv[1][0] ? 0 : 1;
+	}
+
+	if (argc == 4) {
+		// binary operator
+		I64 a = Str2I64(argv[1]);
+		U8 *op = argv[2];
+		I64 b = Str2I64(argv[3]);
+		I64 result;
+
+		if (!StrCmp(op, "+"))
+			result = a + b;
+		else if (!StrCmp(op, "-"))
+			result = a - b;
+		else if (!StrCmp(op, "*"))
+			result = a * b;
+		else if (!StrCmp(op, "/")) {
+			if (b == 0) {
+				"expr: division by zero\n";
+				return 2;
+			}
+			result = a / b;
+		} else if (!StrCmp(op, "%")) {
+			if (b == 0) {
+				"expr: division by zero\n";
+				return 2;
+			}
+			result = a % b;
+		} else if (!StrCmp(op, "<"))
+			result = a < b;
+		else if (!StrCmp(op, "<="))
+			result = a <= b;
+		else if (!StrCmp(op, ">"))
+			result = a > b;
+		else if (!StrCmp(op, ">="))
+			result = a >= b;
+		else if (!StrCmp(op, "="))
+			result = !StrCmp(argv[1], argv[3]);
+		else if (!StrCmp(op, "!="))
+			result = StrCmp(argv[1], argv[3]) != 0;
+		else if (!StrCmp(op, "|"))
+			result = (a || b) ? a : b;
+		else if (!StrCmp(op, "&"))
+			result = (a && b) ? a : 0;
+		else {
+			"expr: syntax error\n";
+			return 2;
+		}
+
+		"%d\n", result;
+		return result == 0 ? 1 : 0;
+	}
+
+	"expr: syntax error\n";
+	return 2;
+}
+
+// ============================================================================
+// SEQ - Print a sequence of numbers
+// ============================================================================
+
+I64 UtilSeq(I64 argc, U8 **argv)
+{
+	I64 first = 1;
+	I64 increment = 1;
+	I64 last;
+	U8 *separator = "\n";
+	I64 arg_start = 1;
+
+	// Parse options
+	for (I64 i = 1; i < argc && argv[i][0] == '-'; i++) {
+		if (argv[i][1] == 's') {
+			if (argv[i][2])
+				separator = argv[i] + 2;
+			else if (i + 1 < argc)
+				separator = argv[++i];
+			arg_start = i + 1;
+		} else {
+			arg_start = i + 1;
+		}
+	}
+
+	I64 num_args = argc - arg_start;
+
+	if (num_args < 1) {
+		"seq: missing operand\n";
+		return 1;
+	}
+
+	if (num_args == 1) {
+		last = Str2I64(argv[arg_start]);
+	} else if (num_args == 2) {
+		first = Str2I64(argv[arg_start]);
+		last = Str2I64(argv[arg_start + 1]);
+	} else {
+		first = Str2I64(argv[arg_start]);
+		increment = Str2I64(argv[arg_start + 1]);
+		last = Str2I64(argv[arg_start + 2]);
+	}
+
+	if (increment == 0) {
+		"seq: increment must not be zero\n";
+		return 1;
+	}
+
+	Bool first_output = TRUE;
+	if (increment > 0) {
+		for (I64 i = first; i <= last; i += increment) {
+			if (!first_output)
+				"%s", separator;
+			first_output = FALSE;
+			"%d", i;
+		}
+	} else {
+		for (I64 i = first; i >= last; i += increment) {
+			if (!first_output)
+				"%s", separator;
+			first_output = FALSE;
+			"%d", i;
+		}
+	}
+
+	if (!first_output)
+		"\n";
+
+	return 0;
+}
+
+// ============================================================================
+// SLEEP - Delay for a specified time
+// ============================================================================
+
+I64 UtilSleep(I64 argc, U8 **argv)
+{
+	if (argc < 2) {
+		"sleep: missing operand\n";
+		return 1;
+	}
+
+	I64 seconds = Str2I64(argv[1]);
+	if (seconds > 0)
+		PosixSleep(seconds);
+
+	return 0;
+}
+
+// ============================================================================
+// TRUE / FALSE
+// ============================================================================
+
+I64 UtilTrue(I64 argc, U8 **argv)
+{
+	return 0;
+}
+
+I64 UtilFalse(I64 argc, U8 **argv)
+{
+	return 1;
+}
+
+// ============================================================================
+// YES - Output a string repeatedly
+// ============================================================================
+
+I64 UtilYes(I64 argc, U8 **argv)
+{
+	U8 *msg = "y";
+	if (argc > 1)
+		msg = argv[1];
+
+	// Output forever (or until killed)
+	for (I64 i = 0; i < 1000; i++) {  // Limited to avoid infinite loop
+		"%s\n", msg;
+	}
+
+	return 0;
+}
+
+// ============================================================================
+// DATE - Print or set the system date and time
+// ============================================================================
+
+I64 UtilDate(I64 argc, U8 **argv)
+{
+	CDate now;
+	CDateStruct ds;
+
+	now = Now;
+	Date2Struct(&ds, now);
+
+	U8 *months[] = {"Jan", "Feb", "Mar", "Apr", "May", "Jun",
+	                "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"};
+	U8 *days[] = {"Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"};
+
+	"%s %s %2d %02d:%02d:%02d %04d\n",
+		days[ds.day_of_week],
+		months[ds.mon - 1],
+		ds.day_of_mon,
+		ds.hour,
+		ds.min,
+		ds.sec,
+		ds.year;
+
+	return 0;
+}
+
+// ============================================================================
+// UNAME - Print system information
+// ============================================================================
+
+I64 UtilUname(I64 argc, U8 **argv)
+{
+	Bool all = FALSE;
+	Bool sysname = FALSE;
+	Bool nodename = FALSE;
+	Bool release = FALSE;
+	Bool version = FALSE;
+	Bool machine = FALSE;
+
+	// Parse options
+	for (I64 i = 1; i < argc; i++) {
+		if (argv[i][0] == '-') {
+			U8 *opt = argv[i] + 1;
+			while (*opt) {
+				switch (*opt) {
+					case 'a': all = TRUE; break;
+					case 's': sysname = TRUE; break;
+					case 'n': nodename = TRUE; break;
+					case 'r': release = TRUE; break;
+					case 'v': version = TRUE; break;
+					case 'm': machine = TRUE; break;
+					default:
+						"uname: invalid option -- '%c'\n", *opt;
+						return 1;
+				}
+				opt++;
+			}
+		}
+	}
+
+	// Default is -s
+	if (!all && !sysname && !nodename && !release && !version && !machine)
+		sysname = TRUE;
+
+	Bool need_space = FALSE;
+
+	if (all || sysname) {
+		"ZealOS";
+		need_space = TRUE;
+	}
+	if (all || nodename) {
+		if (need_space) " ";
+		"zealos";
+		need_space = TRUE;
+	}
+	if (all || release) {
+		if (need_space) " ";
+		"1.0";
+		need_space = TRUE;
+	}
+	if (all || version) {
+		if (need_space) " ";
+		"ZealOS POSIX Layer";
+		need_space = TRUE;
+	}
+	if (all || machine) {
+		if (need_space) " ";
+		"x86_64";
+	}
+	"\n";
+
+	return 0;
+}
+
+// ============================================================================
+// WHOAMI - Print effective user name
+// ============================================================================
+
+I64 UtilWhoami(I64 argc, U8 **argv)
+{
+	"root\n";  // ZealOS runs as root
+	return 0;
+}
+
+// ============================================================================
+// HOSTNAME - Print or set system host name
+// ============================================================================
+
+I64 UtilHostname(I64 argc, U8 **argv)
+{
+	"zealos\n";
+	return 0;
+}
+
+// ============================================================================
+// ID - Print user and group IDs
+// ============================================================================
+
+I64 UtilId(I64 argc, U8 **argv)
+{
+	"uid=0(root) gid=0(root) groups=0(root)\n";
+	return 0;
+}
+
+// ============================================================================
+// PWD - Print working directory
+// ============================================================================
+
+I64 UtilPwd(I64 argc, U8 **argv)
+{
+	U8 cwd[1024];
+
+	if (PosixGetcwd(cwd, sizeof(cwd))) {
+		"%s\n", cwd;
+		return 0;
+	}
+
+	"pwd: %s\n", PosixStrerror(posix_errno);
+	return 1;
+}
+
+// ============================================================================
+// CLEAR - Clear the terminal screen
+// ============================================================================
+
+I64 UtilClear(I64 argc, U8 **argv)
+{
+	// ANSI escape to clear screen
+	"\033[2J\033[H";
+	return 0;
+}
+
+// ============================================================================
+// CMP - Compare two files byte by byte
+// ============================================================================
+
+I64 UtilCmp(I64 argc, U8 **argv)
+{
+	Bool silent = FALSE;
+	Bool verbose = FALSE;
+	I64 arg_start = 1;
+
+	// Parse options
+	for (I64 i = 1; i < argc && argv[i][0] == '-'; i++) {
+		if (!StrCmp(argv[i], "-s") || !StrCmp(argv[i], "--silent"))
+			silent = TRUE;
+		else if (!StrCmp(argv[i], "-l"))
+			verbose = TRUE;
+		arg_start = i + 1;
+	}
+
+	if (argc - arg_start < 2) {
+		"cmp: missing operand\n";
+		return 2;
+	}
+
+	I64 fd1 = PosixOpen(argv[arg_start], O_RDONLY, 0);
+	if (fd1 < 0) {
+		if (!silent)
+			"cmp: %s: %s\n", argv[arg_start], PosixStrerror(posix_errno);
+		return 2;
+	}
+
+	I64 fd2 = PosixOpen(argv[arg_start + 1], O_RDONLY, 0);
+	if (fd2 < 0) {
+		if (!silent)
+			"cmp: %s: %s\n", argv[arg_start + 1], PosixStrerror(posix_errno);
+		PosixClose(fd1);
+		return 2;
+	}
+
+	I64 byte_pos = 1;
+	I64 line_num = 1;
+	U8 buf1[4096], buf2[4096];
+	I64 n1, n2;
+	I64 result = 0;
+
+	while (1) {
+		n1 = PosixRead(fd1, buf1, sizeof(buf1));
+		n2 = PosixRead(fd2, buf2, sizeof(buf2));
+
+		I64 min_n = (n1 < n2) ? n1 : n2;
+
+		for (I64 i = 0; i < min_n; i++) {
+			if (buf1[i] != buf2[i]) {
+				if (verbose) {
+					"%d %o %o\n", byte_pos, buf1[i], buf2[i];
+				} else if (!silent) {
+					"%s %s differ: byte %d, line %d\n",
+						argv[arg_start], argv[arg_start + 1], byte_pos, line_num;
+					result = 1;
+					goto done;
+				} else {
+					result = 1;
+					goto done;
+				}
+			}
+			if (buf1[i] == '\n')
+				line_num++;
+			byte_pos++;
+		}
+
+		if (n1 != n2) {
+			if (!silent) {
+				"cmp: EOF on %s\n", (n1 < n2) ? argv[arg_start] : argv[arg_start + 1];
+			}
+			result = 1;
+			goto done;
+		}
+
+		if (n1 <= 0)
+			break;
+	}
+
+done:
+	PosixClose(fd1);
+	PosixClose(fd2);
+	return result;
+}
+
+// ============================================================================
+// XXD - Make a hexdump
+// ============================================================================
+
+I64 UtilXxd(I64 argc, U8 **argv)
+{
+	Bool reverse = FALSE;
+	I64 cols = 16;
+	I64 arg_start = 1;
+
+	// Parse options
+	for (I64 i = 1; i < argc && argv[i][0] == '-'; i++) {
+		if (!StrCmp(argv[i], "-r"))
+			reverse = TRUE;
+		else if (argv[i][1] == 'c') {
+			if (argv[i][2])
+				cols = Str2I64(argv[i] + 2);
+			else if (i + 1 < argc)
+				cols = Str2I64(argv[++i]);
+		}
+		arg_start = i + 1;
+	}
+
+	I64 fd;
+	if (arg_start >= argc) {
+		fd = 0;
+	} else {
+		fd = PosixOpen(argv[arg_start], O_RDONLY, 0);
+		if (fd < 0) {
+			"xxd: %s: %s\n", argv[arg_start], PosixStrerror(posix_errno);
+			return 1;
+		}
+	}
+
+	U8 buf[4096];
+	I64 n;
+	I64 offset = 0;
+
+	while ((n = PosixRead(fd, buf, sizeof(buf))) > 0) {
+		for (I64 i = 0; i < n; i += cols) {
+			// Print offset
+			"%08x: ", offset + i;
+
+			// Print hex bytes
+			for (I64 j = 0; j < cols; j++) {
+				if (i + j < n)
+					"%02x", buf[i + j];
+				else
+					"  ";
+				if (j % 2 == 1)
+					" ";
+			}
+
+			// Print ASCII
+			" ";
+			for (I64 j = 0; j < cols && i + j < n; j++) {
+				U8 c = buf[i + j];
+				if (c >= 32 && c < 127)
+					"%c", c;
+				else
+					".";
+			}
+			"\n";
+		}
+		offset += n;
+	}
+
+	if (fd != 0)
+		PosixClose(fd);
+
+	return 0;
+}
+
+// ============================================================================
+// OD - Octal dump
+// ============================================================================
+
+I64 UtilOd(I64 argc, U8 **argv)
+{
+	Bool hex = FALSE;
+	Bool octal = TRUE;
+	Bool chars = FALSE;
+	I64 arg_start = 1;
+
+	// Parse options
+	for (I64 i = 1; i < argc && argv[i][0] == '-'; i++) {
+		U8 *opt = argv[i] + 1;
+		while (*opt) {
+			switch (*opt) {
+				case 'x': hex = TRUE; octal = FALSE; break;
+				case 'c': chars = TRUE; octal = FALSE; break;
+				case 'o': octal = TRUE; break;
+				default:
+					"od: invalid option -- '%c'\n", *opt;
+					return 1;
+			}
+			opt++;
+		}
+		arg_start = i + 1;
+	}
+
+	I64 fd;
+	if (arg_start >= argc) {
+		fd = 0;
+	} else {
+		fd = PosixOpen(argv[arg_start], O_RDONLY, 0);
+		if (fd < 0) {
+			"od: %s: %s\n", argv[arg_start], PosixStrerror(posix_errno);
+			return 1;
+		}
+	}
+
+	U8 buf[16];
+	I64 n;
+	I64 offset = 0;
+
+	while ((n = PosixRead(fd, buf, sizeof(buf))) > 0) {
+		// Print offset in octal
+		"%07o", offset;
+
+		if (chars) {
+			for (I64 i = 0; i < n; i++) {
+				U8 c = buf[i];
+				if (c == '\0')
+					" \\0";
+				else if (c == '\n')
+					" \\n";
+				else if (c == '\t')
+					" \\t";
+				else if (c == '\r')
+					" \\r";
+				else if (c >= 32 && c < 127)
+					"  %c", c;
+				else
+					" %03o", c;
+			}
+		} else if (hex) {
+			for (I64 i = 0; i < n; i++)
+				" %02x", buf[i];
+		} else {
+			for (I64 i = 0; i < n; i++)
+				" %03o", buf[i];
+		}
+		"\n";
+
+		offset += n;
+	}
+
+	// Print final offset
+	"%07o\n", offset;
+
+	if (fd != 0)
+		PosixClose(fd);
+
+	return 0;
+}
+
+// ============================================================================
+// HEXDUMP - Display file in hexadecimal format
+// ============================================================================
+
+I64 UtilHexdump(I64 argc, U8 **argv)
+{
+	Bool canonical = FALSE;
+	I64 arg_start = 1;
+
+	// Parse options
+	for (I64 i = 1; i < argc && argv[i][0] == '-'; i++) {
+		if (!StrCmp(argv[i], "-C"))
+			canonical = TRUE;
+		arg_start = i + 1;
+	}
+
+	I64 fd;
+	if (arg_start >= argc) {
+		fd = 0;
+	} else {
+		fd = PosixOpen(argv[arg_start], O_RDONLY, 0);
+		if (fd < 0) {
+			"hexdump: %s: %s\n", argv[arg_start], PosixStrerror(posix_errno);
+			return 1;
+		}
+	}
+
+	U8 buf[16];
+	I64 n;
+	I64 offset = 0;
+
+	while ((n = PosixRead(fd, buf, sizeof(buf))) > 0) {
+		"%08x", offset;
+
+		if (canonical) {
+			" ";
+			for (I64 i = 0; i < 16; i++) {
+				if (i < n)
+					" %02x", buf[i];
+				else
+					"   ";
+				if (i == 7)
+					" ";
+			}
+			"  |";
+			for (I64 i = 0; i < n; i++) {
+				if (buf[i] >= 32 && buf[i] < 127)
+					"%c", buf[i];
+				else
+					".";
+			}
+			"|";
+		} else {
+			for (I64 i = 0; i < n; i += 2) {
+				if (i + 1 < n)
+					" %02x%02x", buf[i + 1], buf[i];
+				else
+					" %02x", buf[i];
+			}
+		}
+		"\n";
+
+		offset += n;
+	}
+
+	"%08x\n", offset;
+
+	if (fd != 0)
+		PosixClose(fd);
+
+	return 0;
+}

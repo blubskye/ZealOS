@@ -1,0 +1,652 @@
+// X509.ZC - X.509 Certificate Parser Implementation for ZealOS
+// Part of ZealOS TLS implementation
+// Provides X.509 certificate parsing and validation
+
+// ============================================================================
+// OID DEFINITIONS
+// ============================================================================
+
+// Signature algorithms
+U8 OID_SHA256_RSA[9] = {0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x01, 0x0B};
+U8 OID_SHA384_RSA[9] = {0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x01, 0x0C};
+U8 OID_SHA512_RSA[9] = {0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x01, 0x0D};
+U8 OID_ECDSA_SHA256[8] = {0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x04, 0x03, 0x02};
+U8 OID_ECDSA_SHA384[8] = {0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x04, 0x03, 0x03};
+
+// RSA encryption: 1.2.840.113549.1.1.1
+U8 OID_RSA_ENCRYPTION[9] = {0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x01, 0x01};
+
+// Name attributes
+U8 OID_COMMON_NAME[3] = {0x55, 0x04, 0x03};
+U8 OID_ORGANIZATION[3] = {0x55, 0x04, 0x0A};
+U8 OID_ORG_UNIT[3] = {0x55, 0x04, 0x0B};
+U8 OID_COUNTRY[3] = {0x55, 0x04, 0x06};
+U8 OID_STATE[3] = {0x55, 0x04, 0x08};
+U8 OID_LOCALITY[3] = {0x55, 0x04, 0x07};
+
+// Extensions
+U8 OID_SUBJECT_ALT_NAME[3] = {0x55, 0x1D, 0x11};
+U8 OID_BASIC_CONSTRAINTS[3] = {0x55, 0x1D, 0x13};
+U8 OID_KEY_USAGE[3] = {0x55, 0x1D, 0x0F};
+
+// ============================================================================
+// CERTIFICATE CREATION/DESTRUCTION
+// ============================================================================
+
+// Create empty certificate
+CX509Certificate *X509CertificateNew()
+{
+	CX509Certificate *cert = MAlloc(sizeof(CX509Certificate));
+	MemSet(cert, 0, sizeof(CX509Certificate));
+	cert->path_len_constraint = -1;
+	return cert;
+}
+
+// Free name fields
+U0 X509NameFree(CX509Name *name)
+{
+	if (name->common_name) Free(name->common_name);
+	if (name->organization) Free(name->organization);
+	if (name->organizational_unit) Free(name->organizational_unit);
+	if (name->country) Free(name->country);
+	if (name->state) Free(name->state);
+	if (name->locality) Free(name->locality);
+	MemSet(name, 0, sizeof(CX509Name));
+}
+
+// Free certificate
+U0 X509CertificateFree(CX509Certificate *cert)
+{
+	I64 i;
+	if (!cert) return;
+
+	if (cert->serial_number) Free(cert->serial_number);
+	if (cert->signature_algorithm) Free(cert->signature_algorithm);
+
+	X509NameFree(&cert->issuer);
+	X509NameFree(&cert->subject);
+
+	if (cert->public_key_algorithm) Free(cert->public_key_algorithm);
+	if (cert->public_key) Free(cert->public_key);
+
+	if (cert->san_dns) {
+		for (i = 0; i < cert->san_dns_count; i++) {
+			if (cert->san_dns[i]) Free(cert->san_dns[i]);
+		}
+		Free(cert->san_dns);
+	}
+
+	if (cert->san_ip) {
+		for (i = 0; i < cert->san_ip_count; i++) {
+			if (cert->san_ip[i]) Free(cert->san_ip[i]);
+		}
+		Free(cert->san_ip);
+	}
+
+	if (cert->signature) Free(cert->signature);
+
+	// Don't free tbs_data and raw_der - they point into original buffer
+
+	Free(cert);
+}
+
+// ============================================================================
+// NAME PARSING
+// ============================================================================
+
+// Parse an X.500 Name (RDNSequence)
+I64 X509ParseName(CASN1Parser *parser, CX509Name *name)
+{
+	CASN1Parser seq_parser, rdn_parser, attr_parser;
+	CASN1Element elem;
+	I64 result;
+
+	// Name is a SEQUENCE of RelativeDistinguishedName
+	result = ASN1EnterConstructed(parser, &elem, &seq_parser);
+	if (result != ASN1_OK) return result;
+
+	while (ASN1HasMore(&seq_parser)) {
+		// Each RDN is a SET of AttributeTypeAndValue
+		result = ASN1EnterConstructed(&seq_parser, &elem, &rdn_parser);
+		if (result != ASN1_OK) continue;
+
+		while (ASN1HasMore(&rdn_parser)) {
+			// AttributeTypeAndValue is a SEQUENCE
+			result = ASN1EnterConstructed(&rdn_parser, &elem, &attr_parser);
+			if (result != ASN1_OK) continue;
+
+			// Parse OID
+			U8 *oid_data;
+			I64 oid_len;
+			result = ASN1ParseOIDRaw(&attr_parser, &oid_data, &oid_len);
+			if (result != ASN1_OK) continue;
+
+			// Parse value (string)
+			U8 *value = ASN1ParseAnyString(&attr_parser, NULL);
+			if (!value) continue;
+
+			// Match OID to name component
+			if (ASN1OIDEquals(oid_data, oid_len, OID_COMMON_NAME, 3)) {
+				if (name->common_name) Free(name->common_name);
+				name->common_name = value;
+			} else if (ASN1OIDEquals(oid_data, oid_len, OID_ORGANIZATION, 3)) {
+				if (name->organization) Free(name->organization);
+				name->organization = value;
+			} else if (ASN1OIDEquals(oid_data, oid_len, OID_ORG_UNIT, 3)) {
+				if (name->organizational_unit) Free(name->organizational_unit);
+				name->organizational_unit = value;
+			} else if (ASN1OIDEquals(oid_data, oid_len, OID_COUNTRY, 3)) {
+				if (name->country) Free(name->country);
+				name->country = value;
+			} else if (ASN1OIDEquals(oid_data, oid_len, OID_STATE, 3)) {
+				if (name->state) Free(name->state);
+				name->state = value;
+			} else if (ASN1OIDEquals(oid_data, oid_len, OID_LOCALITY, 3)) {
+				if (name->locality) Free(name->locality);
+				name->locality = value;
+			} else {
+				Free(value);
+			}
+		}
+	}
+
+	return X509_OK;
+}
+
+// ============================================================================
+// EXTENSION PARSING
+// ============================================================================
+
+// Parse Subject Alternative Name extension
+I64 X509ParseSAN(U8 *ext_data, I64 ext_len, CX509Certificate *cert)
+{
+	CASN1Parser parser, seq_parser;
+	CASN1Element elem;
+	I64 result;
+
+	// Allocate SAN arrays
+	cert->san_dns = MAlloc(X509_MAX_SAN_COUNT * sizeof(U8*));
+	MemSet(cert->san_dns, 0, X509_MAX_SAN_COUNT * sizeof(U8*));
+
+	ASN1ParserInit(&parser, ext_data, ext_len);
+
+	// SAN is a SEQUENCE of GeneralName
+	result = ASN1EnterConstructed(&parser, &elem, &seq_parser);
+	if (result != ASN1_OK) return result;
+
+	while (ASN1HasMore(&seq_parser)) {
+		result = ASN1ParseElement(&seq_parser, &elem);
+		if (result != ASN1_OK) continue;
+
+		// GeneralName is IMPLICIT tagged
+		// [2] dNSName IA5String
+		// [7] iPAddress OCTET STRING
+		if ((elem.tag & 0x1F) == 2) {
+			// DNS name
+			if (cert->san_dns_count < X509_MAX_SAN_COUNT) {
+				U8 *dns = MAlloc(elem.length + 1);
+				MemCpy(dns, elem.content, elem.length);
+				dns[elem.length] = 0;
+				cert->san_dns[cert->san_dns_count++] = dns;
+			}
+		}
+	}
+
+	return X509_OK;
+}
+
+// Parse Basic Constraints extension
+I64 X509ParseBasicConstraints(U8 *ext_data, I64 ext_len, CX509Certificate *cert)
+{
+	CASN1Parser parser, seq_parser;
+	CASN1Element elem;
+	I64 result;
+
+	ASN1ParserInit(&parser, ext_data, ext_len);
+
+	// BasicConstraints ::= SEQUENCE { cA BOOLEAN DEFAULT FALSE, pathLenConstraint INTEGER OPTIONAL }
+	result = ASN1EnterConstructed(&parser, &elem, &seq_parser);
+	if (result != ASN1_OK) return result;
+
+	// CA boolean (optional, default FALSE)
+	if (ASN1HasMore(&seq_parser)) {
+		Bool ca;
+		if (ASN1ParseBoolean(&seq_parser, &ca) == ASN1_OK) {
+			cert->is_ca = ca;
+		}
+	}
+
+	// Path length constraint (optional)
+	if (ASN1HasMore(&seq_parser)) {
+		I64 path_len;
+		if (ASN1ParseInteger(&seq_parser, &path_len) == ASN1_OK) {
+			cert->path_len_constraint = path_len;
+		}
+	}
+
+	return X509_OK;
+}
+
+// Parse extensions
+I64 X509ParseExtensions(CASN1Parser *parser, CX509Certificate *cert)
+{
+	CASN1Parser ext_seq_parser, ext_parser;
+	CASN1Element elem;
+	I64 result;
+
+	// Extensions is [3] EXPLICIT SEQUENCE
+	result = ASN1ParseElement(parser, &elem);
+	if (result != ASN1_OK) return result;
+
+	// Check for [3] tag
+	if ((elem.tag & 0x1F) != 3) {
+		return X509_OK;  // No extensions
+	}
+
+	CASN1Parser inner_parser;
+	ASN1ParserInit(&inner_parser, elem.content, elem.length);
+
+	// Enter the SEQUENCE
+	result = ASN1EnterConstructed(&inner_parser, &elem, &ext_seq_parser);
+	if (result != ASN1_OK) return result;
+
+	// Parse each extension
+	while (ASN1HasMore(&ext_seq_parser)) {
+		result = ASN1EnterConstructed(&ext_seq_parser, &elem, &ext_parser);
+		if (result != ASN1_OK) continue;
+
+		// Extension: SEQUENCE { extnID OID, critical BOOLEAN DEFAULT FALSE, extnValue OCTET STRING }
+		U8 *oid_data;
+		I64 oid_len;
+		result = ASN1ParseOIDRaw(&ext_parser, &oid_data, &oid_len);
+		if (result != ASN1_OK) continue;
+
+		// Skip optional critical boolean
+		I64 saved_pos = ext_parser.pos;
+		Bool critical;
+		if (ASN1ParseBoolean(&ext_parser, &critical) != ASN1_OK) {
+			ext_parser.pos = saved_pos;
+			ext_parser.error = ASN1_OK;
+		}
+
+		// Parse extension value (OCTET STRING)
+		U8 *ext_data;
+		I64 ext_len;
+		result = ASN1ParseOctetString(&ext_parser, &ext_data, &ext_len);
+		if (result != ASN1_OK) continue;
+
+		// Handle known extensions
+		if (ASN1OIDEquals(oid_data, oid_len, OID_SUBJECT_ALT_NAME, 3)) {
+			X509ParseSAN(ext_data, ext_len, cert);
+		} else if (ASN1OIDEquals(oid_data, oid_len, OID_BASIC_CONSTRAINTS, 3)) {
+			X509ParseBasicConstraints(ext_data, ext_len, cert);
+		}
+	}
+
+	return X509_OK;
+}
+
+// ============================================================================
+// CERTIFICATE PARSING
+// ============================================================================
+
+// Parse a DER-encoded X.509 certificate
+CX509Certificate *X509Parse(U8 *der, I64 len)
+{
+	CX509Certificate *cert;
+	CASN1Parser parser, cert_parser, tbs_parser;
+	CASN1Element elem;
+	I64 result;
+
+	cert = X509CertificateNew();
+	cert->raw_der = der;
+	cert->raw_der_len = len;
+
+	ASN1ParserInit(&parser, der, len);
+
+	// Certificate is a SEQUENCE
+	result = ASN1EnterConstructed(&parser, &elem, &cert_parser);
+	if (result != ASN1_OK) {
+		X509CertificateFree(cert);
+		return NULL;
+	}
+
+	// TBSCertificate
+	I64 tbs_start = cert_parser.pos;
+	result = ASN1EnterConstructed(&cert_parser, &elem, &tbs_parser);
+	if (result != ASN1_OK) {
+		X509CertificateFree(cert);
+		return NULL;
+	}
+	cert->tbs_data = elem.raw;
+	cert->tbs_len = elem.raw_length;
+
+	// Version [0] EXPLICIT INTEGER DEFAULT v1
+	I64 saved_pos = tbs_parser.pos;
+	result = ASN1ParseElement(&tbs_parser, &elem);
+	if (result == ASN1_OK && (elem.tag & 0xA0) == 0xA0) {
+		// Version is present
+		CASN1Parser ver_parser;
+		ASN1ParserInit(&ver_parser, elem.content, elem.length);
+		I64 ver;
+		if (ASN1ParseInteger(&ver_parser, &ver) == ASN1_OK) {
+			cert->version = ver + 1;  // v1=0, v2=1, v3=2
+		}
+	} else {
+		// No version, default to v1
+		cert->version = 1;
+		tbs_parser.pos = saved_pos;
+		tbs_parser.error = ASN1_OK;
+	}
+
+	// Serial number
+	U8 *serial_data;
+	I64 serial_len;
+	result = ASN1ParseBigInteger(&tbs_parser, &serial_data, &serial_len);
+	if (result == ASN1_OK) {
+		cert->serial_number = MAlloc(serial_len);
+		MemCpy(cert->serial_number, serial_data, serial_len);
+		cert->serial_number_len = serial_len;
+	}
+
+	// Signature algorithm
+	CASN1Parser algo_parser;
+	result = ASN1EnterConstructed(&tbs_parser, &elem, &algo_parser);
+	if (result == ASN1_OK) {
+		cert->signature_algorithm = ASN1ParseOID(&algo_parser);
+	}
+
+	// Issuer name
+	X509ParseName(&tbs_parser, &cert->issuer);
+
+	// Validity
+	CASN1Parser validity_parser;
+	result = ASN1EnterConstructed(&tbs_parser, &elem, &validity_parser);
+	if (result == ASN1_OK) {
+		ASN1ParseTime(&validity_parser, &cert->not_before);
+		ASN1ParseTime(&validity_parser, &cert->not_after);
+	}
+
+	// Subject name
+	X509ParseName(&tbs_parser, &cert->subject);
+
+	// Subject public key info
+	CASN1Parser spki_parser;
+	result = ASN1EnterConstructed(&tbs_parser, &elem, &spki_parser);
+	if (result == ASN1_OK) {
+		// Algorithm
+		CASN1Parser pk_algo_parser;
+		if (ASN1EnterConstructed(&spki_parser, &elem, &pk_algo_parser) == ASN1_OK) {
+			cert->public_key_algorithm = ASN1ParseOID(&pk_algo_parser);
+		}
+
+		// Public key (BIT STRING)
+		U8 *pk_data;
+		I64 pk_len, unused;
+		if (ASN1ParseBitString(&spki_parser, &pk_data, &pk_len, &unused) == ASN1_OK) {
+			cert->public_key = MAlloc(pk_len);
+			MemCpy(cert->public_key, pk_data, pk_len);
+			cert->public_key_len = pk_len;
+		}
+	}
+
+	// Extensions (v3 only)
+	if (cert->version >= 3 && ASN1HasMore(&tbs_parser)) {
+		X509ParseExtensions(&tbs_parser, cert);
+	}
+
+	// Skip back to cert level
+	// Signature algorithm (duplicate of above)
+	ASN1SkipElement(&cert_parser);
+
+	// Signature value (BIT STRING)
+	U8 *sig_data;
+	I64 sig_len, sig_unused;
+	if (ASN1ParseBitString(&cert_parser, &sig_data, &sig_len, &sig_unused) == ASN1_OK) {
+		cert->signature = MAlloc(sig_len);
+		MemCpy(cert->signature, sig_data, sig_len);
+		cert->signature_len = sig_len;
+	}
+
+	return cert;
+}
+
+// ============================================================================
+// CERTIFICATE VALIDATION
+// ============================================================================
+
+// Check if certificate is valid at given time
+I64 X509IsValid(CX509Certificate *cert, U64 now)
+{
+	if (now < cert->not_before) {
+		return X509_ERR_NOT_YET_VALID;
+	}
+	if (now > cert->not_after) {
+		return X509_ERR_EXPIRED;
+	}
+	return X509_OK;
+}
+
+// Match hostname against certificate
+// Checks CN and SANs
+Bool X509MatchHostname(CX509Certificate *cert, U8 *hostname)
+{
+	I64 i;
+
+	// First check SANs (preferred)
+	for (i = 0; i < cert->san_dns_count; i++) {
+		if (!cert->san_dns[i]) continue;
+
+		// Exact match
+		if (StrICmp(cert->san_dns[i], hostname) == 0) {
+			return TRUE;
+		}
+
+		// Wildcard match (*.example.com)
+		if (cert->san_dns[i][0] == '*' && cert->san_dns[i][1] == '.') {
+			// Find first dot in hostname
+			U8 *dot = StrStr(hostname, ".");
+			if (dot) {
+				// Compare domain part
+				if (StrICmp(&cert->san_dns[i][1], dot) == 0) {
+					return TRUE;
+				}
+			}
+		}
+	}
+
+	// Fall back to CN if no SANs
+	if (cert->san_dns_count == 0 && cert->subject.common_name) {
+		if (StrICmp(cert->subject.common_name, hostname) == 0) {
+			return TRUE;
+		}
+
+		// Wildcard match
+		if (cert->subject.common_name[0] == '*' && cert->subject.common_name[1] == '.') {
+			U8 *dot = StrStr(hostname, ".");
+			if (dot) {
+				if (StrICmp(&cert->subject.common_name[1], dot) == 0) {
+					return TRUE;
+				}
+			}
+		}
+	}
+
+	return FALSE;
+}
+
+// ============================================================================
+// TRUST STORE
+// ============================================================================
+
+// Create a trust store
+CX509TrustStore *X509TrustStoreNew()
+{
+	CX509TrustStore *store = MAlloc(sizeof(CX509TrustStore));
+	MemSet(store, 0, sizeof(CX509TrustStore));
+	return store;
+}
+
+// Free trust store
+U0 X509TrustStoreFree(CX509TrustStore *store)
+{
+	I64 i;
+	if (!store) return;
+
+	for (i = 0; i < store->count; i++) {
+		X509CertificateFree(store->certificates[i]);
+	}
+	if (store->certificates) Free(store->certificates);
+	Free(store);
+}
+
+// Add certificate to trust store
+I64 X509TrustStoreAdd(CX509TrustStore *store, CX509Certificate *cert)
+{
+	if (store->count >= store->capacity) {
+		I64 new_cap = store->capacity == 0 ? 16 : store->capacity * 2;
+		CX509Certificate **new_certs = MAlloc(new_cap * sizeof(CX509Certificate*));
+		if (store->certificates) {
+			MemCpy(new_certs, store->certificates, store->count * sizeof(CX509Certificate*));
+			Free(store->certificates);
+		}
+		store->certificates = new_certs;
+		store->capacity = new_cap;
+	}
+
+	store->certificates[store->count++] = cert;
+	return X509_OK;
+}
+
+// Find certificate in trust store by subject name
+CX509Certificate *X509TrustStoreFind(CX509TrustStore *store, CX509Name *subject)
+{
+	I64 i;
+	for (i = 0; i < store->count; i++) {
+		CX509Certificate *cert = store->certificates[i];
+		// Simple match on common name
+		if (cert->subject.common_name && subject->common_name) {
+			if (StrCmp(cert->subject.common_name, subject->common_name) == 0) {
+				return cert;
+			}
+		}
+	}
+	return NULL;
+}
+
+// ============================================================================
+// CHAIN VALIDATION
+// ============================================================================
+
+// Verify certificate chain
+// chain[0] is end-entity, chain[n-1] is closest to root
+// Returns X509_OK if valid, error code otherwise
+I64 X509VerifyChain(CX509Certificate **chain, I64 chain_len,
+                    CX509TrustStore *trust_store, U8 *hostname, U64 now)
+{
+	I64 i;
+
+	if (chain_len == 0) {
+		return X509_ERR_PARSE_FAILED;
+	}
+
+	if (chain_len > X509_MAX_CHAIN_LENGTH) {
+		return X509_ERR_CHAIN_TOO_LONG;
+	}
+
+	// Check end-entity certificate hostname
+	if (hostname && !X509MatchHostname(chain[0], hostname)) {
+		return X509_ERR_HOSTNAME_MISMATCH;
+	}
+
+	// Check validity of all certificates
+	for (i = 0; i < chain_len; i++) {
+		I64 result = X509IsValid(chain[i], now);
+		if (result != X509_OK) {
+			return result;
+		}
+	}
+
+	// Check that each certificate is signed by the next
+	// Note: Actual signature verification requires RSA/ECDSA implementation
+	// For now, we just check the chain structure
+
+	// Check if chain leads to trusted root
+	if (trust_store) {
+		// Check last cert in chain
+		CX509Certificate *top = chain[chain_len - 1];
+
+		// Look for issuer in trust store
+		CX509Certificate *trusted = X509TrustStoreFind(trust_store, &top->issuer);
+		if (!trusted) {
+			// Check if top is self-signed and trusted
+			if (top->subject.common_name && top->issuer.common_name &&
+			    StrCmp(top->subject.common_name, top->issuer.common_name) == 0) {
+				trusted = X509TrustStoreFind(trust_store, &top->subject);
+			}
+		}
+
+		if (!trusted) {
+			return X509_ERR_UNTRUSTED;
+		}
+	}
+
+	return X509_OK;
+}
+
+// ============================================================================
+// UTILITY FUNCTIONS
+// ============================================================================
+
+// Get certificate subject common name
+U8 *X509GetSubjectCN(CX509Certificate *cert)
+{
+	return cert->subject.common_name;
+}
+
+// Get certificate issuer common name
+U8 *X509GetIssuerCN(CX509Certificate *cert)
+{
+	return cert->issuer.common_name;
+}
+
+// Print certificate info (debug)
+U0 X509Print(CX509Certificate *cert)
+{
+	I64 i;
+
+	"=== X.509 Certificate ===\n";
+	"Version: %d\n", cert->version;
+
+	if (cert->subject.common_name) {
+		"Subject CN: %s\n", cert->subject.common_name;
+	}
+	if (cert->subject.organization) {
+		"Subject O: %s\n", cert->subject.organization;
+	}
+
+	if (cert->issuer.common_name) {
+		"Issuer CN: %s\n", cert->issuer.common_name;
+	}
+
+	if (cert->signature_algorithm) {
+		"Signature Alg: %s\n", cert->signature_algorithm;
+	}
+
+	"Not Before: %llu\n", cert->not_before;
+	"Not After: %llu\n", cert->not_after;
+
+	if (cert->is_ca) {
+		"CA: Yes\n";
+	}
+
+	if (cert->san_dns_count > 0) {
+		"SANs:\n";
+		for (i = 0; i < cert->san_dns_count; i++) {
+			"  DNS: %s\n", cert->san_dns[i];
+		}
+	}
+
+	"\n";
+}
+

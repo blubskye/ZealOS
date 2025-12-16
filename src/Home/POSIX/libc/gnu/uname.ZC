@@ -1,0 +1,157 @@
+// uname.ZC - GNU coreutils 'uname' implementation
+// Print system information
+
+// C-style main function
+I64 uname_main(I64 argc, U8 **argv)
+{
+    Bool print_kernel = FALSE;    // -s
+    Bool print_nodename = FALSE;  // -n
+    Bool print_release = FALSE;   // -r
+    Bool print_version = FALSE;   // -v
+    Bool print_machine = FALSE;   // -m
+    Bool print_processor = FALSE; // -p
+    Bool print_hardware = FALSE;  // -i
+    Bool print_os = FALSE;        // -o
+    Bool print_all = FALSE;       // -a
+    I64 start = 1;
+
+    // Parse options
+    while (start < argc && argv[start][0] == '-' && argv[start][1]) {
+        U8 *arg = argv[start];
+
+        if (strcmp(arg, "--help") == 0) {
+            printf("Usage: uname [OPTION]...\n");
+            printf("Print certain system information.  With no OPTION, same as -s.\n\n");
+            printf("  -a, --all                print all information\n");
+            printf("  -s, --kernel-name        print the kernel name\n");
+            printf("  -n, --nodename           print the network node hostname\n");
+            printf("  -r, --kernel-release     print the kernel release\n");
+            printf("  -v, --kernel-version     print the kernel version\n");
+            printf("  -m, --machine            print the machine hardware name\n");
+            printf("  -p, --processor          print the processor type\n");
+            printf("  -i, --hardware-platform  print the hardware platform\n");
+            printf("  -o, --operating-system   print the operating system\n");
+            printf("      --help               display this help and exit\n");
+            printf("      --version            output version information and exit\n");
+            return 0;
+        }
+
+        if (strcmp(arg, "--version") == 0) {
+            printf("uname (ZealOS coreutils) 1.0\n");
+            return 0;
+        }
+
+        if (strcmp(arg, "-a") == 0 || strcmp(arg, "--all") == 0) {
+            print_all = TRUE;
+            start++;
+            continue;
+        }
+
+        if (strcmp(arg, "-s") == 0 || strcmp(arg, "--kernel-name") == 0) {
+            print_kernel = TRUE; start++; continue;
+        }
+        if (strcmp(arg, "-n") == 0 || strcmp(arg, "--nodename") == 0) {
+            print_nodename = TRUE; start++; continue;
+        }
+        if (strcmp(arg, "-r") == 0 || strcmp(arg, "--kernel-release") == 0) {
+            print_release = TRUE; start++; continue;
+        }
+        if (strcmp(arg, "-v") == 0 || strcmp(arg, "--kernel-version") == 0) {
+            print_version = TRUE; start++; continue;
+        }
+        if (strcmp(arg, "-m") == 0 || strcmp(arg, "--machine") == 0) {
+            print_machine = TRUE; start++; continue;
+        }
+        if (strcmp(arg, "-p") == 0 || strcmp(arg, "--processor") == 0) {
+            print_processor = TRUE; start++; continue;
+        }
+        if (strcmp(arg, "-i") == 0 || strcmp(arg, "--hardware-platform") == 0) {
+            print_hardware = TRUE; start++; continue;
+        }
+        if (strcmp(arg, "-o") == 0 || strcmp(arg, "--operating-system") == 0) {
+            print_os = TRUE; start++; continue;
+        }
+
+        // Combined options
+        if (arg[0] == '-' && arg[1] != '-') {
+            for (I64 i = 1; arg[i]; i++) {
+                switch (arg[i]) {
+                    case 'a': print_all = TRUE; break;
+                    case 's': print_kernel = TRUE; break;
+                    case 'n': print_nodename = TRUE; break;
+                    case 'r': print_release = TRUE; break;
+                    case 'v': print_version = TRUE; break;
+                    case 'm': print_machine = TRUE; break;
+                    case 'p': print_processor = TRUE; break;
+                    case 'i': print_hardware = TRUE; break;
+                    case 'o': print_os = TRUE; break;
+                    default:
+                        fprintf(stderr, "uname: invalid option -- '%c'\n", arg[i]);
+                        return 1;
+                }
+            }
+            start++;
+            continue;
+        }
+
+        if (strcmp(arg, "--") == 0) {
+            start++;
+            break;
+        }
+
+        break;
+    }
+
+    // Default to kernel name only
+    if (!print_all && !print_kernel && !print_nodename && !print_release &&
+        !print_version && !print_machine && !print_processor &&
+        !print_hardware && !print_os) {
+        print_kernel = TRUE;
+    }
+
+    if (print_all) {
+        print_kernel = TRUE;
+        print_nodename = TRUE;
+        print_release = TRUE;
+        print_version = TRUE;
+        print_machine = TRUE;
+        print_processor = TRUE;
+        print_hardware = TRUE;
+        print_os = TRUE;
+    }
+
+    // ZealOS system information
+    U8 *kernel_name = "ZealOS";
+    U8 *nodename = "zealos";
+    U8 *release = "1.0.0";
+    U8 *version = "#1 SMP PREEMPT";
+    U8 *machine = "x86_64";
+    U8 *processor = "x86_64";
+    U8 *hardware = "x86_64";
+    U8 *os = "ZealOS";
+
+    Bool first = TRUE;
+
+    auto print_field = [&first](U8 *value) -> U0 {
+        if (!first) putchar(' ');
+        printf("%s", value);
+        first = FALSE;
+    };
+
+    if (print_kernel) print_field(kernel_name);
+    if (print_nodename) print_field(nodename);
+    if (print_release) print_field(release);
+    if (print_version) print_field(version);
+    if (print_machine) print_field(machine);
+    if (print_processor) print_field(processor);
+    if (print_hardware) print_field(hardware);
+    if (print_os) print_field(os);
+
+    putchar('\n');
+    return 0;
+}
+
+U0 GnuUnameRegister()
+{
+    "GNU 'uname' utility loaded.\n";
+}

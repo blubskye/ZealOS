@@ -1,0 +1,339 @@
+// Poly1305.ZC - Poly1305 Message Authentication Code for ZealOS
+// Part of ZealOS TLS implementation
+// Implements RFC 8439 Poly1305 MAC
+
+// ============================================================================
+// POLY1305 CONSTANTS
+// ============================================================================
+
+#define POLY1305_KEY_SIZE   32
+#define POLY1305_TAG_SIZE   16
+#define POLY1305_BLOCK_SIZE 16
+
+// ============================================================================
+// POLY1305 STATE
+// ============================================================================
+
+class CPoly1305State
+{
+	// Accumulator (130 bits, stored in 5x26-bit limbs)
+	U32     h[5];
+
+	// R key (clamped, 5x26-bit limbs)
+	U32     r[5];
+
+	// S key (128 bits)
+	U32     s[4];
+
+	// Partial block buffer
+	U8      buffer[POLY1305_BLOCK_SIZE];
+	I64     buffer_len;
+};
+
+// ============================================================================
+// HELPER FUNCTIONS
+// ============================================================================
+
+// Read 32-bit little-endian value
+U32 Poly1305ReadLE32(U8 *p)
+{
+	return p[0] | (p[1] << 8) | (p[2] << 16) | (p[3] << 24);
+}
+
+// Write 32-bit little-endian value
+U0 Poly1305WriteLE32(U8 *p, U32 v)
+{
+	p[0] = v & 0xFF;
+	p[1] = (v >> 8) & 0xFF;
+	p[2] = (v >> 16) & 0xFF;
+	p[3] = (v >> 24) & 0xFF;
+}
+
+// ============================================================================
+// POLY1305 INITIALIZATION
+// ============================================================================
+
+// Initialize Poly1305 state
+// key: 32 bytes (r || s)
+U0 Poly1305Init(CPoly1305State *state, U8 *key)
+{
+	// Clear state
+	MemSet(state, 0, sizeof(CPoly1305State));
+
+	// Load and clamp r (first 16 bytes)
+	// Clamp: clear bits 4, 8, 12, 16... and high bits of bytes 3, 7, 11, 15
+	U32 t0 = Poly1305ReadLE32(&key[0]);
+	U32 t1 = Poly1305ReadLE32(&key[4]);
+	U32 t2 = Poly1305ReadLE32(&key[8]);
+	U32 t3 = Poly1305ReadLE32(&key[12]);
+
+	// Clamp r
+	t0 &= 0x0FFFFFFF;
+	t1 &= 0x0FFFFFFC;
+	t2 &= 0x0FFFFFFC;
+	t3 &= 0x0FFFFFFC;
+
+	// Store r in 26-bit limbs
+	state->r[0] = t0 & 0x3FFFFFF;
+	state->r[1] = ((t0 >> 26) | (t1 << 6)) & 0x3FFFFFF;
+	state->r[2] = ((t1 >> 20) | (t2 << 12)) & 0x3FFFFFF;
+	state->r[3] = ((t2 >> 14) | (t3 << 18)) & 0x3FFFFFF;
+	state->r[4] = (t3 >> 8) & 0x3FFFFFF;
+
+	// Load s (last 16 bytes)
+	state->s[0] = Poly1305ReadLE32(&key[16]);
+	state->s[1] = Poly1305ReadLE32(&key[20]);
+	state->s[2] = Poly1305ReadLE32(&key[24]);
+	state->s[3] = Poly1305ReadLE32(&key[28]);
+
+	// Initialize accumulator to 0
+	state->h[0] = 0;
+	state->h[1] = 0;
+	state->h[2] = 0;
+	state->h[3] = 0;
+	state->h[4] = 0;
+}
+
+// ============================================================================
+// POLY1305 BLOCK PROCESSING
+// ============================================================================
+
+// Process a 16-byte block
+// hibit: 0x01000000 for normal blocks, 0 for final partial block
+U0 Poly1305Block(CPoly1305State *state, U8 *block, U32 hibit)
+{
+	U32 t0, t1, t2, t3;
+	U64 d0, d1, d2, d3, d4;
+	U32 h0, h1, h2, h3, h4;
+	U32 r0, r1, r2, r3, r4;
+	U32 s1, s2, s3, s4;
+	U64 c;
+
+	// Load block into accumulator
+	t0 = Poly1305ReadLE32(&block[0]);
+	t1 = Poly1305ReadLE32(&block[4]);
+	t2 = Poly1305ReadLE32(&block[8]);
+	t3 = Poly1305ReadLE32(&block[12]);
+
+	// Add to h
+	h0 = state->h[0] + (t0 & 0x3FFFFFF);
+	h1 = state->h[1] + (((t0 >> 26) | (t1 << 6)) & 0x3FFFFFF);
+	h2 = state->h[2] + (((t1 >> 20) | (t2 << 12)) & 0x3FFFFFF);
+	h3 = state->h[3] + (((t2 >> 14) | (t3 << 18)) & 0x3FFFFFF);
+	h4 = state->h[4] + ((t3 >> 8) | hibit);
+
+	// Load r
+	r0 = state->r[0];
+	r1 = state->r[1];
+	r2 = state->r[2];
+	r3 = state->r[3];
+	r4 = state->r[4];
+
+	// s = r * 5 (for modular reduction)
+	s1 = r1 * 5;
+	s2 = r2 * 5;
+	s3 = r3 * 5;
+	s4 = r4 * 5;
+
+	// Multiply: d = h * r
+	d0 = ((U64)h0 * r0) + ((U64)h1 * s4) + ((U64)h2 * s3) + ((U64)h3 * s2) + ((U64)h4 * s1);
+	d1 = ((U64)h0 * r1) + ((U64)h1 * r0) + ((U64)h2 * s4) + ((U64)h3 * s3) + ((U64)h4 * s2);
+	d2 = ((U64)h0 * r2) + ((U64)h1 * r1) + ((U64)h2 * r0) + ((U64)h3 * s4) + ((U64)h4 * s3);
+	d3 = ((U64)h0 * r3) + ((U64)h1 * r2) + ((U64)h2 * r1) + ((U64)h3 * r0) + ((U64)h4 * s4);
+	d4 = ((U64)h0 * r4) + ((U64)h1 * r3) + ((U64)h2 * r2) + ((U64)h3 * r1) + ((U64)h4 * r0);
+
+	// Partial reduction
+	c = d0 >> 26; h0 = d0 & 0x3FFFFFF;
+	d1 += c;      c = d1 >> 26; h1 = d1 & 0x3FFFFFF;
+	d2 += c;      c = d2 >> 26; h2 = d2 & 0x3FFFFFF;
+	d3 += c;      c = d3 >> 26; h3 = d3 & 0x3FFFFFF;
+	d4 += c;      c = d4 >> 26; h4 = d4 & 0x3FFFFFF;
+	h0 += c * 5;  c = h0 >> 26; h0 = h0 & 0x3FFFFFF;
+	h1 += c;
+
+	// Store result
+	state->h[0] = h0;
+	state->h[1] = h1;
+	state->h[2] = h2;
+	state->h[3] = h3;
+	state->h[4] = h4;
+}
+
+// ============================================================================
+// POLY1305 UPDATE/FINALIZE
+// ============================================================================
+
+// Update with data
+U0 Poly1305Update(CPoly1305State *state, U8 *data, I64 len)
+{
+	I64 i = 0;
+
+	// Process any buffered data
+	if (state->buffer_len > 0) {
+		I64 need = POLY1305_BLOCK_SIZE - state->buffer_len;
+		if (len < need) {
+			MemCpy(&state->buffer[state->buffer_len], data, len);
+			state->buffer_len += len;
+			return;
+		}
+		MemCpy(&state->buffer[state->buffer_len], data, need);
+		Poly1305Block(state, state->buffer, 0x01000000);
+		state->buffer_len = 0;
+		i = need;
+	}
+
+	// Process full blocks
+	while (i + POLY1305_BLOCK_SIZE <= len) {
+		Poly1305Block(state, &data[i], 0x01000000);
+		i += POLY1305_BLOCK_SIZE;
+	}
+
+	// Buffer remaining data
+	if (i < len) {
+		MemCpy(state->buffer, &data[i], len - i);
+		state->buffer_len = len - i;
+	}
+}
+
+// Finalize and get tag
+U0 Poly1305Final(CPoly1305State *state, U8 *tag)
+{
+	U32 h0, h1, h2, h3, h4;
+	U32 g0, g1, g2, g3, g4;
+	U64 f;
+	U32 mask;
+
+	// Process final partial block (if any)
+	if (state->buffer_len > 0) {
+		// Pad with 0x01 and zeros
+		U8 padded[POLY1305_BLOCK_SIZE];
+		MemSet(padded, 0, POLY1305_BLOCK_SIZE);
+		MemCpy(padded, state->buffer, state->buffer_len);
+		padded[state->buffer_len] = 0x01;
+		Poly1305Block(state, padded, 0);
+	}
+
+	h0 = state->h[0];
+	h1 = state->h[1];
+	h2 = state->h[2];
+	h3 = state->h[3];
+	h4 = state->h[4];
+
+	// Full carry
+	U32 c;
+	c = h1 >> 26; h1 = h1 & 0x3FFFFFF;
+	h2 += c;      c = h2 >> 26; h2 = h2 & 0x3FFFFFF;
+	h3 += c;      c = h3 >> 26; h3 = h3 & 0x3FFFFFF;
+	h4 += c;      c = h4 >> 26; h4 = h4 & 0x3FFFFFF;
+	h0 += c * 5;  c = h0 >> 26; h0 = h0 & 0x3FFFFFF;
+	h1 += c;
+
+	// Compute h + -p = h - (2^130 - 5) = h + 5 - 2^130
+	g0 = h0 + 5;  c = g0 >> 26; g0 &= 0x3FFFFFF;
+	g1 = h1 + c;  c = g1 >> 26; g1 &= 0x3FFFFFF;
+	g2 = h2 + c;  c = g2 >> 26; g2 &= 0x3FFFFFF;
+	g3 = h3 + c;  c = g3 >> 26; g3 &= 0x3FFFFFF;
+	g4 = h4 + c - (1 << 26);
+
+	// Select h if h < p, else g
+	mask = (g4 >> 31) - 1;  // All 1s if g4 is negative (h < p)
+	g0 &= mask;
+	g1 &= mask;
+	g2 &= mask;
+	g3 &= mask;
+	g4 &= mask;
+	mask = ~mask;
+	h0 = (h0 & mask) | g0;
+	h1 = (h1 & mask) | g1;
+	h2 = (h2 & mask) | g2;
+	h3 = (h3 & mask) | g3;
+	h4 = (h4 & mask) | g4;
+
+	// Convert to 128-bit
+	f = ((h0) | (h1 << 26)) + (U64)state->s[0];
+	Poly1305WriteLE32(&tag[0], f);
+	f = ((h1 >> 6) | (h2 << 20)) + (U64)state->s[1] + (f >> 32);
+	Poly1305WriteLE32(&tag[4], f);
+	f = ((h2 >> 12) | (h3 << 14)) + (U64)state->s[2] + (f >> 32);
+	Poly1305WriteLE32(&tag[8], f);
+	f = ((h3 >> 18) | (h4 << 8)) + (U64)state->s[3] + (f >> 32);
+	Poly1305WriteLE32(&tag[12], f);
+
+	// Clear sensitive data
+	MemSet(state, 0, sizeof(CPoly1305State));
+}
+
+// ============================================================================
+// ONE-SHOT FUNCTION
+// ============================================================================
+
+// Compute Poly1305 MAC in one call
+U0 Poly1305(U8 *key, U8 *data, I64 len, U8 *tag)
+{
+	CPoly1305State state;
+	Poly1305Init(&state, key);
+	Poly1305Update(&state, data, len);
+	Poly1305Final(&state, tag);
+}
+
+// Verify Poly1305 tag
+Bool Poly1305Verify(U8 *key, U8 *data, I64 len, U8 *expected_tag)
+{
+	U8 computed[POLY1305_TAG_SIZE];
+	Poly1305(key, data, len, computed);
+
+	// Constant-time comparison
+	U8 diff = 0;
+	I64 i;
+	for (i = 0; i < POLY1305_TAG_SIZE; i++) {
+		diff |= computed[i] ^ expected_tag[i];
+	}
+	return diff == 0;
+}
+
+// ============================================================================
+// TEST
+// ============================================================================
+
+Bool Poly1305Test()
+{
+	// RFC 8439 Test Vector
+	U8 key[32] = {
+		0x85, 0xd6, 0xbe, 0x78, 0x57, 0x55, 0x6d, 0x33,
+		0x7f, 0x44, 0x52, 0xfe, 0x42, 0xd5, 0x06, 0xa8,
+		0x01, 0x03, 0x80, 0x8a, 0xfb, 0x0d, 0xb2, 0xfd,
+		0x4a, 0xbf, 0xf6, 0xaf, 0x41, 0x49, 0xf5, 0x1b
+	};
+	U8 message[34] = {
+		0x43, 0x72, 0x79, 0x70, 0x74, 0x6f, 0x67, 0x72,
+		0x61, 0x70, 0x68, 0x69, 0x63, 0x20, 0x46, 0x6f,
+		0x72, 0x75, 0x6d, 0x20, 0x52, 0x65, 0x73, 0x65,
+		0x61, 0x72, 0x63, 0x68, 0x20, 0x47, 0x72, 0x6f,
+		0x75, 0x70
+	};
+	U8 expected[16] = {
+		0xa8, 0x06, 0x1d, 0xc1, 0x30, 0x51, 0x36, 0xc6,
+		0xc2, 0x2b, 0x8b, 0xaf, 0x0c, 0x01, 0x27, 0xa9
+	};
+
+	U8 tag[16];
+
+	"Poly1305 Test... ";
+
+	Poly1305(key, message, 34, tag);
+
+	if (MemCmp(tag, expected, 16) != 0) {
+		"FAILED\n";
+		return FALSE;
+	}
+
+	// Verify function
+	if (!Poly1305Verify(key, message, 34, expected)) {
+		"FAILED (verify)\n";
+		return FALSE;
+	}
+
+	"PASSED\n";
+	return TRUE;
+}
+

@@ -1,0 +1,461 @@
+// ls.ZC - GNU coreutils 'ls' implementation
+// List directory contents
+
+#define LS_MAX_ENTRIES 4096
+
+// File entry for sorting
+class CLSEntry {
+    U8 name[256];
+    CPosixStat st;
+    U8 link_target[PATH_MAX];
+    Bool is_link;
+};
+
+// C-style main function
+I64 ls_main(I64 argc, U8 **argv)
+{
+    Bool all = FALSE;            // -a
+    Bool almost_all = FALSE;     // -A
+    Bool long_format = FALSE;    // -l
+    Bool human_readable = FALSE; // -h
+    Bool inode = FALSE;          // -i
+    Bool size_blocks = FALSE;    // -s
+    Bool recursive = FALSE;      // -R
+    Bool reverse = FALSE;        // -r
+    Bool sort_time = FALSE;      // -t
+    Bool sort_size = FALSE;      // -S
+    Bool sort_none = FALSE;      // -U (unsorted)
+    Bool one_per_line = FALSE;   // -1
+    Bool classify = FALSE;       // -F
+    Bool dir_indicator = FALSE;  // -p
+    Bool no_group = FALSE;       // -G
+    Bool numeric_uid = FALSE;    // -n
+    Bool dereference = FALSE;    // -L
+    Bool directory = FALSE;      // -d (list directories themselves)
+    I64 start = 1;
+
+    // Parse options
+    while (start < argc && argv[start][0] == '-' && argv[start][1]) {
+        U8 *arg = argv[start];
+
+        if (strcmp(arg, "--help") == 0) {
+            printf("Usage: ls [OPTION]... [FILE]...\n");
+            printf("List information about the FILEs (the current directory by default).\n\n");
+            printf("  -a, --all             do not ignore entries starting with .\n");
+            printf("  -A, --almost-all      do not list implied . and ..\n");
+            printf("  -d, --directory       list directories themselves, not their contents\n");
+            printf("  -F, --classify        append indicator (*/=>@|) to entries\n");
+            printf("  -G                    in a long listing, don't print group names\n");
+            printf("  -h, --human-readable  with -l, print human readable sizes\n");
+            printf("  -i, --inode           print the index number of each file\n");
+            printf("  -l                    use a long listing format\n");
+            printf("  -L, --dereference     show info for link's target\n");
+            printf("  -n, --numeric-uid-gid like -l, but list numeric user and group IDs\n");
+            printf("  -p                    append / indicator to directories\n");
+            printf("  -r, --reverse         reverse order while sorting\n");
+            printf("  -R, --recursive       list subdirectories recursively\n");
+            printf("  -s, --size            print the allocated size of each file\n");
+            printf("  -S                    sort by file size, largest first\n");
+            printf("  -t                    sort by modification time, newest first\n");
+            printf("  -U                    do not sort; list entries in directory order\n");
+            printf("  -1                    list one file per line\n");
+            printf("      --help            display this help and exit\n");
+            printf("      --version         output version information and exit\n");
+            return 0;
+        }
+
+        if (strcmp(arg, "--version") == 0) {
+            printf("ls (ZealOS coreutils) 1.0\n");
+            return 0;
+        }
+
+        if (strcmp(arg, "-l") == 0) { long_format = TRUE; start++; continue; }
+        if (strcmp(arg, "-a") == 0 || strcmp(arg, "--all") == 0) {
+            all = TRUE; start++; continue;
+        }
+        if (strcmp(arg, "-A") == 0 || strcmp(arg, "--almost-all") == 0) {
+            almost_all = TRUE; start++; continue;
+        }
+        if (strcmp(arg, "-h") == 0 || strcmp(arg, "--human-readable") == 0) {
+            human_readable = TRUE; start++; continue;
+        }
+        if (strcmp(arg, "-i") == 0 || strcmp(arg, "--inode") == 0) {
+            inode = TRUE; start++; continue;
+        }
+        if (strcmp(arg, "-s") == 0 || strcmp(arg, "--size") == 0) {
+            size_blocks = TRUE; start++; continue;
+        }
+        if (strcmp(arg, "-R") == 0 || strcmp(arg, "--recursive") == 0) {
+            recursive = TRUE; start++; continue;
+        }
+        if (strcmp(arg, "-r") == 0 || strcmp(arg, "--reverse") == 0) {
+            reverse = TRUE; start++; continue;
+        }
+        if (strcmp(arg, "-t") == 0) { sort_time = TRUE; start++; continue; }
+        if (strcmp(arg, "-S") == 0) { sort_size = TRUE; start++; continue; }
+        if (strcmp(arg, "-U") == 0) { sort_none = TRUE; start++; continue; }
+        if (strcmp(arg, "-1") == 0) { one_per_line = TRUE; start++; continue; }
+        if (strcmp(arg, "-F") == 0 || strcmp(arg, "--classify") == 0) {
+            classify = TRUE; start++; continue;
+        }
+        if (strcmp(arg, "-p") == 0) { dir_indicator = TRUE; start++; continue; }
+        if (strcmp(arg, "-G") == 0) { no_group = TRUE; start++; continue; }
+        if (strcmp(arg, "-n") == 0 || strcmp(arg, "--numeric-uid-gid") == 0) {
+            numeric_uid = TRUE; long_format = TRUE; start++; continue;
+        }
+        if (strcmp(arg, "-L") == 0 || strcmp(arg, "--dereference") == 0) {
+            dereference = TRUE; start++; continue;
+        }
+        if (strcmp(arg, "-d") == 0 || strcmp(arg, "--directory") == 0) {
+            directory = TRUE; start++; continue;
+        }
+
+        // Combined short options
+        if (arg[0] == '-' && arg[1] != '-') {
+            for (I64 i = 1; arg[i]; i++) {
+                switch (arg[i]) {
+                    case 'a': all = TRUE; break;
+                    case 'A': almost_all = TRUE; break;
+                    case 'l': long_format = TRUE; break;
+                    case 'h': human_readable = TRUE; break;
+                    case 'i': inode = TRUE; break;
+                    case 's': size_blocks = TRUE; break;
+                    case 'R': recursive = TRUE; break;
+                    case 'r': reverse = TRUE; break;
+                    case 't': sort_time = TRUE; break;
+                    case 'S': sort_size = TRUE; break;
+                    case 'U': sort_none = TRUE; break;
+                    case '1': one_per_line = TRUE; break;
+                    case 'F': classify = TRUE; break;
+                    case 'p': dir_indicator = TRUE; break;
+                    case 'G': no_group = TRUE; break;
+                    case 'n': numeric_uid = TRUE; long_format = TRUE; break;
+                    case 'L': dereference = TRUE; break;
+                    case 'd': directory = TRUE; break;
+                    default:
+                        fprintf(stderr, "ls: invalid option -- '%c'\n", arg[i]);
+                        return 2;
+                }
+            }
+            start++;
+            continue;
+        }
+
+        if (strcmp(arg, "--") == 0) {
+            start++;
+            break;
+        }
+
+        break;
+    }
+
+    // Format size for human readable
+    auto format_size = [](I64 size, U8 *buf, I64 buflen, Bool human) -> U0 {
+        if (!human) {
+            snprintf(buf, buflen, "%8ld", size);
+            return;
+        }
+        if (size < 1024) {
+            snprintf(buf, buflen, "%4ld", size);
+        } else if (size < 1024 * 1024) {
+            snprintf(buf, buflen, "%4ldK", size / 1024);
+        } else if (size < 1024 * 1024 * 1024) {
+            snprintf(buf, buflen, "%4ldM", size / (1024 * 1024));
+        } else {
+            snprintf(buf, buflen, "%4ldG", size / (1024 * 1024 * 1024));
+        }
+    };
+
+    // Get file type indicator
+    auto get_indicator = [](I64 mode, Bool classify, Bool dir_only) -> U8 {
+        if (S_ISDIR(mode)) return '/';
+        if (!classify) return 0;
+        if (S_ISLNK(mode)) return '@';
+        if (S_ISFIFO(mode)) return '|';
+        if (S_ISSOCK(mode)) return '=';
+        if (mode & (S_IXUSR | S_IXGRP | S_IXOTH)) return '*';
+        return 0;
+    };
+
+    // Format mode string
+    auto format_mode = [](I64 mode, U8 *buf) -> U0 {
+        buf[0] = S_ISDIR(mode) ? 'd' : S_ISLNK(mode) ? 'l' :
+                 S_ISCHR(mode) ? 'c' : S_ISBLK(mode) ? 'b' :
+                 S_ISFIFO(mode) ? 'p' : S_ISSOCK(mode) ? 's' : '-';
+        buf[1] = (mode & S_IRUSR) ? 'r' : '-';
+        buf[2] = (mode & S_IWUSR) ? 'w' : '-';
+        buf[3] = (mode & S_IXUSR) ? 'x' : '-';
+        buf[4] = (mode & S_IRGRP) ? 'r' : '-';
+        buf[5] = (mode & S_IWGRP) ? 'w' : '-';
+        buf[6] = (mode & S_IXGRP) ? 'x' : '-';
+        buf[7] = (mode & S_IROTH) ? 'r' : '-';
+        buf[8] = (mode & S_IWOTH) ? 'w' : '-';
+        buf[9] = (mode & S_IXOTH) ? 'x' : '-';
+        buf[10] = 0;
+    };
+
+    // Format time
+    auto format_time = [](U64 mtime, U8 *buf, I64 buflen) -> U0 {
+        // Simple time format - just show timestamp for now
+        // In real implementation would use localtime/strftime
+        U64 now = time(NULL);
+        U64 six_months = 180 * 24 * 60 * 60;
+
+        if (mtime > now - six_months && mtime <= now) {
+            // Recent: "Mon DD HH:MM"
+            snprintf(buf, buflen, "Dec 16 12:00");  // Simplified
+        } else {
+            // Old: "Mon DD  YYYY"
+            snprintf(buf, buflen, "Jan  1  2024");  // Simplified
+        }
+    };
+
+    // Print a single entry
+    auto print_entry = [&](CLSEntry *entry) -> U0 {
+        if (inode) {
+            printf("%8ld ", entry->st.st_ino);
+        }
+        if (size_blocks) {
+            printf("%4ld ", (entry->st.st_blocks + 1) / 2);
+        }
+        if (long_format) {
+            U8 mode_str[12];
+            format_mode(entry->st.st_mode, mode_str);
+            printf("%s ", mode_str);
+
+            printf("%3ld ", entry->st.st_nlink);
+
+            if (numeric_uid) {
+                printf("%5ld ", entry->st.st_uid);
+                if (!no_group)
+                    printf("%5ld ", entry->st.st_gid);
+            } else {
+                printf("%-8ld ", entry->st.st_uid);
+                if (!no_group)
+                    printf("%-8ld ", entry->st.st_gid);
+            }
+
+            U8 size_str[16];
+            format_size(entry->st.st_size, size_str, sizeof(size_str), human_readable);
+            printf("%s ", size_str);
+
+            U8 time_str[16];
+            format_time(entry->st.st_mtime, time_str, sizeof(time_str));
+            printf("%s ", time_str);
+        }
+
+        printf("%s", entry->name);
+
+        if (classify || dir_indicator) {
+            U8 ind = get_indicator(entry->st.st_mode, classify, !classify);
+            if (ind) putchar(ind);
+        }
+
+        if (long_format && entry->is_link && entry->link_target[0]) {
+            printf(" -> %s", entry->link_target);
+        }
+
+        if (long_format || one_per_line) {
+            printf("\n");
+        } else {
+            printf("  ");
+        }
+    };
+
+    // Comparison functions for qsort
+    I64 compare_name(CLSEntry *a, CLSEntry *b) {
+        return strcmp(a->name, b->name);
+    }
+
+    I64 compare_time(CLSEntry *a, CLSEntry *b) {
+        if (a->st.st_mtime > b->st.st_mtime) return -1;
+        if (a->st.st_mtime < b->st.st_mtime) return 1;
+        return strcmp(a->name, b->name);
+    }
+
+    I64 compare_size(CLSEntry *a, CLSEntry *b) {
+        if (a->st.st_size > b->st.st_size) return -1;
+        if (a->st.st_size < b->st.st_size) return 1;
+        return strcmp(a->name, b->name);
+    }
+
+    // List a directory
+    I64 list_dir(U8 *path, Bool show_header);
+    list_dir = [&](U8 *path, Bool show_header) -> I64 {
+        if (show_header) {
+            printf("\n%s:\n", path);
+        }
+
+        I64 dir_fd = PosixOpenDir(path);
+        if (dir_fd < 0) {
+            fprintf(stderr, "ls: cannot open directory '%s': %s\n",
+                    path, strerror(errno));
+            return 1;
+        }
+
+        // Collect entries
+        CLSEntry *entries = MAlloc(LS_MAX_ENTRIES * sizeof(CLSEntry));
+        I64 count = 0;
+        I64 total_blocks = 0;
+
+        CPosixDirent *de;
+        while ((de = PosixReadDir(dir_fd)) != NULL && count < LS_MAX_ENTRIES) {
+            // Skip . and ..
+            if (!all && !almost_all && de->d_name[0] == '.')
+                continue;
+            if (almost_all && (strcmp(de->d_name, ".") == 0 ||
+                               strcmp(de->d_name, "..") == 0))
+                continue;
+
+            CLSEntry *entry = &entries[count];
+            strncpy(entry->name, de->d_name, 255);
+            entry->name[255] = 0;
+            entry->is_link = FALSE;
+            entry->link_target[0] = 0;
+
+            U8 full_path[PATH_MAX];
+            snprintf(full_path, PATH_MAX, "%s/%s", path, de->d_name);
+
+            // Get file info
+            if (dereference) {
+                PosixStat(full_path, &entry->st);
+            } else {
+                PosixLstat(full_path, &entry->st);
+            }
+
+            // Read symlink target
+            if (S_ISLNK(entry->st.st_mode)) {
+                entry->is_link = TRUE;
+                I64 len = PosixReadlink(full_path, entry->link_target, PATH_MAX - 1);
+                if (len > 0)
+                    entry->link_target[len] = 0;
+            }
+
+            total_blocks += entry->st.st_blocks;
+            count++;
+        }
+
+        PosixCloseDir(dir_fd);
+
+        // Sort entries
+        if (!sort_none) {
+            I64 (*cmp)(CLSEntry*, CLSEntry*);
+            if (sort_time)
+                cmp = &compare_time;
+            else if (sort_size)
+                cmp = &compare_size;
+            else
+                cmp = &compare_name;
+
+            // Simple bubble sort (qsort would be better)
+            for (I64 i = 0; i < count - 1; i++) {
+                for (I64 j = 0; j < count - i - 1; j++) {
+                    I64 result = cmp(&entries[j], &entries[j+1]);
+                    if (reverse) result = -result;
+                    if (result > 0) {
+                        CLSEntry tmp = entries[j];
+                        entries[j] = entries[j+1];
+                        entries[j+1] = tmp;
+                    }
+                }
+            }
+        }
+
+        // Print total blocks for long format
+        if (long_format || size_blocks) {
+            printf("total %ld\n", (total_blocks + 1) / 2);
+        }
+
+        // Print entries
+        for (I64 i = 0; i < count; i++) {
+            print_entry(&entries[i]);
+        }
+
+        if (!long_format && !one_per_line && count > 0) {
+            printf("\n");
+        }
+
+        // Recursive listing
+        if (recursive) {
+            for (I64 i = 0; i < count; i++) {
+                if (S_ISDIR(entries[i].st.st_mode) &&
+                    strcmp(entries[i].name, ".") != 0 &&
+                    strcmp(entries[i].name, "..") != 0) {
+                    U8 subdir[PATH_MAX];
+                    snprintf(subdir, PATH_MAX, "%s/%s", path, entries[i].name);
+                    list_dir(subdir, TRUE);
+                }
+            }
+        }
+
+        Free(entries);
+        return 0;
+    };
+
+    // List a single file
+    auto list_file = [&](U8 *path) -> I64 {
+        CLSEntry entry;
+        strncpy(entry.name, path, 255);
+        entry.name[255] = 0;
+        entry.is_link = FALSE;
+        entry.link_target[0] = 0;
+
+        if (dereference) {
+            if (PosixStat(path, &entry.st) < 0) {
+                fprintf(stderr, "ls: cannot access '%s': %s\n", path, strerror(errno));
+                return 1;
+            }
+        } else {
+            if (PosixLstat(path, &entry.st) < 0) {
+                fprintf(stderr, "ls: cannot access '%s': %s\n", path, strerror(errno));
+                return 1;
+            }
+        }
+
+        if (S_ISLNK(entry.st.st_mode)) {
+            entry.is_link = TRUE;
+            I64 len = PosixReadlink(path, entry.link_target, PATH_MAX - 1);
+            if (len > 0)
+                entry.link_target[len] = 0;
+        }
+
+        print_entry(&entry);
+        if (!long_format && !one_per_line) printf("\n");
+        return 0;
+    };
+
+    I64 exit_status = 0;
+
+    // Default to current directory
+    if (start >= argc) {
+        exit_status = list_dir(".", FALSE);
+    } else {
+        Bool multiple = (argc - start) > 1;
+
+        for (I64 i = start; i < argc; i++) {
+            U8 *path = argv[i];
+            CPosixStat st;
+
+            if (PosixLstat(path, &st) < 0) {
+                fprintf(stderr, "ls: cannot access '%s': %s\n", path, strerror(errno));
+                exit_status = 2;
+                continue;
+            }
+
+            if (S_ISDIR(st.st_mode) && !directory) {
+                if (list_dir(path, multiple) != 0)
+                    exit_status = 2;
+            } else {
+                if (list_file(path) != 0)
+                    exit_status = 2;
+            }
+        }
+    }
+
+    return exit_status;
+}
+
+U0 GnuLsRegister()
+{
+    "GNU 'ls' utility loaded.\n";
+}

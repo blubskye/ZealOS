@@ -1,0 +1,242 @@
+// ChaCha20.ZC - ChaCha20 Stream Cipher for ZealOS
+// Part of ZealOS TLS implementation
+// Implements RFC 8439 ChaCha20 stream cipher
+
+// ============================================================================
+// CHACHA20 CONSTANTS
+// ============================================================================
+
+#define CHACHA20_KEY_SIZE       32
+#define CHACHA20_NONCE_SIZE     12
+#define CHACHA20_BLOCK_SIZE     64
+
+// ============================================================================
+// CHACHA20 STATE
+// ============================================================================
+
+class CChaCha20State
+{
+	U32     state[16];      // 512-bit state
+};
+
+// ============================================================================
+// QUARTER ROUND
+// ============================================================================
+
+// ChaCha20 quarter round operation
+U0 ChaCha20QuarterRound(U32 *a, U32 *b, U32 *c, U32 *d)
+{
+	*a += *b; *d ^= *a; *d = (*d << 16) | (*d >> 16);  // ROTL(d, 16)
+	*c += *d; *b ^= *c; *b = (*b << 12) | (*b >> 20);  // ROTL(b, 12)
+	*a += *b; *d ^= *a; *d = (*d << 8)  | (*d >> 24);  // ROTL(d, 8)
+	*c += *d; *b ^= *c; *b = (*b << 7)  | (*b >> 25);  // ROTL(b, 7)
+}
+
+// ============================================================================
+// CHACHA20 BLOCK FUNCTION
+// ============================================================================
+
+// Generate one 64-byte block of keystream
+U0 ChaCha20Block(CChaCha20State *state, U8 *out)
+{
+	U32 working[16];
+	I64 i;
+
+	// Copy state to working array
+	for (i = 0; i < 16; i++) {
+		working[i] = state->state[i];
+	}
+
+	// 20 rounds (10 double rounds)
+	for (i = 0; i < 10; i++) {
+		// Column rounds
+		ChaCha20QuarterRound(&working[0], &working[4], &working[8],  &working[12]);
+		ChaCha20QuarterRound(&working[1], &working[5], &working[9],  &working[13]);
+		ChaCha20QuarterRound(&working[2], &working[6], &working[10], &working[14]);
+		ChaCha20QuarterRound(&working[3], &working[7], &working[11], &working[15]);
+
+		// Diagonal rounds
+		ChaCha20QuarterRound(&working[0], &working[5], &working[10], &working[15]);
+		ChaCha20QuarterRound(&working[1], &working[6], &working[11], &working[12]);
+		ChaCha20QuarterRound(&working[2], &working[7], &working[8],  &working[13]);
+		ChaCha20QuarterRound(&working[3], &working[4], &working[9],  &working[14]);
+	}
+
+	// Add original state
+	for (i = 0; i < 16; i++) {
+		working[i] += state->state[i];
+	}
+
+	// Output as little-endian bytes
+	for (i = 0; i < 16; i++) {
+		out[i*4 + 0] = working[i] & 0xFF;
+		out[i*4 + 1] = (working[i] >> 8) & 0xFF;
+		out[i*4 + 2] = (working[i] >> 16) & 0xFF;
+		out[i*4 + 3] = (working[i] >> 24) & 0xFF;
+	}
+}
+
+// ============================================================================
+// CHACHA20 INITIALIZATION
+// ============================================================================
+
+// Initialize ChaCha20 state
+// key: 32 bytes
+// nonce: 12 bytes
+// counter: initial block counter (usually 0 or 1)
+U0 ChaCha20Init(CChaCha20State *state, U8 *key, U8 *nonce, U32 counter)
+{
+	// Constants: "expand 32-byte k"
+	state->state[0] = 0x61707865;
+	state->state[1] = 0x3320646E;
+	state->state[2] = 0x79622D32;
+	state->state[3] = 0x6B206574;
+
+	// Key (little-endian)
+	I64 i;
+	for (i = 0; i < 8; i++) {
+		state->state[4 + i] = key[i*4]           |
+		                      (key[i*4 + 1] << 8)  |
+		                      (key[i*4 + 2] << 16) |
+		                      (key[i*4 + 3] << 24);
+	}
+
+	// Counter
+	state->state[12] = counter;
+
+	// Nonce (little-endian)
+	for (i = 0; i < 3; i++) {
+		state->state[13 + i] = nonce[i*4]           |
+		                        (nonce[i*4 + 1] << 8)  |
+		                        (nonce[i*4 + 2] << 16) |
+		                        (nonce[i*4 + 3] << 24);
+	}
+}
+
+// Increment block counter
+U0 ChaCha20IncrementCounter(CChaCha20State *state)
+{
+	state->state[12]++;
+}
+
+// ============================================================================
+// CHACHA20 ENCRYPTION/DECRYPTION
+// ============================================================================
+
+// Encrypt/Decrypt data with ChaCha20
+// XOR is symmetric, so same function for both
+U0 ChaCha20Crypt(U8 *key, U8 *nonce, U32 counter, U8 *data, I64 len)
+{
+	CChaCha20State state;
+	U8 keystream[CHACHA20_BLOCK_SIZE];
+	I64 i, blocks, remaining;
+
+	ChaCha20Init(&state, key, nonce, counter);
+
+	blocks = len / CHACHA20_BLOCK_SIZE;
+	remaining = len % CHACHA20_BLOCK_SIZE;
+
+	// Process full blocks
+	for (i = 0; i < blocks; i++) {
+		ChaCha20Block(&state, keystream);
+		ChaCha20IncrementCounter(&state);
+
+		I64 j;
+		for (j = 0; j < CHACHA20_BLOCK_SIZE; j++) {
+			data[i * CHACHA20_BLOCK_SIZE + j] ^= keystream[j];
+		}
+	}
+
+	// Process remaining bytes
+	if (remaining > 0) {
+		ChaCha20Block(&state, keystream);
+
+		for (i = 0; i < remaining; i++) {
+			data[blocks * CHACHA20_BLOCK_SIZE + i] ^= keystream[i];
+		}
+	}
+
+	// Clear sensitive data
+	MemSet(keystream, 0, CHACHA20_BLOCK_SIZE);
+}
+
+// ============================================================================
+// CHACHA20 IN-PLACE ENCRYPTION WITH OUTPUT
+// ============================================================================
+
+// Encrypt and copy to output buffer
+U0 ChaCha20Encrypt(U8 *key, U8 *nonce, U32 counter, U8 *plaintext, U8 *ciphertext, I64 len)
+{
+	MemCpy(ciphertext, plaintext, len);
+	ChaCha20Crypt(key, nonce, counter, ciphertext, len);
+}
+
+// Decrypt and copy to output buffer
+U0 ChaCha20Decrypt(U8 *key, U8 *nonce, U32 counter, U8 *ciphertext, U8 *plaintext, I64 len)
+{
+	MemCpy(plaintext, ciphertext, len);
+	ChaCha20Crypt(key, nonce, counter, plaintext, len);
+}
+
+// ============================================================================
+// TEST
+// ============================================================================
+
+Bool ChaCha20Test()
+{
+	// RFC 8439 Test Vector
+	U8 key[32] = {
+		0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07,
+		0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f,
+		0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17,
+		0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f
+	};
+	U8 nonce[12] = {
+		0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x4a,
+		0x00, 0x00, 0x00, 0x00
+	};
+	U8 plaintext[64] = {
+		0x4c, 0x61, 0x64, 0x69, 0x65, 0x73, 0x20, 0x61,
+		0x6e, 0x64, 0x20, 0x47, 0x65, 0x6e, 0x74, 0x6c,
+		0x65, 0x6d, 0x65, 0x6e, 0x20, 0x6f, 0x66, 0x20,
+		0x74, 0x68, 0x65, 0x20, 0x63, 0x6c, 0x61, 0x73,
+		0x73, 0x20, 0x6f, 0x66, 0x20, 0x27, 0x39, 0x39,
+		0x3a, 0x20, 0x49, 0x66, 0x20, 0x49, 0x20, 0x63,
+		0x6f, 0x75, 0x6c, 0x64, 0x20, 0x6f, 0x66, 0x66,
+		0x65, 0x72, 0x20, 0x79, 0x6f, 0x75, 0x20, 0x6f
+	};
+	U8 expected[64] = {
+		0x6e, 0x2e, 0x35, 0x9a, 0x25, 0x68, 0xf9, 0x80,
+		0x41, 0xba, 0x07, 0x28, 0xdd, 0x0d, 0x69, 0x81,
+		0xe9, 0x7e, 0x7a, 0xec, 0x1d, 0x43, 0x60, 0xc2,
+		0x0a, 0x27, 0xaf, 0xcc, 0xfd, 0x9f, 0xae, 0x0b,
+		0xf9, 0x1b, 0x65, 0xc5, 0x52, 0x47, 0x33, 0xab,
+		0x8f, 0x59, 0x3d, 0xab, 0xcd, 0x62, 0xb3, 0x57,
+		0x16, 0x39, 0xd6, 0x24, 0xe6, 0x51, 0x52, 0xab,
+		0x8f, 0x53, 0x0c, 0x35, 0x9f, 0x08, 0x61, 0xd8
+	};
+
+	U8 ciphertext[64];
+
+	"ChaCha20 Test... ";
+
+	ChaCha20Encrypt(key, nonce, 1, plaintext, ciphertext, 64);
+
+	if (MemCmp(ciphertext, expected, 64) != 0) {
+		"FAILED\n";
+		return FALSE;
+	}
+
+	// Verify decryption
+	U8 decrypted[64];
+	ChaCha20Decrypt(key, nonce, 1, ciphertext, decrypted, 64);
+
+	if (MemCmp(decrypted, plaintext, 64) != 0) {
+		"FAILED (decryption)\n";
+		return FALSE;
+	}
+
+	"PASSED\n";
+	return TRUE;
+}
+

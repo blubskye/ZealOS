@@ -1,0 +1,568 @@
+// stdlib.h - Standard library functions for ZealOS libc
+
+#ifndef _STDLIB_H
+#define _STDLIB_H
+
+#include "stddef.h"
+
+// Exit status codes
+#define EXIT_SUCCESS    0
+#define EXIT_FAILURE    1
+
+// RAND_MAX
+#define RAND_MAX    0x7FFFFFFF
+
+// ============================================================================
+// MEMORY ALLOCATION
+// ============================================================================
+
+U0 *malloc(size_t size)
+{
+    if (size == 0)
+        return NULL;
+    return MAlloc(size);
+}
+
+U0 *calloc(size_t nmemb, size_t size)
+{
+    size_t total = nmemb * size;
+    if (nmemb != 0 && total / nmemb != size)
+        return NULL;  // Overflow
+    U0 *ptr = MAlloc(total);
+    if (ptr)
+        MemSet(ptr, 0, total);
+    return ptr;
+}
+
+U0 *realloc(U0 *ptr, size_t size)
+{
+    if (!ptr)
+        return malloc(size);
+    if (size == 0) {
+        Free(ptr);
+        return NULL;
+    }
+    return MReAlloc(ptr, size);
+}
+
+U0 free(U0 *ptr)
+{
+    if (ptr)
+        Free(ptr);
+}
+
+// Aligned allocation
+U0 *aligned_alloc(size_t alignment, size_t size)
+{
+    // Simple implementation - allocate extra and align
+    U0 *ptr = MAlloc(size + alignment);
+    if (!ptr)
+        return NULL;
+    U64 addr = (U64)ptr;
+    U64 aligned = (addr + alignment - 1) & ~(alignment - 1);
+    // Store original pointer just before aligned address
+    // (This is a simplified version - proper implementation would be more complex)
+    return aligned(U0 *);
+}
+
+I64 posix_memalign(U0 **memptr, size_t alignment, size_t size)
+{
+    *memptr = aligned_alloc(alignment, size);
+    return *memptr ? 0 : ENOMEM;
+}
+
+// ============================================================================
+// STRING TO NUMBER CONVERSION
+// ============================================================================
+
+I64 atoi(U8 *str)
+{
+    return Str2I64(str);
+}
+
+I64 atol(U8 *str)
+{
+    return Str2I64(str);
+}
+
+I64 atoll(U8 *str)
+{
+    return Str2I64(str);
+}
+
+F64 atof(U8 *str)
+{
+    return Str2F64(str);
+}
+
+I64 strtol(U8 *str, U8 **endptr, I64 base)
+{
+    I64 result = 0;
+    I64 sign = 1;
+    U8 *p = str;
+
+    // Skip whitespace
+    while (*p == ' ' || *p == '\t' || *p == '\n')
+        p++;
+
+    // Handle sign
+    if (*p == '-') {
+        sign = -1;
+        p++;
+    } else if (*p == '+') {
+        p++;
+    }
+
+    // Handle base prefix
+    if (base == 0) {
+        if (*p == '0') {
+            p++;
+            if (*p == 'x' || *p == 'X') {
+                base = 16;
+                p++;
+            } else {
+                base = 8;
+            }
+        } else {
+            base = 10;
+        }
+    } else if (base == 16 && *p == '0' && (p[1] == 'x' || p[1] == 'X')) {
+        p += 2;
+    }
+
+    // Convert digits
+    while (*p) {
+        I64 digit;
+        if (*p >= '0' && *p <= '9')
+            digit = *p - '0';
+        else if (*p >= 'A' && *p <= 'Z')
+            digit = *p - 'A' + 10;
+        else if (*p >= 'a' && *p <= 'z')
+            digit = *p - 'a' + 10;
+        else
+            break;
+
+        if (digit >= base)
+            break;
+
+        result = result * base + digit;
+        p++;
+    }
+
+    if (endptr)
+        *endptr = p;
+
+    return result * sign;
+}
+
+U64 strtoul(U8 *str, U8 **endptr, I64 base)
+{
+    return strtol(str, endptr, base)(U64);
+}
+
+I64 strtoll(U8 *str, U8 **endptr, I64 base)
+{
+    return strtol(str, endptr, base);
+}
+
+U64 strtoull(U8 *str, U8 **endptr, I64 base)
+{
+    return strtol(str, endptr, base)(U64);
+}
+
+F64 strtod(U8 *str, U8 **endptr)
+{
+    F64 result = 0.0;
+    F64 sign = 1.0;
+    U8 *p = str;
+
+    // Skip whitespace
+    while (*p == ' ' || *p == '\t' || *p == '\n')
+        p++;
+
+    // Handle sign
+    if (*p == '-') {
+        sign = -1.0;
+        p++;
+    } else if (*p == '+') {
+        p++;
+    }
+
+    // Integer part
+    while (*p >= '0' && *p <= '9') {
+        result = result * 10.0 + (*p - '0');
+        p++;
+    }
+
+    // Fractional part
+    if (*p == '.') {
+        p++;
+        F64 fraction = 0.1;
+        while (*p >= '0' && *p <= '9') {
+            result += (*p - '0') * fraction;
+            fraction *= 0.1;
+            p++;
+        }
+    }
+
+    // Exponent
+    if (*p == 'e' || *p == 'E') {
+        p++;
+        I64 exp_sign = 1;
+        if (*p == '-') {
+            exp_sign = -1;
+            p++;
+        } else if (*p == '+') {
+            p++;
+        }
+        I64 exponent = 0;
+        while (*p >= '0' && *p <= '9') {
+            exponent = exponent * 10 + (*p - '0');
+            p++;
+        }
+        exponent *= exp_sign;
+        while (exponent > 0) {
+            result *= 10.0;
+            exponent--;
+        }
+        while (exponent < 0) {
+            result *= 0.1;
+            exponent++;
+        }
+    }
+
+    if (endptr)
+        *endptr = p;
+
+    return result * sign;
+}
+
+F64 strtof(U8 *str, U8 **endptr)
+{
+    return strtod(str, endptr);
+}
+
+F64 strtold(U8 *str, U8 **endptr)
+{
+    return strtod(str, endptr);
+}
+
+// ============================================================================
+// RANDOM NUMBERS
+// ============================================================================
+
+static U64 _rand_seed = 1;
+
+I64 rand()
+{
+    _rand_seed = _rand_seed * 1103515245 + 12345;
+    return (_rand_seed >> 16) & RAND_MAX;
+}
+
+U0 srand(U32 seed)
+{
+    _rand_seed = seed;
+}
+
+// rand_r - thread-safe version
+I64 rand_r(U32 *seedp)
+{
+    *seedp = *seedp * 1103515245 + 12345;
+    return (*seedp >> 16) & RAND_MAX;
+}
+
+// ============================================================================
+// ABSOLUTE VALUE
+// ============================================================================
+
+I64 abs(I64 n)
+{
+    return n < 0 ? -n : n;
+}
+
+I64 labs(I64 n)
+{
+    return n < 0 ? -n : n;
+}
+
+I64 llabs(I64 n)
+{
+    return n < 0 ? -n : n;
+}
+
+// ============================================================================
+// DIVISION
+// ============================================================================
+
+class div_t {
+    I64 quot;
+    I64 rem;
+};
+
+class ldiv_t {
+    I64 quot;
+    I64 rem;
+};
+
+class lldiv_t {
+    I64 quot;
+    I64 rem;
+};
+
+div_t div(I64 numer, I64 denom)
+{
+    div_t result;
+    result.quot = numer / denom;
+    result.rem = numer % denom;
+    return result;
+}
+
+ldiv_t ldiv(I64 numer, I64 denom)
+{
+    ldiv_t result;
+    result.quot = numer / denom;
+    result.rem = numer % denom;
+    return result;
+}
+
+lldiv_t lldiv(I64 numer, I64 denom)
+{
+    lldiv_t result;
+    result.quot = numer / denom;
+    result.rem = numer % denom;
+    return result;
+}
+
+// ============================================================================
+// SORTING AND SEARCHING
+// ============================================================================
+
+// Comparison function type
+typedef I64 (*compar_fn)(U0 *, U0 *);
+
+U0 qsort(U0 *base, size_t nmemb, size_t size, compar_fn compar)
+{
+    // Simple bubble sort implementation
+    // TODO: Use actual quicksort for better performance
+    U8 *arr = base;
+    U8 *temp = MAlloc(size);
+    Bool swapped;
+
+    do {
+        swapped = FALSE;
+        for (size_t i = 1; i < nmemb; i++) {
+            U8 *a = arr + (i - 1) * size;
+            U8 *b = arr + i * size;
+            if (compar(a, b) > 0) {
+                MemCpy(temp, a, size);
+                MemCpy(a, b, size);
+                MemCpy(b, temp, size);
+                swapped = TRUE;
+            }
+        }
+    } while (swapped);
+
+    Free(temp);
+}
+
+U0 *bsearch(U0 *key, U0 *base, size_t nmemb, size_t size, compar_fn compar)
+{
+    U8 *arr = base;
+    size_t low = 0, high = nmemb;
+
+    while (low < high) {
+        size_t mid = low + (high - low) / 2;
+        U8 *elem = arr + mid * size;
+        I64 cmp = compar(key, elem);
+        if (cmp == 0)
+            return elem;
+        else if (cmp < 0)
+            high = mid;
+        else
+            low = mid + 1;
+    }
+
+    return NULL;
+}
+
+// ============================================================================
+// ENVIRONMENT
+// ============================================================================
+
+// These use our POSIX layer
+extern U8 *PosixGetEnv(U8 *name);
+extern I64 PosixSetEnv(U8 *name, U8 *value, I64 overwrite);
+extern I64 PosixUnsetEnv(U8 *name);
+
+U8 *getenv(U8 *name)
+{
+    return PosixGetEnv(name);
+}
+
+I64 setenv(U8 *name, U8 *value, I64 overwrite)
+{
+    return PosixSetEnv(name, value, overwrite);
+}
+
+I64 unsetenv(U8 *name)
+{
+    return PosixUnsetEnv(name);
+}
+
+I64 putenv(U8 *string)
+{
+    // Parse "name=value"
+    U8 *eq = strchr(string, '=');
+    if (!eq)
+        return -1;
+
+    U8 name[256];
+    size_t name_len = eq - string;
+    if (name_len >= 256)
+        name_len = 255;
+    MemCpy(name, string, name_len);
+    name[name_len] = 0;
+
+    return setenv(name, eq + 1, 1);
+}
+
+// ============================================================================
+// PROGRAM TERMINATION
+// ============================================================================
+
+// atexit handlers
+#define ATEXIT_MAX 32
+static U0 (*_atexit_handlers[ATEXIT_MAX])();
+static I64 _atexit_count = 0;
+
+I64 atexit(U0 (*function)())
+{
+    if (_atexit_count >= ATEXIT_MAX)
+        return -1;
+    _atexit_handlers[_atexit_count++] = function;
+    return 0;
+}
+
+U0 exit(I64 status)
+{
+    // Call atexit handlers in reverse order
+    while (_atexit_count > 0) {
+        _atexit_count--;
+        if (_atexit_handlers[_atexit_count])
+            _atexit_handlers[_atexit_count]();
+    }
+
+    // TODO: Flush stdio buffers, close files
+
+    // Exit the task
+    throw('EXIT', status);
+}
+
+U0 _exit(I64 status)
+{
+    // Immediate exit without cleanup
+    throw('EXIT', status);
+}
+
+U0 _Exit(I64 status)
+{
+    _exit(status);
+}
+
+U0 abort()
+{
+    // TODO: Raise SIGABRT
+    "Aborted\n";
+    _exit(134);  // 128 + SIGABRT(6)
+}
+
+// ============================================================================
+// SYSTEM COMMAND
+// ============================================================================
+
+extern I64 PosixSystem(U8 *command);
+
+I64 system(U8 *command)
+{
+    if (!command)
+        return 1;  // Shell is available
+    return PosixSystem(command);
+}
+
+// ============================================================================
+// TEMPORARY FILES
+// ============================================================================
+
+static I64 _tmpnam_counter = 0;
+
+U8 *tmpnam(U8 *s)
+{
+    static U8 _tmpnam_buf[64];
+    U8 *buf = s ? s : _tmpnam_buf;
+    StrPrint(buf, "/tmp/tmp%d%d", cnts.jiffies, _tmpnam_counter++);
+    return buf;
+}
+
+I64 mkstemp(U8 *template)
+{
+    // Replace XXXXXX with random characters
+    size_t len = strlen(template);
+    if (len < 6)
+        return -1;
+
+    U8 *p = template + len - 6;
+    for (I64 i = 0; i < 6; i++) {
+        I64 r = rand() % 36;
+        if (r < 10)
+            p[i] = '0' + r;
+        else
+            p[i] = 'a' + r - 10;
+    }
+
+    return PosixOpen(template, O_RDWR | O_CREAT | O_EXCL, 0600);
+}
+
+U8 *mkdtemp(U8 *template)
+{
+    size_t len = strlen(template);
+    if (len < 6)
+        return NULL;
+
+    U8 *p = template + len - 6;
+    for (I64 i = 0; i < 6; i++) {
+        I64 r = rand() % 36;
+        if (r < 10)
+            p[i] = '0' + r;
+        else
+            p[i] = 'a' + r - 10;
+    }
+
+    if (PosixMkdir(template, 0700) < 0)
+        return NULL;
+
+    return template;
+}
+
+// ============================================================================
+// PATH RESOLUTION
+// ============================================================================
+
+U8 *realpath(U8 *path, U8 *resolved_path)
+{
+    // Simplified implementation - doesn't resolve symlinks
+    U8 *result = resolved_path ? resolved_path : MAlloc(PATH_MAX);
+
+    if (path[0] == '/') {
+        StrCpy(result, path);
+    } else {
+        PosixGetcwd(result, PATH_MAX);
+        StrCat(result, "/");
+        StrCat(result, path);
+    }
+
+    // TODO: Normalize path (remove .., ., etc.)
+
+    return result;
+}
+
+#endif // _STDLIB_H

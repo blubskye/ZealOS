@@ -1,0 +1,283 @@
+// Pipe.ZC - POSIX Pipe Implementation for ZealOS
+// Part of ZealOS POSIX compatibility layer
+
+// ============================================================================
+// PIPE CREATION
+// ============================================================================
+
+// Create a pipe
+I64 PosixPipe(I64 *pipefd)
+{
+	return PosixPipe2(pipefd, 0);
+}
+
+// Create a pipe with flags
+I64 PosixPipe2(I64 *pipefd, I64 flags)
+{
+	CPosixProcess *proc = PosixGetCurrent();
+	CPosixPipe *pipe;
+	CPosixFD *read_fdp, *write_fdp;
+	I64 read_fd, write_fd;
+
+	if (!proc)
+		return PosixSetErrno(EINVAL);
+
+	if (!pipefd)
+		return PosixSetErrno(EFAULT);
+
+	// Allocate pipe structure
+	pipe = MAlloc(sizeof(CPosixPipe));
+	MemSet(pipe, 0, sizeof(CPosixPipe));
+
+	pipe->buffer = MAlloc(PIPE_BUFFER_SIZE);
+	pipe->size = PIPE_BUFFER_SIZE;
+	pipe->read_pos = 0;
+	pipe->write_pos = 0;
+	pipe->count = 0;
+	pipe->read_closed = FALSE;
+	pipe->write_closed = FALSE;
+	pipe->readers = 1;
+	pipe->writers = 1;
+
+	// Allocate file descriptors
+	read_fd = PosixFDAlloc(proc);
+	if (read_fd < 0) {
+		Free(pipe->buffer);
+		Free(pipe);
+		return -1;
+	}
+
+	write_fd = PosixFDAlloc(proc);
+	if (write_fd < 0) {
+		PosixFDFree(proc, read_fd);
+		Free(pipe->buffer);
+		Free(pipe);
+		return -1;
+	}
+
+	// Set up read end
+	read_fdp = proc->fd_table[read_fd];
+	read_fdp->type = FD_TYPE_PIPE;
+	read_fdp->flags = O_RDONLY;
+	read_fdp->pipe = pipe;
+	read_fdp->is_read_end = TRUE;
+
+	if (flags & O_CLOEXEC)
+		read_fdp->fd_flags |= FD_CLOEXEC;
+	if (flags & O_NONBLOCK)
+		read_fdp->flags |= O_NONBLOCK;
+
+	// Set up write end
+	write_fdp = proc->fd_table[write_fd];
+	write_fdp->type = FD_TYPE_PIPE;
+	write_fdp->flags = O_WRONLY;
+	write_fdp->pipe = pipe;
+	write_fdp->is_read_end = FALSE;
+
+	if (flags & O_CLOEXEC)
+		write_fdp->fd_flags |= FD_CLOEXEC;
+	if (flags & O_NONBLOCK)
+		write_fdp->flags |= O_NONBLOCK;
+
+	pipefd[0] = read_fd;
+	pipefd[1] = write_fd;
+
+	return 0;
+}
+
+// ============================================================================
+// PIPE I/O
+// ============================================================================
+
+// Read from pipe
+I64 PosixPipeRead(CPosixFD *fdp, U8 *buf, I64 count)
+{
+	CPosixPipe *pipe;
+	I64 available, to_read, total_read;
+
+	if (!fdp || !fdp->pipe)
+		return PosixSetErrno(EINVAL);
+
+	if (!buf)
+		return PosixSetErrno(EFAULT);
+
+	pipe = fdp->pipe;
+
+	// Check if this is the read end
+	if (!fdp->is_read_end)
+		return PosixSetErrno(EBADF);
+
+	total_read = 0;
+
+	while (total_read < count) {
+		available = pipe->count;
+
+		if (available == 0) {
+			// No data available
+			if (pipe->write_closed) {
+				// EOF - write end closed
+				break;
+			}
+
+			if (fdp->flags & O_NONBLOCK) {
+				if (total_read > 0)
+					break;
+				return PosixSetErrno(EAGAIN);
+			}
+
+			// Block until data available
+			// In ZealOS, we yield and retry
+			Yield;
+			continue;
+		}
+
+		// Calculate how much we can read
+		to_read = count - total_read;
+		if (to_read > available)
+			to_read = available;
+
+		// Read from circular buffer
+		I64 first_chunk = pipe->size - pipe->read_pos;
+		if (first_chunk > to_read)
+			first_chunk = to_read;
+
+		MemCpy(&buf[total_read], &pipe->buffer[pipe->read_pos], first_chunk);
+		pipe->read_pos = (pipe->read_pos + first_chunk) % pipe->size;
+		pipe->count -= first_chunk;
+		total_read += first_chunk;
+
+		// Handle wrap-around
+		if (first_chunk < to_read) {
+			I64 second_chunk = to_read - first_chunk;
+			MemCpy(&buf[total_read], &pipe->buffer[0], second_chunk);
+			pipe->read_pos = second_chunk;
+			pipe->count -= second_chunk;
+			total_read += second_chunk;
+		}
+	}
+
+	return total_read;
+}
+
+// Write to pipe
+I64 PosixPipeWrite(CPosixFD *fdp, U8 *buf, I64 count)
+{
+	CPosixPipe *pipe;
+	I64 space, to_write, total_written;
+
+	if (!fdp || !fdp->pipe)
+		return PosixSetErrno(EINVAL);
+
+	if (!buf && count > 0)
+		return PosixSetErrno(EFAULT);
+
+	pipe = fdp->pipe;
+
+	// Check if this is the write end
+	if (fdp->is_read_end)
+		return PosixSetErrno(EBADF);
+
+	// Check if read end is closed
+	if (pipe->read_closed) {
+		// SIGPIPE would be sent here
+		// For now, just return error
+		return PosixSetErrno(EPIPE);
+	}
+
+	total_written = 0;
+
+	while (total_written < count) {
+		space = pipe->size - pipe->count;
+
+		if (space == 0) {
+			// Buffer full
+			if (fdp->flags & O_NONBLOCK) {
+				if (total_written > 0)
+					break;
+				return PosixSetErrno(EAGAIN);
+			}
+
+			// Check if read end closed while waiting
+			if (pipe->read_closed)
+				return PosixSetErrno(EPIPE);
+
+			// Block until space available
+			Yield;
+			continue;
+		}
+
+		// Calculate how much we can write
+		to_write = count - total_written;
+		if (to_write > space)
+			to_write = space;
+
+		// For atomic writes <= PIPE_BUF, write all at once
+		if (count <= POSIX_PIPE_BUF && to_write < count - total_written) {
+			if (fdp->flags & O_NONBLOCK) {
+				if (total_written > 0)
+					break;
+				return PosixSetErrno(EAGAIN);
+			}
+			Yield;
+			continue;
+		}
+
+		// Write to circular buffer
+		I64 first_chunk = pipe->size - pipe->write_pos;
+		if (first_chunk > to_write)
+			first_chunk = to_write;
+
+		MemCpy(&pipe->buffer[pipe->write_pos], &buf[total_written], first_chunk);
+		pipe->write_pos = (pipe->write_pos + first_chunk) % pipe->size;
+		pipe->count += first_chunk;
+		total_written += first_chunk;
+
+		// Handle wrap-around
+		if (first_chunk < to_write) {
+			I64 second_chunk = to_write - first_chunk;
+			MemCpy(&pipe->buffer[0], &buf[total_written], second_chunk);
+			pipe->write_pos = second_chunk;
+			pipe->count += second_chunk;
+			total_written += second_chunk;
+		}
+	}
+
+	return total_written;
+}
+
+// ============================================================================
+// PIPE UTILITIES
+// ============================================================================
+
+// Check if pipe has data available
+Bool PosixPipeHasData(CPosixPipe *pipe)
+{
+	if (!pipe)
+		return FALSE;
+	return pipe->count > 0;
+}
+
+// Check if pipe has space for writing
+Bool PosixPipeHasSpace(CPosixPipe *pipe)
+{
+	if (!pipe)
+		return FALSE;
+	return pipe->count < pipe->size;
+}
+
+// Get number of bytes in pipe
+I64 PosixPipeAvailable(CPosixPipe *pipe)
+{
+	if (!pipe)
+		return 0;
+	return pipe->count;
+}
+
+// Get free space in pipe
+I64 PosixPipeSpace(CPosixPipe *pipe)
+{
+	if (!pipe)
+		return 0;
+	return pipe->size - pipe->count;
+}
+

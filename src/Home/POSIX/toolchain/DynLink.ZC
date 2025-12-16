@@ -1,0 +1,1415 @@
+// DynLink.ZC - ELF Dynamic Linker for ZealOS
+// Part of the POSIX compatibility layer
+//
+// Implements runtime dynamic linking (ld-linux.so equivalent)
+// Supports loading shared libraries and symbol resolution.
+
+#include "ELF.HH"
+#include "DynLink.HH"
+
+// ============================================================================
+// GLOBAL STATE
+// ============================================================================
+
+static CDynLinker *g_dynlink = NULL;
+
+// ============================================================================
+// INITIALIZATION
+// ============================================================================
+
+CDynLinker *DynLinkInit()
+{
+    if (g_dynlink)
+        return g_dynlink;
+
+    g_dynlink = MAlloc(sizeof(CDynLinker));
+    MemSet(g_dynlink, 0, sizeof(CDynLinker));
+
+    // Set up default search paths
+    g_dynlink->search_paths[0] = StrNew("/Home/POSIX/lib");
+    g_dynlink->search_paths[1] = StrNew("/Home/POSIX/usr/lib");
+    g_dynlink->search_paths[2] = StrNew("/Home/POSIX/lib64");
+    g_dynlink->search_paths[3] = StrNew("/Home/POSIX/usr/lib64");
+    g_dynlink->path_count = 4;
+
+    return g_dynlink;
+}
+
+// ============================================================================
+// ERROR HANDLING
+// ============================================================================
+
+U0 DynLinkSetError(CDynLinker *dl, U8 *fmt, ...)
+{
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(dl->error, sizeof(dl->error), fmt, ap);
+    va_end(ap);
+    dl->has_error = TRUE;
+}
+
+U8 *dlerror()
+{
+    if (!g_dynlink || !g_dynlink->has_error)
+        return NULL;
+
+    g_dynlink->has_error = FALSE;
+    return g_dynlink->error;
+}
+
+// ============================================================================
+// SYMBOL HASH FUNCTIONS
+// ============================================================================
+
+// ELF hash function (SYSV style)
+U32 ELFHash(U8 *name)
+{
+    U32 h = 0, g;
+
+    while (*name) {
+        h = (h << 4) + *name++;
+        g = h & 0xF0000000;
+        if (g)
+            h ^= g >> 24;
+        h &= ~g;
+    }
+
+    return h;
+}
+
+// GNU hash function (faster)
+U32 GNUHash(U8 *name)
+{
+    U32 h = 5381;
+
+    while (*name)
+        h = (h << 5) + h + *name++;
+
+    return h;
+}
+
+// Simple hash for our symbol table
+U32 DynSymHash(U8 *name)
+{
+    return GNUHash(name) % DL_HASH_SIZE;
+}
+
+// ============================================================================
+// LIBRARY SEARCH
+// ============================================================================
+
+U8 *DynFindLibrary(CDynLinker *dl, U8 *name)
+{
+    static U8 path_buf[DL_MAX_PATH];
+
+    // If absolute path, use directly
+    if (name[0] == '/') {
+        if (FileFind(name))
+            return StrNew(name);
+        return NULL;
+    }
+
+    // Check LD_LIBRARY_PATH environment variable
+    CPosixProcess *proc = PosixGetCurrent();
+    if (proc) {
+        U8 *ld_path = getenv("LD_LIBRARY_PATH");
+        if (ld_path) {
+            U8 *path_copy = StrNew(ld_path);
+            U8 *token = strtok(path_copy, ":");
+            while (token) {
+                snprintf(path_buf, DL_MAX_PATH, "%s/%s", token, name);
+                if (FileFind(path_buf)) {
+                    Free(path_copy);
+                    return StrNew(path_buf);
+                }
+                token = strtok(NULL, ":");
+            }
+            Free(path_copy);
+        }
+    }
+
+    // Search in configured paths
+    for (I64 i = 0; i < dl->path_count; i++) {
+        snprintf(path_buf, DL_MAX_PATH, "%s/%s", dl->search_paths[i], name);
+        if (FileFind(path_buf))
+            return StrNew(path_buf);
+    }
+
+    // Not found
+    return NULL;
+}
+
+// ============================================================================
+// LIBRARY LOADING
+// ============================================================================
+
+CDynLib *DynLoadFile(CDynLinker *dl, U8 *path)
+{
+    CDynLib *lib = MAlloc(sizeof(CDynLib));
+    if (!lib) {
+        DynLinkSetError(dl, "Out of memory");
+        return NULL;
+    }
+
+    MemSet(lib, 0, sizeof(CDynLib));
+    lib->path = StrNew(path);
+
+    // Read file
+    FILE *fp = fopen(path, "rb");
+    if (!fp) {
+        DynLinkSetError(dl, "Cannot open %s", path);
+        Free(lib->path);
+        Free(lib);
+        return NULL;
+    }
+
+    fseek(fp, 0, SEEK_END);
+    lib->file_size = ftell(fp);
+    fseek(fp, 0, SEEK_SET);
+
+    lib->file_data = MAlloc(lib->file_size);
+    if (!lib->file_data) {
+        DynLinkSetError(dl, "Out of memory reading %s", path);
+        fclose(fp);
+        Free(lib->path);
+        Free(lib);
+        return NULL;
+    }
+
+    if (fread(lib->file_data, 1, lib->file_size, fp) != lib->file_size) {
+        DynLinkSetError(dl, "Read error: %s", path);
+        fclose(fp);
+        Free(lib->file_data);
+        Free(lib->path);
+        Free(lib);
+        return NULL;
+    }
+    fclose(fp);
+
+    // Validate ELF header
+    lib->ehdr = (Elf64_Ehdr*)lib->file_data;
+
+    if (lib->ehdr->e_ident[EI_MAG0] != ELFMAG0 ||
+        lib->ehdr->e_ident[EI_MAG1] != ELFMAG1 ||
+        lib->ehdr->e_ident[EI_MAG2] != ELFMAG2 ||
+        lib->ehdr->e_ident[EI_MAG3] != ELFMAG3) {
+        DynLinkSetError(dl, "Not an ELF file: %s", path);
+        Free(lib->file_data);
+        Free(lib->path);
+        Free(lib);
+        return NULL;
+    }
+
+    if (lib->ehdr->e_ident[EI_CLASS] != ELFCLASS64) {
+        DynLinkSetError(dl, "Not 64-bit ELF: %s", path);
+        Free(lib->file_data);
+        Free(lib->path);
+        Free(lib);
+        return NULL;
+    }
+
+    if (lib->ehdr->e_machine != EM_X86_64) {
+        DynLinkSetError(dl, "Not x86-64: %s", path);
+        Free(lib->file_data);
+        Free(lib->path);
+        Free(lib);
+        return NULL;
+    }
+
+    if (lib->ehdr->e_type != ET_DYN && lib->ehdr->e_type != ET_EXEC) {
+        DynLinkSetError(dl, "Not executable or shared object: %s", path);
+        Free(lib->file_data);
+        Free(lib->path);
+        Free(lib);
+        return NULL;
+    }
+
+    lib->phdrs = (Elf64_Phdr*)(lib->file_data + lib->ehdr->e_phoff);
+
+    return lib;
+}
+
+// ============================================================================
+// MEMORY MAPPING
+// ============================================================================
+
+I64 DynMapLibrary(CDynLinker *dl, CDynLib *lib)
+{
+    // Calculate memory range needed
+    lib->min_vaddr = 0xFFFFFFFFFFFFFFFF;
+    lib->max_vaddr = 0;
+
+    for (I64 i = 0; i < lib->ehdr->e_phnum; i++) {
+        Elf64_Phdr *phdr = &lib->phdrs[i];
+
+        if (phdr->p_type == PT_LOAD) {
+            U64 seg_start = phdr->p_vaddr;
+            U64 seg_end = phdr->p_vaddr + phdr->p_memsz;
+
+            if (seg_start < lib->min_vaddr)
+                lib->min_vaddr = seg_start;
+            if (seg_end > lib->max_vaddr)
+                lib->max_vaddr = seg_end;
+        }
+    }
+
+    if (lib->max_vaddr <= lib->min_vaddr) {
+        DynLinkSetError(dl, "No loadable segments in %s", lib->path);
+        return -1;
+    }
+
+    // Allocate memory
+    lib->load_size = lib->max_vaddr - lib->min_vaddr;
+    lib->base_addr = MAlloc(lib->load_size);
+
+    if (!lib->base_addr) {
+        DynLinkSetError(dl, "Out of memory mapping %s", lib->path);
+        return -1;
+    }
+
+    MemSet(lib->base_addr, 0, lib->load_size);
+
+    // Load segments
+    for (I64 i = 0; i < lib->ehdr->e_phnum; i++) {
+        Elf64_Phdr *phdr = &lib->phdrs[i];
+
+        if (phdr->p_type == PT_LOAD) {
+            U8 *dest = lib->base_addr + (phdr->p_vaddr - lib->min_vaddr);
+
+            if (phdr->p_filesz > 0) {
+                MemCpy(dest, lib->file_data + phdr->p_offset, phdr->p_filesz);
+            }
+        }
+        else if (phdr->p_type == PT_DYNAMIC) {
+            // Find dynamic section
+            lib->dynamic = (Elf64_Dyn*)(lib->base_addr +
+                                        (phdr->p_vaddr - lib->min_vaddr));
+            lib->dyn_count = phdr->p_memsz / sizeof(Elf64_Dyn);
+        }
+    }
+
+    if (dl->verbose)
+        printf("DynLink: Mapped %s at 0x%016X (%d bytes)\n",
+               lib->path, lib->base_addr, lib->load_size);
+
+    return 0;
+}
+
+// ============================================================================
+// PARSE DYNAMIC SECTION
+// ============================================================================
+
+I64 DynParseDynamic(CDynLinker *dl, CDynLib *lib)
+{
+    if (!lib->dynamic) {
+        // No dynamic section - might be a static executable
+        return 0;
+    }
+
+    U8 *base = lib->base_addr - lib->min_vaddr;
+
+    for (Elf64_Dyn *dyn = lib->dynamic; dyn->d_tag != DT_NULL; dyn++) {
+        switch (dyn->d_tag) {
+            case DT_NEEDED:
+                // Record needed library name (will resolve later)
+                if (lib->needed_count < DL_MAX_LIBS)
+                    lib->needed[lib->needed_count++] = (U8*)(dyn->d_un.d_val);
+                break;
+
+            case DT_STRTAB:
+                lib->dyn.strtab = base + dyn->d_un.d_ptr;
+                break;
+
+            case DT_STRSZ:
+                lib->dyn.strsz = dyn->d_un.d_val;
+                break;
+
+            case DT_SYMTAB:
+                lib->dyn.symtab = base + dyn->d_un.d_ptr;
+                break;
+
+            case DT_SYMENT:
+                lib->dyn.syment = dyn->d_un.d_val;
+                break;
+
+            case DT_HASH:
+                lib->dyn.hash = base + dyn->d_un.d_ptr;
+                break;
+
+            case DT_GNU_HASH:
+                lib->dyn.gnu_hash = base + dyn->d_un.d_ptr;
+                break;
+
+            case DT_RELA:
+                lib->dyn.rela = base + dyn->d_un.d_ptr;
+                break;
+
+            case DT_RELASZ:
+                lib->dyn.relasz = dyn->d_un.d_val;
+                break;
+
+            case DT_RELAENT:
+                lib->dyn.relaent = dyn->d_un.d_val;
+                break;
+
+            case DT_REL:
+                lib->dyn.rel = base + dyn->d_un.d_ptr;
+                break;
+
+            case DT_RELSZ:
+                lib->dyn.relsz = dyn->d_un.d_val;
+                break;
+
+            case DT_RELENT:
+                lib->dyn.relent = dyn->d_un.d_val;
+                break;
+
+            case DT_JMPREL:
+                lib->dyn.jmprel = base + dyn->d_un.d_ptr;
+                break;
+
+            case DT_PLTRELSZ:
+                lib->dyn.pltrelsz = dyn->d_un.d_val;
+                break;
+
+            case DT_PLTREL:
+                lib->dyn.pltrel = dyn->d_un.d_val;
+                break;
+
+            case DT_PLTGOT:
+                lib->dyn.pltgot = base + dyn->d_un.d_ptr;
+                break;
+
+            case DT_INIT:
+                lib->dyn.init = dyn->d_un.d_ptr;
+                break;
+
+            case DT_FINI:
+                lib->dyn.fini = dyn->d_un.d_ptr;
+                break;
+
+            case DT_INIT_ARRAY:
+                lib->dyn.init_array = dyn->d_un.d_ptr;
+                break;
+
+            case DT_INIT_ARRAYSZ:
+                lib->dyn.init_arraysz = dyn->d_un.d_val;
+                break;
+
+            case DT_FINI_ARRAY:
+                lib->dyn.fini_array = dyn->d_un.d_ptr;
+                break;
+
+            case DT_FINI_ARRAYSZ:
+                lib->dyn.fini_arraysz = dyn->d_un.d_val;
+                break;
+
+            case DT_SONAME:
+                // Will resolve after strtab is known
+                break;
+        }
+    }
+
+    // Second pass: resolve NEEDED and SONAME strings
+    for (Elf64_Dyn *dyn = lib->dynamic; dyn->d_tag != DT_NULL; dyn++) {
+        if (dyn->d_tag == DT_SONAME && lib->dyn.strtab) {
+            lib->soname = StrNew(lib->dyn.strtab + dyn->d_un.d_val);
+        }
+    }
+
+    // Resolve NEEDED library names
+    for (I64 i = 0; i < lib->needed_count; i++) {
+        if (lib->dyn.strtab) {
+            U64 offset = (U64)lib->needed[i];
+            lib->needed[i] = StrNew(lib->dyn.strtab + offset);
+        }
+    }
+
+    if (dl->verbose) {
+        printf("DynLink: Parsed dynamic section for %s\n", lib->path);
+        if (lib->soname)
+            printf("  SONAME: %s\n", lib->soname);
+        printf("  Dependencies: %d\n", lib->needed_count);
+        for (I64 i = 0; i < lib->needed_count; i++)
+            printf("    - %s\n", lib->needed[i]);
+    }
+
+    return 0;
+}
+
+// ============================================================================
+// SYMBOL LOOKUP
+// ============================================================================
+
+// Lookup symbol in a specific library using SYSV hash
+Elf64_Sym *DynLookupSymSYSV(CDynLib *lib, U8 *name, U32 hash)
+{
+    if (!lib->dyn.hash || !lib->dyn.symtab || !lib->dyn.strtab)
+        return NULL;
+
+    U32 *hashtab = (U32*)lib->dyn.hash;
+    U32 nbucket = hashtab[0];
+    U32 nchain = hashtab[1];
+    U32 *bucket = &hashtab[2];
+    U32 *chain = &bucket[nbucket];
+
+    U32 idx = bucket[hash % nbucket];
+
+    while (idx != 0) {
+        Elf64_Sym *sym = (Elf64_Sym*)(lib->dyn.symtab + idx * lib->dyn.syment);
+        U8 *sym_name = lib->dyn.strtab + sym->st_name;
+
+        if (StrCmp(sym_name, name) == 0) {
+            // Found - check if defined
+            if (sym->st_shndx != SHN_UNDEF)
+                return sym;
+        }
+
+        if (idx >= nchain)
+            break;
+        idx = chain[idx];
+    }
+
+    return NULL;
+}
+
+// Lookup symbol in a specific library using GNU hash
+Elf64_Sym *DynLookupSymGNU(CDynLib *lib, U8 *name, U32 hash)
+{
+    if (!lib->dyn.gnu_hash || !lib->dyn.symtab || !lib->dyn.strtab)
+        return NULL;
+
+    U32 *hashtab = (U32*)lib->dyn.gnu_hash;
+    U32 nbuckets = hashtab[0];
+    U32 symoffset = hashtab[1];
+    U32 bloom_size = hashtab[2];
+    U32 bloom_shift = hashtab[3];
+
+    U64 *bloom = (U64*)&hashtab[4];
+    U32 *buckets = (U32*)&bloom[bloom_size];
+    U32 *chains = &buckets[nbuckets];
+
+    // Bloom filter check
+    U64 bloom_word = bloom[(hash / 64) % bloom_size];
+    U64 mask = (1ULL << (hash % 64)) | (1ULL << ((hash >> bloom_shift) % 64));
+    if ((bloom_word & mask) != mask)
+        return NULL;
+
+    // Bucket lookup
+    U32 idx = buckets[hash % nbuckets];
+    if (idx < symoffset)
+        return NULL;
+
+    // Chain walk
+    while (TRUE) {
+        Elf64_Sym *sym = (Elf64_Sym*)(lib->dyn.symtab +
+                                       idx * lib->dyn.syment);
+        U8 *sym_name = lib->dyn.strtab + sym->st_name;
+        U32 chain_hash = chains[idx - symoffset];
+
+        // Check hash and name
+        if ((hash | 1) == (chain_hash | 1) && StrCmp(sym_name, name) == 0) {
+            if (sym->st_shndx != SHN_UNDEF)
+                return sym;
+        }
+
+        // End of chain?
+        if (chain_hash & 1)
+            break;
+
+        idx++;
+    }
+
+    return NULL;
+}
+
+// Lookup symbol in a specific library
+Elf64_Sym *DynLookupSymInLib(CDynLib *lib, U8 *name)
+{
+    U32 sysv_hash = ELFHash(name);
+    U32 gnu_hash = GNUHash(name);
+
+    // Try GNU hash first (faster)
+    if (lib->dyn.gnu_hash) {
+        Elf64_Sym *sym = DynLookupSymGNU(lib, name, gnu_hash);
+        if (sym)
+            return sym;
+    }
+
+    // Fall back to SYSV hash
+    if (lib->dyn.hash) {
+        return DynLookupSymSYSV(lib, name, sysv_hash);
+    }
+
+    // Linear search as last resort
+    if (lib->dyn.symtab && lib->dyn.strtab) {
+        // Need to know symbol count - use hash table nchain
+        if (lib->dyn.hash) {
+            U32 *hashtab = (U32*)lib->dyn.hash;
+            U32 nchain = hashtab[1];
+
+            for (U32 i = 0; i < nchain; i++) {
+                Elf64_Sym *sym = (Elf64_Sym*)(lib->dyn.symtab +
+                                              i * lib->dyn.syment);
+                if (sym->st_name == 0)
+                    continue;
+
+                U8 *sym_name = lib->dyn.strtab + sym->st_name;
+                if (StrCmp(sym_name, name) == 0 && sym->st_shndx != SHN_UNDEF)
+                    return sym;
+            }
+        }
+    }
+
+    return NULL;
+}
+
+// Lookup symbol globally
+U64 DynLookupSymbol(CDynLinker *dl, U8 *name, CDynLib *exclude)
+{
+    // First check our global symbol table
+    U32 hash = DynSymHash(name);
+    CDynSymbol *gsym = dl->symtab[hash];
+    while (gsym) {
+        if (StrCmp(gsym->name, name) == 0)
+            return gsym->addr;
+        gsym = gsym->next;
+    }
+
+    // Search loaded libraries in order
+    for (CDynLib *lib = dl->load_head; lib; lib = lib->next) {
+        if (lib == exclude)
+            continue;
+
+        Elf64_Sym *sym = DynLookupSymInLib(lib, name);
+        if (sym) {
+            return (lib->base_addr - lib->min_vaddr) + sym->st_value;
+        }
+    }
+
+    // Check if symbol is provided by ZealOS POSIX layer
+    U64 zealos_sym = DynLookupZealOS(name);
+    if (zealos_sym)
+        return zealos_sym;
+
+    return 0;
+}
+
+// ============================================================================
+// ZEALOS SYMBOL PROVIDER
+// ============================================================================
+
+// Map of symbols provided by ZealOS POSIX layer
+typedef struct {
+    U8 *name;
+    U64 addr;
+} CDynZealOSSym;
+
+// This table maps libc/libpthread/etc symbols to ZealOS implementations
+static CDynZealOSSym g_zealos_symbols[] = {
+    // stdio
+    {"printf",      (U64)&printf},
+    {"fprintf",     (U64)&fprintf},
+    {"sprintf",     (U64)&sprintf},
+    {"snprintf",    (U64)&snprintf},
+    {"puts",        (U64)&puts},
+    {"putchar",     (U64)&putchar},
+    {"fopen",       (U64)&fopen},
+    {"fclose",      (U64)&fclose},
+    {"fread",       (U64)&fread},
+    {"fwrite",      (U64)&fwrite},
+    {"fgets",       (U64)&fgets},
+    {"fputs",       (U64)&fputs},
+    {"fflush",      (U64)&fflush},
+    {"fseek",       (U64)&fseek},
+    {"ftell",       (U64)&ftell},
+    {"feof",        (U64)&feof},
+    {"ferror",      (U64)&ferror},
+
+    // stdlib
+    {"malloc",      (U64)&malloc},
+    {"free",        (U64)&free},
+    {"realloc",     (U64)&realloc},
+    {"calloc",      (U64)&calloc},
+    {"exit",        (U64)&exit},
+    {"abort",       (U64)&abort},
+    {"atoi",        (U64)&atoi},
+    {"atol",        (U64)&atol},
+    {"strtol",      (U64)&strtol},
+    {"strtoul",     (U64)&strtoul},
+    {"getenv",      (U64)&getenv},
+    {"setenv",      (U64)&setenv},
+    {"atexit",      (U64)&atexit},
+    {"qsort",       (U64)&qsort},
+    {"bsearch",     (U64)&bsearch},
+
+    // string
+    {"strlen",      (U64)&strlen},
+    {"strcpy",      (U64)&strcpy},
+    {"strncpy",     (U64)&strncpy},
+    {"strcat",      (U64)&strcat},
+    {"strncat",     (U64)&strncat},
+    {"strcmp",      (U64)&strcmp},
+    {"strncmp",     (U64)&strncmp},
+    {"strchr",      (U64)&strchr},
+    {"strrchr",     (U64)&strrchr},
+    {"strstr",      (U64)&strstr},
+    {"strdup",      (U64)&strdup},
+    {"strtok",      (U64)&strtok},
+    {"memcpy",      (U64)&memcpy},
+    {"memmove",     (U64)&memmove},
+    {"memset",      (U64)&memset},
+    {"memcmp",      (U64)&memcmp},
+
+    // ctype
+    {"isalpha",     (U64)&isalpha},
+    {"isdigit",     (U64)&isdigit},
+    {"isalnum",     (U64)&isalnum},
+    {"isspace",     (U64)&isspace},
+    {"isupper",     (U64)&isupper},
+    {"islower",     (U64)&islower},
+    {"toupper",     (U64)&toupper},
+    {"tolower",     (U64)&tolower},
+
+    // unistd
+    {"read",        (U64)&read},
+    {"write",       (U64)&write},
+    {"open",        (U64)&open},
+    {"close",       (U64)&close},
+    {"lseek",       (U64)&lseek},
+    {"fork",        (U64)&fork},
+    {"execve",      (U64)&execve},
+    {"getpid",      (U64)&getpid},
+    {"getppid",     (U64)&getppid},
+    {"getuid",      (U64)&getuid},
+    {"getgid",      (U64)&getgid},
+    {"getcwd",      (U64)&getcwd},
+    {"chdir",       (U64)&chdir},
+    {"sleep",       (U64)&sleep},
+    {"usleep",      (U64)&usleep},
+    {"access",      (U64)&access},
+    {"unlink",      (U64)&unlink},
+    {"rmdir",       (U64)&rmdir},
+    {"pipe",        (U64)&pipe},
+    {"dup",         (U64)&dup},
+    {"dup2",        (U64)&dup2},
+    {"isatty",      (U64)&isatty},
+
+    // time
+    {"time",        (U64)&time},
+    {"gettimeofday",(U64)&gettimeofday},
+    {"localtime",   (U64)&localtime},
+    {"gmtime",      (U64)&gmtime},
+    {"strftime",    (U64)&strftime},
+    {"mktime",      (U64)&mktime},
+
+    // math
+    {"sin",         (U64)&sin},
+    {"cos",         (U64)&cos},
+    {"tan",         (U64)&tan},
+    {"sqrt",        (U64)&sqrt},
+    {"pow",         (U64)&pow},
+    {"log",         (U64)&log},
+    {"log10",       (U64)&log10},
+    {"exp",         (U64)&exp},
+    {"floor",       (U64)&floor},
+    {"ceil",        (U64)&ceil},
+    {"fabs",        (U64)&fabs},
+
+    // network
+    {"socket",      (U64)&socket},
+    {"connect",     (U64)&connect},
+    {"bind",        (U64)&bind},
+    {"listen",      (U64)&listen},
+    {"accept",      (U64)&accept},
+    {"send",        (U64)&send},
+    {"recv",        (U64)&recv},
+    {"sendto",      (U64)&sendto},
+    {"recvfrom",    (U64)&recvfrom},
+    {"getaddrinfo", (U64)&getaddrinfo},
+    {"freeaddrinfo",(U64)&freeaddrinfo},
+    {"gethostbyname",(U64)&gethostbyname},
+
+    // pthread
+    {"pthread_create",      (U64)&pthread_create},
+    {"pthread_join",        (U64)&pthread_join},
+    {"pthread_exit",        (U64)&pthread_exit},
+    {"pthread_mutex_init",  (U64)&pthread_mutex_init},
+    {"pthread_mutex_lock",  (U64)&pthread_mutex_lock},
+    {"pthread_mutex_unlock",(U64)&pthread_mutex_unlock},
+    {"pthread_cond_init",   (U64)&pthread_cond_init},
+    {"pthread_cond_wait",   (U64)&pthread_cond_wait},
+    {"pthread_cond_signal", (U64)&pthread_cond_signal},
+
+    // mmap
+    {"mmap",        (U64)&mmap},
+    {"munmap",      (U64)&munmap},
+    {"mprotect",    (U64)&mprotect},
+
+    // poll/select
+    {"poll",        (U64)&poll},
+    {"select",      (U64)&select},
+
+    // signal
+    {"signal",      (U64)&signal},
+    {"sigaction",   (U64)&sigaction},
+    {"raise",       (U64)&raise},
+
+    // C++ ABI
+    {"__cxa_atexit",        (U64)&__cxa_atexit},
+    {"__cxa_finalize",      (U64)&__cxa_finalize},
+    {"__cxa_guard_acquire", (U64)&__cxa_guard_acquire},
+    {"__cxa_guard_release", (U64)&__cxa_guard_release},
+    {"__cxa_guard_abort",   (U64)&__cxa_guard_abort},
+    {"__cxa_throw",         (U64)&__cxa_throw},
+    {"__cxa_begin_catch",   (U64)&__cxa_begin_catch},
+    {"__cxa_end_catch",     (U64)&__cxa_end_catch},
+    {"__cxa_allocate_exception", (U64)&__cxa_allocate_exception},
+    {"__cxa_free_exception",(U64)&__cxa_free_exception},
+    {"__cxa_pure_virtual",  (U64)&__cxa_pure_virtual},
+    {"__gxx_personality_v0",(U64)&__gxx_personality_v0},
+
+    // C++ new/delete
+    {"_Znwm",       (U64)&_Znwm},       // operator new
+    {"_Znam",       (U64)&_Znam},       // operator new[]
+    {"_ZdlPv",      (U64)&_ZdlPv},      // operator delete
+    {"_ZdaPv",      (U64)&_ZdaPv},      // operator delete[]
+
+    // Unwind
+    {"_Unwind_RaiseException", (U64)&_Unwind_RaiseException},
+    {"_Unwind_Resume",         (U64)&_Unwind_Resume},
+    {"_Unwind_GetGR",          (U64)&_Unwind_GetGR},
+    {"_Unwind_SetGR",          (U64)&_Unwind_SetGR},
+    {"_Unwind_GetIP",          (U64)&_Unwind_GetIP},
+    {"_Unwind_SetIP",          (U64)&_Unwind_SetIP},
+
+    // Terminator
+    {NULL, 0}
+};
+
+U64 DynLookupZealOS(U8 *name)
+{
+    for (I64 i = 0; g_zealos_symbols[i].name; i++) {
+        if (StrCmp(g_zealos_symbols[i].name, name) == 0)
+            return g_zealos_symbols[i].addr;
+    }
+    return 0;
+}
+
+// ============================================================================
+// RELOCATIONS
+// ============================================================================
+
+I64 DynApplyRelocations(CDynLinker *dl, CDynLib *lib)
+{
+    U8 *base = lib->base_addr - lib->min_vaddr;
+
+    // Apply RELA relocations
+    if (lib->dyn.rela && lib->dyn.relasz) {
+        I64 count = lib->dyn.relasz / sizeof(Elf64_Rela);
+        Elf64_Rela *rela = (Elf64_Rela*)lib->dyn.rela;
+
+        for (I64 i = 0; i < count; i++) {
+            if (DynApplyRela(dl, lib, &rela[i]) < 0)
+                return -1;
+        }
+    }
+
+    // Apply REL relocations
+    if (lib->dyn.rel && lib->dyn.relsz) {
+        I64 count = lib->dyn.relsz / sizeof(Elf64_Rel);
+        Elf64_Rel *rel = (Elf64_Rel*)lib->dyn.rel;
+
+        for (I64 i = 0; i < count; i++) {
+            Elf64_Rela rela;
+            rela.r_offset = rel[i].r_offset;
+            rela.r_info = rel[i].r_info;
+            rela.r_addend = 0;
+
+            if (DynApplyRela(dl, lib, &rela) < 0)
+                return -1;
+        }
+    }
+
+    // Apply PLT relocations
+    if (lib->dyn.jmprel && lib->dyn.pltrelsz) {
+        I64 ent_size = (lib->dyn.pltrel == DT_RELA) ?
+                       sizeof(Elf64_Rela) : sizeof(Elf64_Rel);
+        I64 count = lib->dyn.pltrelsz / ent_size;
+
+        for (I64 i = 0; i < count; i++) {
+            Elf64_Rela rela;
+
+            if (lib->dyn.pltrel == DT_RELA) {
+                Elf64_Rela *r = ((Elf64_Rela*)lib->dyn.jmprel) + i;
+                rela = *r;
+            } else {
+                Elf64_Rel *r = ((Elf64_Rel*)lib->dyn.jmprel) + i;
+                rela.r_offset = r->r_offset;
+                rela.r_info = r->r_info;
+                rela.r_addend = 0;
+            }
+
+            if (DynApplyRela(dl, lib, &rela) < 0)
+                return -1;
+        }
+    }
+
+    lib->relocated = TRUE;
+    return 0;
+}
+
+I64 DynApplyRela(CDynLinker *dl, CDynLib *lib, Elf64_Rela *rela)
+{
+    U8 *base = lib->base_addr - lib->min_vaddr;
+    U32 sym_idx = ELF64_R_SYM(rela->r_info);
+    U32 rel_type = ELF64_R_TYPE(rela->r_info);
+
+    U64 *target = (U64*)(base + rela->r_offset);
+    U64 sym_val = 0;
+    U8 *sym_name = NULL;
+
+    // Get symbol if needed
+    if (sym_idx != 0) {
+        Elf64_Sym *sym = (Elf64_Sym*)(lib->dyn.symtab +
+                                       sym_idx * lib->dyn.syment);
+
+        if (lib->dyn.strtab)
+            sym_name = lib->dyn.strtab + sym->st_name;
+
+        if (sym->st_shndx == SHN_UNDEF) {
+            // Undefined - look up globally
+            sym_val = DynLookupSymbol(dl, sym_name, lib);
+
+            if (sym_val == 0) {
+                // Check if weak symbol
+                if (ELF64_ST_BIND(sym->st_info) == STB_WEAK) {
+                    sym_val = 0;  // OK to be zero for weak
+                } else {
+                    DynLinkSetError(dl, "Undefined symbol: %s", sym_name);
+                    if (dl->verbose)
+                        fprintf(stderr, "DynLink: Undefined symbol: %s (in %s)\n",
+                                sym_name, lib->path);
+                    return -1;
+                }
+            }
+        } else {
+            // Defined locally
+            sym_val = base(U64) + sym->st_value;
+        }
+    }
+
+    // Apply relocation
+    switch (rel_type) {
+        case R_X86_64_NONE:
+            break;
+
+        case R_X86_64_64:
+            *target = sym_val + rela->r_addend;
+            break;
+
+        case R_X86_64_PC32:
+            *(U32*)target = (sym_val + rela->r_addend - (U64)target)(U32);
+            break;
+
+        case R_X86_64_GLOB_DAT:
+        case R_X86_64_JUMP_SLOT:
+            *target = sym_val;
+            break;
+
+        case R_X86_64_RELATIVE:
+            *target = base(U64) + rela->r_addend;
+            break;
+
+        case R_X86_64_32:
+            *(U32*)target = (sym_val + rela->r_addend)(U32);
+            break;
+
+        case R_X86_64_32S:
+            *(I32*)target = (sym_val + rela->r_addend)(I32);
+            break;
+
+        case R_X86_64_COPY:
+            // Copy from shared object to executable
+            if (sym_val) {
+                Elf64_Sym *sym = (Elf64_Sym*)(lib->dyn.symtab +
+                                               sym_idx * lib->dyn.syment);
+                MemCpy(target, sym_val(void*), sym->st_size);
+            }
+            break;
+
+        case R_X86_64_GOTPCREL:
+            // GOT-relative, PC-relative
+            *(U32*)target = (sym_val + rela->r_addend - (U64)target)(U32);
+            break;
+
+        default:
+            if (dl->verbose)
+                fprintf(stderr, "DynLink: Unknown relocation type %d for %s\n",
+                        rel_type, sym_name ? sym_name : "<unknown>");
+            break;
+    }
+
+    return 0;
+}
+
+// ============================================================================
+// INITIALIZATION
+// ============================================================================
+
+I64 DynCallInit(CDynLinker *dl, CDynLib *lib)
+{
+    if (lib->initialized)
+        return 0;
+
+    U8 *base = lib->base_addr - lib->min_vaddr;
+
+    // Call DT_INIT_ARRAY functions
+    if (lib->dyn.init_array && lib->dyn.init_arraysz) {
+        I64 count = lib->dyn.init_arraysz / sizeof(U64);
+        U64 *init_funcs = (U64*)(base + lib->dyn.init_array);
+
+        for (I64 i = 0; i < count; i++) {
+            if (init_funcs[i]) {
+                U0 (*init)() = (U0(*)())init_funcs[i];
+                if (dl->verbose)
+                    printf("DynLink: Calling init_array[%d] at 0x%X\n",
+                           i, init_funcs[i]);
+                init();
+            }
+        }
+    }
+
+    // Call DT_INIT function
+    if (lib->dyn.init) {
+        U0 (*init)() = (U0(*)())(base + lib->dyn.init);
+        if (dl->verbose)
+            printf("DynLink: Calling _init at 0x%X\n", lib->dyn.init);
+        init();
+    }
+
+    lib->initialized = TRUE;
+    return 0;
+}
+
+U0 DynCallFini(CDynLinker *dl, CDynLib *lib)
+{
+    if (!lib->initialized)
+        return;
+
+    U8 *base = lib->base_addr - lib->min_vaddr;
+
+    // Call DT_FINI function
+    if (lib->dyn.fini) {
+        U0 (*fini)() = (U0(*)())(base + lib->dyn.fini);
+        fini();
+    }
+
+    // Call DT_FINI_ARRAY functions (reverse order)
+    if (lib->dyn.fini_array && lib->dyn.fini_arraysz) {
+        I64 count = lib->dyn.fini_arraysz / sizeof(U64);
+        U64 *fini_funcs = (U64*)(base + lib->dyn.fini_array);
+
+        for (I64 i = count - 1; i >= 0; i--) {
+            if (fini_funcs[i]) {
+                U0 (*fini)() = (U0(*)())fini_funcs[i];
+                fini();
+            }
+        }
+    }
+
+    lib->initialized = FALSE;
+}
+
+// ============================================================================
+// DLOPEN / DLSYM / DLCLOSE
+// ============================================================================
+
+void *dlopen(U8 *filename, I64 flags)
+{
+    CDynLinker *dl = DynLinkInit();
+
+    // NULL filename returns main program handle
+    if (!filename)
+        return dl->main_exe ? dl->main_exe : RTLD_DEFAULT;
+
+    // Check if already loaded
+    for (I64 i = 0; i < dl->lib_count; i++) {
+        if (dl->libs[i]) {
+            if (StrCmp(dl->libs[i]->path, filename) == 0 ||
+                (dl->libs[i]->soname && StrCmp(dl->libs[i]->soname, filename) == 0)) {
+                dl->libs[i]->ref_count++;
+                return dl->libs[i];
+            }
+        }
+    }
+
+    // Find the library file
+    U8 *path = DynFindLibrary(dl, filename);
+    if (!path) {
+        DynLinkSetError(dl, "Cannot find library: %s", filename);
+        return NULL;
+    }
+
+    // Load the library
+    CDynLib *lib = DynLoadFile(dl, path);
+    Free(path);
+
+    if (!lib)
+        return NULL;
+
+    lib->flags = flags;
+    lib->ref_count = 1;
+
+    // Map into memory
+    if (DynMapLibrary(dl, lib) < 0) {
+        Free(lib->file_data);
+        Free(lib->path);
+        Free(lib);
+        return NULL;
+    }
+
+    // Parse dynamic section
+    if (DynParseDynamic(dl, lib) < 0) {
+        Free(lib->base_addr);
+        Free(lib->file_data);
+        Free(lib->path);
+        Free(lib);
+        return NULL;
+    }
+
+    // Add to library list
+    if (dl->lib_count < DL_MAX_LIBS) {
+        dl->libs[dl->lib_count++] = lib;
+    }
+
+    // Add to load order list
+    if (dl->load_tail) {
+        dl->load_tail->next = lib;
+        lib->prev = dl->load_tail;
+        dl->load_tail = lib;
+    } else {
+        dl->load_head = dl->load_tail = lib;
+    }
+
+    // Load dependencies
+    for (I64 i = 0; i < lib->needed_count; i++) {
+        void *dep = dlopen(lib->needed[i], flags);
+        if (!dep && !(flags & RTLD_LAZY)) {
+            // Failed to load dependency
+            // TODO: proper cleanup
+            return NULL;
+        }
+    }
+
+    // Apply relocations
+    if (DynApplyRelocations(dl, lib) < 0) {
+        if (!(flags & RTLD_LAZY)) {
+            // TODO: proper cleanup
+            return NULL;
+        }
+    }
+
+    // Call constructors (unless RTLD_NOLOAD)
+    if (!(flags & RTLD_NOLOAD)) {
+        DynCallInit(dl, lib);
+    }
+
+    if (dl->verbose)
+        printf("DynLink: Loaded %s at 0x%016X\n", lib->path, lib->base_addr);
+
+    return lib;
+}
+
+void *dlsym(void *handle, U8 *symbol)
+{
+    CDynLinker *dl = DynLinkInit();
+
+    if (!symbol) {
+        DynLinkSetError(dl, "NULL symbol name");
+        return NULL;
+    }
+
+    // Handle RTLD_DEFAULT - search all libraries
+    if (handle == RTLD_DEFAULT || handle == NULL) {
+        U64 addr = DynLookupSymbol(dl, symbol, NULL);
+        if (addr)
+            return (void*)addr;
+
+        DynLinkSetError(dl, "Symbol not found: %s", symbol);
+        return NULL;
+    }
+
+    // Handle RTLD_NEXT - search after current library
+    if (handle == RTLD_NEXT) {
+        // Get return address to determine "current" library
+        // Simplified: just search from beginning
+        U64 addr = DynLookupSymbol(dl, symbol, NULL);
+        if (addr)
+            return (void*)addr;
+
+        DynLinkSetError(dl, "Symbol not found: %s", symbol);
+        return NULL;
+    }
+
+    // Handle specific library
+    CDynLib *lib = (CDynLib*)handle;
+
+    Elf64_Sym *sym = DynLookupSymInLib(lib, symbol);
+    if (sym) {
+        U64 addr = (lib->base_addr - lib->min_vaddr) + sym->st_value;
+        return (void*)addr;
+    }
+
+    // Also check dependencies if RTLD_GLOBAL
+    if (lib->flags & RTLD_GLOBAL) {
+        for (I64 i = 0; i < lib->needed_count; i++) {
+            // Find loaded dependency
+            for (I64 j = 0; j < dl->lib_count; j++) {
+                if (dl->libs[j] && dl->libs[j]->soname &&
+                    StrCmp(dl->libs[j]->soname, lib->needed[i]) == 0) {
+                    void *result = dlsym(dl->libs[j], symbol);
+                    if (result)
+                        return result;
+                }
+            }
+        }
+    }
+
+    DynLinkSetError(dl, "Symbol not found: %s", symbol);
+    return NULL;
+}
+
+I64 dlclose(void *handle)
+{
+    CDynLinker *dl = DynLinkInit();
+
+    if (!handle || handle == RTLD_DEFAULT || handle == RTLD_NEXT)
+        return 0;
+
+    CDynLib *lib = (CDynLib*)handle;
+
+    // Decrement reference count
+    lib->ref_count--;
+
+    if (lib->ref_count > 0)
+        return 0;
+
+    // Don't actually unload if RTLD_NODELETE
+    if (lib->flags & RTLD_NODELETE)
+        return 0;
+
+    // Call destructors
+    DynCallFini(dl, lib);
+
+    // Remove from load order list
+    if (lib->prev)
+        lib->prev->next = lib->next;
+    else
+        dl->load_head = lib->next;
+
+    if (lib->next)
+        lib->next->prev = lib->prev;
+    else
+        dl->load_tail = lib->prev;
+
+    // Remove from library array
+    for (I64 i = 0; i < dl->lib_count; i++) {
+        if (dl->libs[i] == lib) {
+            dl->libs[i] = NULL;
+            break;
+        }
+    }
+
+    // Free memory
+    if (lib->base_addr)
+        Free(lib->base_addr);
+    if (lib->file_data)
+        Free(lib->file_data);
+    if (lib->path)
+        Free(lib->path);
+    if (lib->soname)
+        Free(lib->soname);
+
+    for (I64 i = 0; i < lib->needed_count; i++) {
+        if (lib->needed[i])
+            Free(lib->needed[i]);
+    }
+
+    Free(lib);
+
+    return 0;
+}
+
+// dladdr - get information about a symbol address
+I64 dladdr(void *addr, Dl_info *info)
+{
+    CDynLinker *dl = DynLinkInit();
+
+    if (!info)
+        return 0;
+
+    MemSet(info, 0, sizeof(Dl_info));
+
+    // Find which library contains this address
+    for (I64 i = 0; i < dl->lib_count; i++) {
+        CDynLib *lib = dl->libs[i];
+        if (!lib)
+            continue;
+
+        if ((U8*)addr >= lib->base_addr &&
+            (U8*)addr < lib->base_addr + lib->load_size) {
+
+            info->dli_fname = lib->path;
+            info->dli_fbase = lib->base_addr;
+
+            // Find nearest symbol
+            // TODO: implement proper symbol search
+            info->dli_sname = NULL;
+            info->dli_saddr = NULL;
+
+            return 1;
+        }
+    }
+
+    return 0;
+}
+
+// ============================================================================
+// DYNAMIC LOADER ENTRY POINT
+// ============================================================================
+
+// Load and run a dynamically-linked ELF executable
+I64 DynRun(U8 *filename, I64 argc, U8 **argv)
+{
+    CDynLinker *dl = DynLinkInit();
+    dl->verbose = TRUE;  // Debug output
+
+    printf("DynLink: Loading %s\n", filename);
+
+    // Load main executable
+    CDynLib *exe = DynLoadFile(dl, filename);
+    if (!exe) {
+        fprintf(stderr, "DynLink: Failed to load %s: %s\n", filename, dl->error);
+        return -1;
+    }
+
+    exe->flags = RTLD_GLOBAL | RTLD_NOW;
+    exe->ref_count = 1;
+
+    // Map into memory
+    if (DynMapLibrary(dl, exe) < 0) {
+        fprintf(stderr, "DynLink: Failed to map %s: %s\n", filename, dl->error);
+        return -1;
+    }
+
+    // Parse dynamic section
+    if (DynParseDynamic(dl, exe) < 0) {
+        fprintf(stderr, "DynLink: Failed to parse %s: %s\n", filename, dl->error);
+        return -1;
+    }
+
+    // Set as main executable
+    dl->main_exe = exe;
+    dl->libs[dl->lib_count++] = exe;
+    dl->load_head = dl->load_tail = exe;
+
+    // Load all dependencies
+    printf("DynLink: Loading dependencies...\n");
+    for (I64 i = 0; i < exe->needed_count; i++) {
+        printf("  Loading %s\n", exe->needed[i]);
+        void *dep = dlopen(exe->needed[i], RTLD_GLOBAL | RTLD_NOW);
+        if (!dep) {
+            fprintf(stderr, "DynLink: Failed to load %s: %s\n",
+                    exe->needed[i], dl->error);
+            return -1;
+        }
+    }
+
+    // Apply relocations to main executable
+    printf("DynLink: Applying relocations...\n");
+    if (DynApplyRelocations(dl, exe) < 0) {
+        fprintf(stderr, "DynLink: Relocation failed: %s\n", dl->error);
+        return -1;
+    }
+
+    // Call library initializers
+    printf("DynLink: Calling initializers...\n");
+    for (CDynLib *lib = dl->load_head; lib; lib = lib->next) {
+        if (lib != exe) {
+            DynCallInit(dl, lib);
+        }
+    }
+
+    // Call main executable initializers
+    DynCallInit(dl, exe);
+
+    // Get entry point
+    U64 entry = exe->ehdr->e_entry;
+    if (exe->ehdr->e_type == ET_DYN) {
+        // PIE - adjust entry point
+        entry = (exe->base_addr - exe->min_vaddr) + entry;
+    } else {
+        entry = (exe->base_addr - exe->min_vaddr) + entry;
+    }
+
+    printf("DynLink: Jumping to entry point 0x%016X\n", entry);
+
+    // Get environment
+    CPosixProcess *proc = PosixGetCurrent();
+    U8 **envp = proc ? proc->environ : NULL;
+
+    // Call entry point
+    I64 (*entry_func)(I64, U8**, U8**) = entry(void*);
+    I64 result = entry_func(argc, argv, envp);
+
+    // Call finalizers
+    for (CDynLib *lib = dl->load_tail; lib; lib = lib->prev) {
+        DynCallFini(dl, lib);
+    }
+
+    printf("DynLink: Process exited with code %d\n", result);
+    return result;
+}
+
+// ============================================================================
+// ADD LIBRARY SEARCH PATH
+// ============================================================================
+
+U0 DynAddSearchPath(U8 *path)
+{
+    CDynLinker *dl = DynLinkInit();
+
+    if (dl->path_count < DL_MAX_SEARCH_PATHS) {
+        dl->search_paths[dl->path_count++] = StrNew(path);
+    }
+}
+
+// ============================================================================
+// REGISTER GLOBAL SYMBOL
+// ============================================================================
+
+U0 DynRegisterSymbol(U8 *name, U64 addr)
+{
+    CDynLinker *dl = DynLinkInit();
+
+    CDynSymbol *sym = MAlloc(sizeof(CDynSymbol));
+    sym->name = StrNew(name);
+    sym->addr = addr;
+    sym->lib = NULL;
+
+    U32 hash = DynSymHash(name);
+    sym->next = dl->symtab[hash];
+    dl->symtab[hash] = sym;
+}
+
+// ============================================================================
+// INITIALIZATION MESSAGE
+// ============================================================================
+
+"ZealOS Dynamic Linker loaded.\n";
+"  - dlopen, dlsym, dlclose, dladdr\n";
+"  - Shared library loading\n";
+"  - Symbol resolution\n";
+"  - PLT/GOT relocations\n";
+"  - Init/fini functions\n";

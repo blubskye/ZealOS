@@ -1,0 +1,160 @@
+// seq.ZC - GNU coreutils 'seq' implementation
+// Print a sequence of numbers
+
+// C-style main function
+I64 seq_main(I64 argc, U8 **argv)
+{
+    U8 *separator = "\n";       // -s
+    Bool equal_width = FALSE;   // -w
+    U8 *format = NULL;          // -f
+    I64 start = 1;
+
+    // Parse options
+    while (start < argc && argv[start][0] == '-' && argv[start][1]) {
+        U8 *arg = argv[start];
+
+        if (strcmp(arg, "--help") == 0) {
+            printf("Usage: seq [OPTION]... LAST\n");
+            printf("  or:  seq [OPTION]... FIRST LAST\n");
+            printf("  or:  seq [OPTION]... FIRST INCREMENT LAST\n");
+            printf("Print numbers from FIRST to LAST, in steps of INCREMENT.\n\n");
+            printf("  -f, --format=FORMAT  use printf style floating-point FORMAT\n");
+            printf("  -s, --separator=STRING use STRING to separate numbers (default: \\n)\n");
+            printf("  -w, --equal-width    equalize width by padding with leading zeroes\n");
+            printf("      --help           display this help and exit\n");
+            printf("      --version        output version information and exit\n");
+            return 0;
+        }
+
+        if (strcmp(arg, "--version") == 0) {
+            printf("seq (ZealOS coreutils) 1.0\n");
+            return 0;
+        }
+
+        if (strcmp(arg, "-w") == 0 || strcmp(arg, "--equal-width") == 0) {
+            equal_width = TRUE;
+            start++;
+            continue;
+        }
+
+        if (strncmp(arg, "-s", 2) == 0) {
+            if (arg[2]) separator = &arg[2];
+            else if (start + 1 < argc) { start++; separator = argv[start]; }
+            start++;
+            continue;
+        }
+
+        if (strncmp(arg, "--separator=", 12) == 0) {
+            separator = &arg[12];
+            start++;
+            continue;
+        }
+
+        if (strncmp(arg, "-f", 2) == 0) {
+            if (arg[2]) format = &arg[2];
+            else if (start + 1 < argc) { start++; format = argv[start]; }
+            start++;
+            continue;
+        }
+
+        if (strncmp(arg, "--format=", 9) == 0) {
+            format = &arg[9];
+            start++;
+            continue;
+        }
+
+        if (strcmp(arg, "--") == 0) {
+            start++;
+            break;
+        }
+
+        // Check if it's a negative number
+        if (arg[0] == '-' && (isdigit(arg[1]) || arg[1] == '.')) {
+            break;  // It's a number
+        }
+
+        fprintf(stderr, "seq: invalid option '%s'\n", arg);
+        return 1;
+    }
+
+    I64 num_args = argc - start;
+    if (num_args < 1) {
+        fprintf(stderr, "seq: missing operand\n");
+        return 1;
+    }
+
+    // Parse numbers (using floating point for flexibility)
+    F64 first = 1.0, increment = 1.0, last;
+
+    if (num_args == 1) {
+        last = strtod(argv[start], NULL);
+    } else if (num_args == 2) {
+        first = strtod(argv[start], NULL);
+        last = strtod(argv[start + 1], NULL);
+    } else {
+        first = strtod(argv[start], NULL);
+        increment = strtod(argv[start + 1], NULL);
+        last = strtod(argv[start + 2], NULL);
+    }
+
+    if (increment == 0) {
+        fprintf(stderr, "seq: increment must not be zero\n");
+        return 1;
+    }
+
+    // Determine width for -w option
+    I64 width = 0;
+    if (equal_width) {
+        // Count digits in first and last
+        U8 buf[64];
+        snprintf(buf, sizeof(buf), "%.0f", first);
+        I64 first_len = strlen(buf);
+        snprintf(buf, sizeof(buf), "%.0f", last);
+        I64 last_len = strlen(buf);
+        width = (first_len > last_len) ? first_len : last_len;
+    }
+
+    // Determine if we're dealing with integers
+    Bool use_int = (first == (I64)first && increment == (I64)increment && last == (I64)last);
+
+    // Print sequence
+    Bool first_output = TRUE;
+    F64 current = first;
+
+    while ((increment > 0 && current <= last + 0.000001) ||
+           (increment < 0 && current >= last - 0.000001)) {
+
+        if (!first_output) {
+            printf("%s", separator);
+        }
+
+        if (format) {
+            printf(format, current);
+        } else if (use_int) {
+            if (equal_width) {
+                printf("%0*ld", width, (I64)current);
+            } else {
+                printf("%ld", (I64)current);
+            }
+        } else {
+            printf("%g", current);
+        }
+
+        first_output = FALSE;
+        current += increment;
+
+        // Prevent infinite loops due to floating point precision
+        if ((increment > 0 && current > last + 1000 * increment) ||
+            (increment < 0 && current < last + 1000 * increment)) {
+            break;
+        }
+    }
+
+    printf("\n");
+    return 0;
+}
+
+U0 GnuSeqRegister()
+{
+    "GNU 'seq' utility loaded.\n";
+}

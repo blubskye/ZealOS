@@ -1,0 +1,706 @@
+// Process.ZC - POSIX Process Management for ZealOS
+// Part of ZealOS POSIX compatibility layer
+//
+// Maps POSIX process model to ZealOS task model
+// Note: fork() is emulated using spawn-based approach
+
+// ============================================================================
+// GLOBAL PROCESS STATE
+// ============================================================================
+
+CPosixProcess *posix_processes[POSIX_CHILD_MAX];
+I64 posix_process_count = 0;
+I64 posix_next_pid = 1;
+
+// Per-task current process pointer
+// In real implementation, this would use task-local storage
+CPosixProcess *posix_current = NULL;
+
+// ============================================================================
+// PROCESS TABLE MANAGEMENT
+// ============================================================================
+
+// Find process by PID
+CPosixProcess *PosixFindProcess(I64 pid)
+{
+	I64 i;
+
+	for (i = 0; i < posix_process_count; i++) {
+		if (posix_processes[i] && posix_processes[i]->pid == pid)
+			return posix_processes[i];
+	}
+
+	return NULL;
+}
+
+// Add process to table
+I64 PosixAddProcess(CPosixProcess *proc)
+{
+	I64 i;
+
+	if (posix_process_count >= POSIX_CHILD_MAX)
+		return -1;
+
+	// Find empty slot
+	for (i = 0; i < POSIX_CHILD_MAX; i++) {
+		if (!posix_processes[i]) {
+			posix_processes[i] = proc;
+			posix_process_count++;
+			return i;
+		}
+	}
+
+	return -1;
+}
+
+// Remove process from table
+U0 PosixRemoveProcess(CPosixProcess *proc)
+{
+	I64 i;
+
+	if (!proc)
+		return;
+
+	for (i = 0; i < POSIX_CHILD_MAX; i++) {
+		if (posix_processes[i] == proc) {
+			posix_processes[i] = NULL;
+			posix_process_count--;
+			return;
+		}
+	}
+}
+
+// ============================================================================
+// PROCESS CREATION
+// ============================================================================
+
+// Create a new process structure
+CPosixProcess *PosixProcessNew()
+{
+	CPosixProcess *proc;
+
+	proc = MAlloc(sizeof(CPosixProcess));
+	MemSet(proc, 0, sizeof(CPosixProcess));
+
+	proc->pid = posix_next_pid++;
+	proc->ppid = 0;
+	proc->pgid = proc->pid;  // Own process group by default
+	proc->sid = proc->pid;   // Own session by default
+
+	// Initialize file descriptors
+	PosixFDInitStdio(proc);
+
+	// Initialize current directory
+	proc->cwd = StrNew(Fs->cur_dir);
+
+	// Initialize environment
+	PosixEnvInit(proc);
+
+	// Initialize signal handlers to default
+	I64 i;
+	for (i = 0; i < NSIG; i++) {
+		proc->sigactions[i].sa_handler = SIG_DFL;
+		PosixSigemptyset(&proc->sigactions[i].sa_mask);
+		proc->sigactions[i].sa_flags = 0;
+	}
+
+	PosixSigemptyset(&proc->sigmask);
+	PosixSigemptyset(&proc->sigpending);
+
+	return proc;
+}
+
+// Free a process structure
+U0 PosixProcessFree(CPosixProcess *proc)
+{
+	I64 i;
+
+	if (!proc)
+		return;
+
+	// Close all file descriptors
+	for (i = 0; i < POSIX_OPEN_MAX; i++) {
+		if (proc->fd_table[i])
+			PosixFDFree(proc, i);
+	}
+
+	// Free environment
+	PosixEnvFree(proc);
+
+	// Free cwd
+	if (proc->cwd)
+		Free(proc->cwd);
+
+	// Free argv
+	if (proc->argv) {
+		for (i = 0; i < proc->argc; i++) {
+			if (proc->argv[i])
+				Free(proc->argv[i]);
+		}
+		Free(proc->argv);
+	}
+
+	if (proc->argv0)
+		Free(proc->argv0);
+
+	Free(proc);
+}
+
+// ============================================================================
+// PROCESS INITIALIZATION
+// ============================================================================
+
+// Initialize POSIX layer for current task
+CPosixProcess *PosixInit()
+{
+	CPosixProcess *proc;
+
+	// Check if already initialized
+	if (posix_current)
+		return posix_current;
+
+	proc = PosixProcessNew();
+	proc->task = Fs;
+	proc->ppid = 0;  // No parent (init process)
+
+	PosixAddProcess(proc);
+	posix_current = proc;
+
+	return proc;
+}
+
+// Get current process
+CPosixProcess *PosixGetCurrent()
+{
+	if (!posix_current)
+		return PosixInit();
+	return posix_current;
+}
+
+// Clean up POSIX layer
+U0 PosixCleanup(CPosixProcess *proc)
+{
+	if (!proc)
+		return;
+
+	// Notify parent of child death (SIGCHLD)
+	if (proc->parent) {
+		PosixDeliverSignal(proc->parent, SIGCHLD);
+	}
+
+	// Reparent children to init (pid 1) or just orphan them
+	CPosixProcess *child;
+	I64 i;
+	for (i = 0; i < proc->child_count; i++) {
+		child = proc->children[i];
+		if (child) {
+			child->parent = NULL;
+			child->ppid = 1;
+		}
+	}
+
+	PosixRemoveProcess(proc);
+	PosixProcessFree(proc);
+
+	if (posix_current == proc)
+		posix_current = NULL;
+}
+
+// ============================================================================
+// FORK EMULATION
+// ============================================================================
+
+// Fork is very difficult to implement on ZealOS due to shared memory
+// We provide a limited emulation that works for fork+exec patterns
+
+// Fork state for child process
+class CPosixForkState
+{
+	CPosixProcess *parent;
+	CPosixFD *fd_copies[POSIX_OPEN_MAX];
+	U8 *cwd;
+	U8 **environ;
+	I64 environ_count;
+};
+
+// This is a simplified fork that only works when followed by exec
+// Real fork() semantics are impossible without virtual memory
+I64 PosixFork()
+{
+	CPosixProcess *parent = PosixGetCurrent();
+	CPosixProcess *child;
+	I64 i;
+
+	if (!parent)
+		return PosixSetErrno(EINVAL);
+
+	// Create child process
+	child = PosixProcessNew();
+	if (!child)
+		return PosixSetErrno(ENOMEM);
+
+	child->ppid = parent->pid;
+	child->parent = parent;
+	child->pgid = parent->pgid;
+	child->sid = parent->sid;
+
+	// Copy file descriptors
+	for (i = 0; i < POSIX_OPEN_MAX; i++) {
+		if (parent->fd_table[i]) {
+			// Duplicate the fd
+			child->fd_table[i] = MAlloc(sizeof(CPosixFD));
+			MemCpy(child->fd_table[i], parent->fd_table[i], sizeof(CPosixFD));
+			child->fd_table[i]->ref_count = 1;
+
+			// Handle type-specific copying
+			switch (parent->fd_table[i]->type) {
+				case FD_TYPE_FILE:
+					if (parent->fd_table[i]->path)
+						child->fd_table[i]->path = StrNew(parent->fd_table[i]->path);
+					// Note: data is shared (COW semantics would be ideal)
+					parent->fd_table[i]->ref_count++;
+					break;
+
+				case FD_TYPE_PIPE:
+					if (parent->fd_table[i]->is_read_end)
+						parent->fd_table[i]->pipe->readers++;
+					else
+						parent->fd_table[i]->pipe->writers++;
+					break;
+			}
+
+			child->fd_count++;
+		}
+	}
+
+	// Copy current directory
+	if (parent->cwd) {
+		Free(child->cwd);
+		child->cwd = StrNew(parent->cwd);
+	}
+
+	// Copy environment
+	PosixEnvFree(child);
+	child->environ = MAlloc(parent->environ_capacity * sizeof(U8*));
+	child->environ_capacity = parent->environ_capacity;
+	child->environ_count = parent->environ_count;
+	for (i = 0; i < parent->environ_count; i++) {
+		child->environ[i] = StrNew(parent->environ[i]);
+	}
+	child->environ[child->environ_count] = NULL;
+
+	// Copy signal handlers
+	for (i = 0; i < NSIG; i++) {
+		MemCpy(&child->sigactions[i], &parent->sigactions[i], sizeof(CPosixSigAction));
+	}
+
+	// Clear pending signals in child
+	PosixSigemptyset(&child->sigpending);
+
+	// Add to parent's children
+	if (parent->child_count < POSIX_CHILD_MAX) {
+		parent->children[parent->child_count++] = child;
+	}
+
+	// Add to process table
+	PosixAddProcess(child);
+
+	// In a real fork, we'd return 0 in child and child pid in parent
+	// Since we can't actually fork, we return the child pid
+	// The caller must use vfork semantics (child calls exec immediately)
+
+	return child->pid;
+}
+
+// Vfork - same as fork for our purposes
+I64 PosixVfork()
+{
+	return PosixFork();
+}
+
+// ============================================================================
+// EXEC FAMILY
+// ============================================================================
+
+// Execute a program
+I64 PosixExecve(U8 *path, U8 **argv, U8 **envp)
+{
+	CPosixProcess *proc = PosixGetCurrent();
+	U8 *full_path;
+	I64 i;
+
+	if (!proc)
+		return PosixSetErrno(EINVAL);
+
+	if (!path || !*path)
+		return PosixSetErrno(ENOENT);
+
+	// Resolve path
+	full_path = PosixResolvePath(proc, path);
+	if (!full_path)
+		return PosixSetErrno(ENOMEM);
+
+	// Check if file exists
+	if (!FileFind(full_path)) {
+		Free(full_path);
+		return PosixSetErrno(ENOENT);
+	}
+
+	// Close close-on-exec file descriptors
+	for (i = 0; i < POSIX_OPEN_MAX; i++) {
+		if (proc->fd_table[i] && (proc->fd_table[i]->fd_flags & FD_CLOEXEC)) {
+			PosixFDFree(proc, i);
+		}
+	}
+
+	// Update argv
+	if (proc->argv) {
+		for (i = 0; i < proc->argc; i++) {
+			if (proc->argv[i])
+				Free(proc->argv[i]);
+		}
+		Free(proc->argv);
+	}
+
+	// Count and copy argv
+	if (argv) {
+		for (proc->argc = 0; argv[proc->argc]; proc->argc++);
+		proc->argv = MAlloc((proc->argc + 1) * sizeof(U8*));
+		for (i = 0; i < proc->argc; i++) {
+			proc->argv[i] = StrNew(argv[i]);
+		}
+		proc->argv[proc->argc] = NULL;
+	} else {
+		proc->argc = 0;
+		proc->argv = NULL;
+	}
+
+	// Update environment if provided
+	if (envp) {
+		PosixEnvFree(proc);
+		for (i = 0; envp[i]; i++);
+		proc->environ = MAlloc((i + 1) * sizeof(U8*));
+		proc->environ_count = i;
+		proc->environ_capacity = i + 1;
+		for (i = 0; envp[i]; i++) {
+			proc->environ[i] = StrNew(envp[i]);
+		}
+		proc->environ[i] = NULL;
+	}
+
+	// Update argv0
+	if (proc->argv0)
+		Free(proc->argv0);
+	proc->argv0 = StrNew(path);
+
+	// Reset signal handlers to default (except ignored ones)
+	for (i = 0; i < NSIG; i++) {
+		if (proc->sigactions[i].sa_handler != SIG_IGN) {
+			proc->sigactions[i].sa_handler = SIG_DFL;
+		}
+	}
+
+	// Clear pending signals
+	PosixSigemptyset(&proc->sigpending);
+
+	// In a real exec, we'd load and run the new program
+	// For ZealOS, we execute the file as ZealC code
+	// This is a simplification - real exec would need ELF loading
+
+	// Execute the file
+	ExeFile(full_path);
+
+	Free(full_path);
+
+	// If we get here, exec failed
+	return PosixSetErrno(ENOEXEC);
+}
+
+// Execute with PATH search
+I64 PosixExecvp(U8 *file, U8 **argv)
+{
+	CPosixProcess *proc = PosixGetCurrent();
+	U8 *path, *path_copy, *dir, *full_path;
+	I64 result;
+
+	if (!file || !*file)
+		return PosixSetErrno(ENOENT);
+
+	// If file contains '/', use it directly
+	if (StrFirstOcc(file, "/"))
+		return PosixExecve(file, argv, proc ? proc->environ : NULL);
+
+	// Search PATH
+	path = PosixGetenv("PATH");
+	if (!path)
+		path = "/bin:/usr/bin";
+
+	path_copy = StrNew(path);
+	dir = path_copy;
+
+	while (dir && *dir) {
+		// Find next colon
+		U8 *colon = StrFirstOcc(dir, ":");
+		if (colon)
+			*colon = 0;
+
+		// Build full path
+		I64 len = StrLen(dir) + 1 + StrLen(file) + 1;
+		full_path = MAlloc(len);
+		StrCpy(full_path, dir);
+		StrCat(full_path, "/");
+		StrCat(full_path, file);
+
+		// Try this path
+		if (FileFind(full_path)) {
+			result = PosixExecve(full_path, argv, proc ? proc->environ : NULL);
+			Free(full_path);
+			Free(path_copy);
+			return result;
+		}
+
+		Free(full_path);
+
+		// Move to next directory
+		if (colon)
+			dir = colon + 1;
+		else
+			break;
+	}
+
+	Free(path_copy);
+	return PosixSetErrno(ENOENT);
+}
+
+// Execute with current environment
+I64 PosixExecv(U8 *path, U8 **argv)
+{
+	CPosixProcess *proc = PosixGetCurrent();
+	return PosixExecve(path, argv, proc ? proc->environ : NULL);
+}
+
+// ============================================================================
+// WAIT FAMILY
+// ============================================================================
+
+// Wait for any child
+I64 PosixWait(I64 *status)
+{
+	return PosixWaitpid(-1, status, 0);
+}
+
+// Wait for specific child
+I64 PosixWaitpid(I64 pid, I64 *status, I64 options)
+{
+	CPosixProcess *proc = PosixGetCurrent();
+	CPosixProcess *child;
+	I64 i, found_pid;
+	Bool found;
+
+	if (!proc)
+		return PosixSetErrno(EINVAL);
+
+	if (proc->child_count == 0)
+		return PosixSetErrno(ECHILD);
+
+	while (1) {
+		found = FALSE;
+
+		for (i = 0; i < proc->child_count; i++) {
+			child = proc->children[i];
+			if (!child)
+				continue;
+
+			// Check if this child matches
+			if (pid == -1) {
+				// Any child
+				found = TRUE;
+			} else if (pid > 0) {
+				// Specific child
+				if (child->pid == pid)
+					found = TRUE;
+			} else if (pid == 0) {
+				// Same process group
+				if (child->pgid == proc->pgid)
+					found = TRUE;
+			} else {
+				// Process group |pid|
+				if (child->pgid == -pid)
+					found = TRUE;
+			}
+
+			if (!found)
+				continue;
+
+			// Check if child has exited
+			if (child->exited) {
+				found_pid = child->pid;
+
+				if (status) {
+					if (child->signaled) {
+						*status = child->term_signal;
+					} else {
+						*status = (child->exit_status << 8);
+					}
+				}
+
+				// Remove child from list
+				for (I64 j = i; j < proc->child_count - 1; j++) {
+					proc->children[j] = proc->children[j + 1];
+				}
+				proc->child_count--;
+
+				// Free child
+				PosixProcessFree(child);
+
+				return found_pid;
+			}
+		}
+
+		if (!found)
+			return PosixSetErrno(ECHILD);
+
+		if (options & WNOHANG)
+			return 0;  // No child exited yet
+
+		// Wait for child state change
+		Yield;
+	}
+}
+
+// ============================================================================
+// EXIT
+// ============================================================================
+
+// Exit process
+U0 PosixExit(I64 status)
+{
+	CPosixProcess *proc = PosixGetCurrent();
+
+	if (!proc)
+		return;
+
+	// Flush stdio
+	// Close all file descriptors
+	I64 i;
+	for (i = 0; i < POSIX_OPEN_MAX; i++) {
+		if (proc->fd_table[i])
+			PosixClose(i);
+	}
+
+	// Call _exit
+	Posix_Exit(status);
+}
+
+// Immediate exit (no cleanup)
+U0 Posix_Exit(I64 status)
+{
+	CPosixProcess *proc = PosixGetCurrent();
+
+	if (proc) {
+		proc->exit_status = status & 0xFF;
+		proc->exited = TRUE;
+	}
+
+	// In ZealOS, we return from the task
+	// The task will be cleaned up by the system
+	throw;  // Or use Exit() for ZealOS
+}
+
+// ============================================================================
+// PROCESS ID FUNCTIONS
+// ============================================================================
+
+I64 PosixGetPid()
+{
+	CPosixProcess *proc = PosixGetCurrent();
+	return proc ? proc->pid : 0;
+}
+
+I64 PosixGetPPid()
+{
+	CPosixProcess *proc = PosixGetCurrent();
+	return proc ? proc->ppid : 0;
+}
+
+I64 PosixGetUid()
+{
+	return 0;  // ZealOS is single-user, always root
+}
+
+I64 PosixGetGid()
+{
+	return 0;
+}
+
+I64 PosixGetEuid()
+{
+	return 0;
+}
+
+I64 PosixGetEgid()
+{
+	return 0;
+}
+
+// ============================================================================
+// PROCESS GROUP AND SESSION
+// ============================================================================
+
+I64 PosixGetPgrp()
+{
+	CPosixProcess *proc = PosixGetCurrent();
+	return proc ? proc->pgid : 0;
+}
+
+I64 PosixSetpgid(I64 pid, I64 pgid)
+{
+	CPosixProcess *proc;
+
+	if (pid == 0)
+		proc = PosixGetCurrent();
+	else
+		proc = PosixFindProcess(pid);
+
+	if (!proc)
+		return PosixSetErrno(ESRCH);
+
+	if (pgid == 0)
+		pgid = proc->pid;
+
+	proc->pgid = pgid;
+	return 0;
+}
+
+I64 PosixGetsid(I64 pid)
+{
+	CPosixProcess *proc;
+
+	if (pid == 0)
+		proc = PosixGetCurrent();
+	else
+		proc = PosixFindProcess(pid);
+
+	if (!proc)
+		return PosixSetErrno(ESRCH);
+
+	return proc->sid;
+}
+
+I64 PosixSetsid()
+{
+	CPosixProcess *proc = PosixGetCurrent();
+
+	if (!proc)
+		return PosixSetErrno(EINVAL);
+
+	// Already a process group leader?
+	if (proc->pid == proc->pgid)
+		return PosixSetErrno(EPERM);
+
+	proc->pgid = proc->pid;
+	proc->sid = proc->pid;
+
+	return proc->sid;
+}
+

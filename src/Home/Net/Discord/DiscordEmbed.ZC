@@ -1,0 +1,512 @@
+// DiscordEmbed.ZC - Discord Embed Builder for ZealOS
+// Part of ZealOS Discord implementation
+// Provides rich embed message support
+
+// ============================================================================
+// EMBED STRUCTURE DEFINITIONS (inline in this file)
+// ============================================================================
+
+#define DISCORD_MAX_EMBED_FIELDS    25
+#define DISCORD_MAX_FIELD_NAME      256
+#define DISCORD_MAX_FIELD_VALUE     1024
+#define DISCORD_MAX_TITLE           256
+#define DISCORD_MAX_DESCRIPTION     4096
+#define DISCORD_MAX_FOOTER_TEXT     2048
+#define DISCORD_MAX_AUTHOR_NAME     256
+
+// Embed field
+class CDiscordEmbedField
+{
+	U8    *name;
+	U8    *value;
+	Bool   is_inline;
+};
+
+// Embed footer
+class CDiscordEmbedFooter
+{
+	U8    *text;
+	U8    *icon_url;
+};
+
+// Embed image/thumbnail
+class CDiscordEmbedImage
+{
+	U8    *url;
+	I64    width;
+	I64    height;
+};
+
+// Embed author
+class CDiscordEmbedAuthor
+{
+	U8    *name;
+	U8    *url;
+	U8    *icon_url;
+};
+
+// Main embed structure
+class CDiscordEmbed
+{
+	U8                   *title;
+	U8                   *description;
+	U8                   *url;
+	I64                   color;          // RGB color as integer (0xRRGGBB)
+	U64                   timestamp;      // Unix timestamp
+
+	CDiscordEmbedFooter   footer;
+	CDiscordEmbedImage    image;
+	CDiscordEmbedImage    thumbnail;
+	CDiscordEmbedAuthor   author;
+
+	CDiscordEmbedField   *fields;
+	I64                   field_count;
+	I64                   field_capacity;
+};
+
+// ============================================================================
+// EMBED CREATION/DESTRUCTION
+// ============================================================================
+
+// Create a new embed
+CDiscordEmbed *DiscordEmbedNew()
+{
+	CDiscordEmbed *embed = MAlloc(sizeof(CDiscordEmbed));
+	MemSet(embed, 0, sizeof(CDiscordEmbed));
+	embed->color = -1;  // -1 = no color set
+	return embed;
+}
+
+// Free embed resources
+U0 DiscordEmbedFree(CDiscordEmbed *embed)
+{
+	I64 i;
+	if (!embed) return;
+
+	if (embed->title) Free(embed->title);
+	if (embed->description) Free(embed->description);
+	if (embed->url) Free(embed->url);
+
+	if (embed->footer.text) Free(embed->footer.text);
+	if (embed->footer.icon_url) Free(embed->footer.icon_url);
+
+	if (embed->image.url) Free(embed->image.url);
+	if (embed->thumbnail.url) Free(embed->thumbnail.url);
+
+	if (embed->author.name) Free(embed->author.name);
+	if (embed->author.url) Free(embed->author.url);
+	if (embed->author.icon_url) Free(embed->author.icon_url);
+
+	if (embed->fields) {
+		for (i = 0; i < embed->field_count; i++) {
+			if (embed->fields[i].name) Free(embed->fields[i].name);
+			if (embed->fields[i].value) Free(embed->fields[i].value);
+		}
+		Free(embed->fields);
+	}
+
+	Free(embed);
+}
+
+// ============================================================================
+// EMBED SETTERS
+// ============================================================================
+
+// Set embed title
+U0 DiscordEmbedSetTitle(CDiscordEmbed *embed, U8 *title)
+{
+	if (embed->title) Free(embed->title);
+	embed->title = title ? StrNew(title) : NULL;
+}
+
+// Set embed description
+U0 DiscordEmbedSetDescription(CDiscordEmbed *embed, U8 *description)
+{
+	if (embed->description) Free(embed->description);
+	embed->description = description ? StrNew(description) : NULL;
+}
+
+// Set embed URL (makes title clickable)
+U0 DiscordEmbedSetURL(CDiscordEmbed *embed, U8 *url)
+{
+	if (embed->url) Free(embed->url);
+	embed->url = url ? StrNew(url) : NULL;
+}
+
+// Set embed color (0xRRGGBB format)
+U0 DiscordEmbedSetColor(CDiscordEmbed *embed, I64 color)
+{
+	embed->color = color;
+}
+
+// Set embed color from RGB components
+U0 DiscordEmbedSetColorRGB(CDiscordEmbed *embed, I64 r, I64 g, I64 b)
+{
+	embed->color = ((r & 0xFF) << 16) | ((g & 0xFF) << 8) | (b & 0xFF);
+}
+
+// Set embed timestamp (Unix timestamp in seconds)
+U0 DiscordEmbedSetTimestamp(CDiscordEmbed *embed, U64 timestamp)
+{
+	embed->timestamp = timestamp;
+}
+
+// Set embed timestamp to current time
+U0 DiscordEmbedSetTimestampNow(CDiscordEmbed *embed)
+{
+	// Note: tS is seconds since boot in ZealOS, not Unix time
+	// For proper Unix time, you'd need to add boot time offset
+	embed->timestamp = tS;
+}
+
+// Set embed footer
+U0 DiscordEmbedSetFooter(CDiscordEmbed *embed, U8 *text, U8 *icon_url)
+{
+	if (embed->footer.text) Free(embed->footer.text);
+	if (embed->footer.icon_url) Free(embed->footer.icon_url);
+
+	embed->footer.text = text ? StrNew(text) : NULL;
+	embed->footer.icon_url = icon_url ? StrNew(icon_url) : NULL;
+}
+
+// Set embed image
+U0 DiscordEmbedSetImage(CDiscordEmbed *embed, U8 *url)
+{
+	if (embed->image.url) Free(embed->image.url);
+	embed->image.url = url ? StrNew(url) : NULL;
+}
+
+// Set embed thumbnail
+U0 DiscordEmbedSetThumbnail(CDiscordEmbed *embed, U8 *url)
+{
+	if (embed->thumbnail.url) Free(embed->thumbnail.url);
+	embed->thumbnail.url = url ? StrNew(url) : NULL;
+}
+
+// Set embed author
+U0 DiscordEmbedSetAuthor(CDiscordEmbed *embed, U8 *name, U8 *url, U8 *icon_url)
+{
+	if (embed->author.name) Free(embed->author.name);
+	if (embed->author.url) Free(embed->author.url);
+	if (embed->author.icon_url) Free(embed->author.icon_url);
+
+	embed->author.name = name ? StrNew(name) : NULL;
+	embed->author.url = url ? StrNew(url) : NULL;
+	embed->author.icon_url = icon_url ? StrNew(icon_url) : NULL;
+}
+
+// Add field to embed
+I64 DiscordEmbedAddField(CDiscordEmbed *embed, U8 *name, U8 *value, Bool is_inline)
+{
+	if (embed->field_count >= DISCORD_MAX_EMBED_FIELDS) {
+		return -1;
+	}
+
+	// Grow capacity if needed
+	if (embed->field_count >= embed->field_capacity) {
+		I64 new_cap = embed->field_capacity == 0 ? 4 : embed->field_capacity * 2;
+		if (new_cap > DISCORD_MAX_EMBED_FIELDS) new_cap = DISCORD_MAX_EMBED_FIELDS;
+
+		CDiscordEmbedField *new_fields = MAlloc(new_cap * sizeof(CDiscordEmbedField));
+		MemSet(new_fields, 0, new_cap * sizeof(CDiscordEmbedField));
+
+		if (embed->fields) {
+			MemCpy(new_fields, embed->fields, embed->field_count * sizeof(CDiscordEmbedField));
+			Free(embed->fields);
+		}
+
+		embed->fields = new_fields;
+		embed->field_capacity = new_cap;
+	}
+
+	CDiscordEmbedField *field = &embed->fields[embed->field_count];
+	field->name = name ? StrNew(name) : NULL;
+	field->value = value ? StrNew(value) : NULL;
+	field->is_inline = is_inline;
+
+	embed->field_count++;
+	return embed->field_count - 1;
+}
+
+// ============================================================================
+// JSON SERIALIZATION
+// ============================================================================
+
+// Build embed as JSON object (appends to existing JSON builder)
+U0 DiscordEmbedToJSON(CDiscordEmbed *embed, CJSONBuilder *json)
+{
+	I64 i;
+
+	JSONBeginObject(json);
+
+	// Title
+	if (embed->title) {
+		JSONKeyString(json, "title", embed->title);
+	}
+
+	// Description
+	if (embed->description) {
+		JSONKeyString(json, "description", embed->description);
+	}
+
+	// URL
+	if (embed->url) {
+		JSONKeyString(json, "url", embed->url);
+	}
+
+	// Color
+	if (embed->color >= 0) {
+		JSONKeyInt(json, "color", embed->color);
+	}
+
+	// Timestamp (ISO8601 format would be needed, skip for now)
+
+	// Footer
+	if (embed->footer.text) {
+		JSONKeyObject(json, "footer");
+		JSONKeyString(json, "text", embed->footer.text);
+		if (embed->footer.icon_url) {
+			JSONKeyString(json, "icon_url", embed->footer.icon_url);
+		}
+		JSONEndObject(json);
+	}
+
+	// Image
+	if (embed->image.url) {
+		JSONKeyObject(json, "image");
+		JSONKeyString(json, "url", embed->image.url);
+		JSONEndObject(json);
+	}
+
+	// Thumbnail
+	if (embed->thumbnail.url) {
+		JSONKeyObject(json, "thumbnail");
+		JSONKeyString(json, "url", embed->thumbnail.url);
+		JSONEndObject(json);
+	}
+
+	// Author
+	if (embed->author.name) {
+		JSONKeyObject(json, "author");
+		JSONKeyString(json, "name", embed->author.name);
+		if (embed->author.url) {
+			JSONKeyString(json, "url", embed->author.url);
+		}
+		if (embed->author.icon_url) {
+			JSONKeyString(json, "icon_url", embed->author.icon_url);
+		}
+		JSONEndObject(json);
+	}
+
+	// Fields
+	if (embed->field_count > 0) {
+		JSONKeyArray(json, "fields");
+		for (i = 0; i < embed->field_count; i++) {
+			JSONBeginObject(json);
+			if (embed->fields[i].name) {
+				JSONKeyString(json, "name", embed->fields[i].name);
+			}
+			if (embed->fields[i].value) {
+				JSONKeyString(json, "value", embed->fields[i].value);
+			}
+			JSONKeyBool(json, "inline", embed->fields[i].is_inline);
+			JSONEndObject(json);
+		}
+		JSONEndArray(json);
+	}
+
+	JSONEndObject(json);
+}
+
+// ============================================================================
+// MESSAGE SENDING WITH EMBEDS
+// ============================================================================
+
+// Send message with embed
+I64 DiscordSendMessageWithEmbed(CDiscordClient *client, CDiscordSnowflake channel_id,
+                                U8 *content, CDiscordEmbed *embed)
+{
+	U8 endpoint[64];
+	CJSONBuilder json;
+	CHTTPResponse *resp;
+
+	StrPrint(endpoint, "/channels/%llu/messages", channel_id);
+
+	JSONBuilderInit(&json, 2048);
+	JSONBeginObject(&json);
+
+	if (content) {
+		JSONKeyString(&json, "content", content);
+	}
+
+	if (embed) {
+		JSONKeyArray(&json, "embeds");
+		DiscordEmbedToJSON(embed, &json);
+		JSONEndArray(&json);
+	}
+
+	JSONEndObject(&json);
+
+	resp = DiscordAPIRequest(client, HTTP_METHOD_POST, endpoint, JSONBuilderGet(&json));
+	JSONBuilderFree(&json);
+
+	if (!resp) return DISCORD_ERR_API_ERROR;
+
+	I64 status = resp->status_code;
+	HTTPResponseFree(resp);
+
+	return (status == 200 || status == 201) ? DISCORD_OK : DISCORD_ERR_API_ERROR;
+}
+
+// Send message with multiple embeds
+I64 DiscordSendMessageWithEmbeds(CDiscordClient *client, CDiscordSnowflake channel_id,
+                                 U8 *content, CDiscordEmbed **embeds, I64 embed_count)
+{
+	U8 endpoint[64];
+	CJSONBuilder json;
+	CHTTPResponse *resp;
+	I64 i;
+
+	if (embed_count > 10) embed_count = 10;  // Discord limit
+
+	StrPrint(endpoint, "/channels/%llu/messages", channel_id);
+
+	JSONBuilderInit(&json, 4096);
+	JSONBeginObject(&json);
+
+	if (content) {
+		JSONKeyString(&json, "content", content);
+	}
+
+	if (embeds && embed_count > 0) {
+		JSONKeyArray(&json, "embeds");
+		for (i = 0; i < embed_count; i++) {
+			if (embeds[i]) {
+				DiscordEmbedToJSON(embeds[i], &json);
+			}
+		}
+		JSONEndArray(&json);
+	}
+
+	JSONEndObject(&json);
+
+	resp = DiscordAPIRequest(client, HTTP_METHOD_POST, endpoint, JSONBuilderGet(&json));
+	JSONBuilderFree(&json);
+
+	if (!resp) return DISCORD_ERR_API_ERROR;
+
+	I64 status = resp->status_code;
+	HTTPResponseFree(resp);
+
+	return (status == 200 || status == 201) ? DISCORD_OK : DISCORD_ERR_API_ERROR;
+}
+
+// Reply to message with embed
+I64 DiscordReplyWithEmbed(CDiscordClient *client, CDiscordMessage *original,
+                          U8 *content, CDiscordEmbed *embed)
+{
+	U8 endpoint[64];
+	CJSONBuilder json;
+	CHTTPResponse *resp;
+
+	StrPrint(endpoint, "/channels/%llu/messages", original->channel_id);
+
+	JSONBuilderInit(&json, 2048);
+	JSONBeginObject(&json);
+
+	if (content) {
+		JSONKeyString(&json, "content", content);
+	}
+
+	// Message reference for reply
+	JSONKeyObject(&json, "message_reference");
+	U8 msg_id_str[32];
+	StrPrint(msg_id_str, "%llu", original->id);
+	JSONKeyString(&json, "message_id", msg_id_str);
+	JSONEndObject(&json);
+
+	if (embed) {
+		JSONKeyArray(&json, "embeds");
+		DiscordEmbedToJSON(embed, &json);
+		JSONEndArray(&json);
+	}
+
+	JSONEndObject(&json);
+
+	resp = DiscordAPIRequest(client, HTTP_METHOD_POST, endpoint, JSONBuilderGet(&json));
+	JSONBuilderFree(&json);
+
+	if (!resp) return DISCORD_ERR_API_ERROR;
+
+	I64 status = resp->status_code;
+	HTTPResponseFree(resp);
+
+	return (status == 200 || status == 201) ? DISCORD_OK : DISCORD_ERR_API_ERROR;
+}
+
+// Edit message with embed
+I64 DiscordEditMessageWithEmbed(CDiscordClient *client, CDiscordSnowflake channel_id,
+                                CDiscordSnowflake message_id, U8 *content,
+                                CDiscordEmbed *embed)
+{
+	U8 endpoint[128];
+	CJSONBuilder json;
+	CHTTPResponse *resp;
+
+	StrPrint(endpoint, "/channels/%llu/messages/%llu", channel_id, message_id);
+
+	JSONBuilderInit(&json, 2048);
+	JSONBeginObject(&json);
+
+	if (content) {
+		JSONKeyString(&json, "content", content);
+	}
+
+	if (embed) {
+		JSONKeyArray(&json, "embeds");
+		DiscordEmbedToJSON(embed, &json);
+		JSONEndArray(&json);
+	}
+
+	JSONEndObject(&json);
+
+	resp = DiscordAPIRequest(client, HTTP_METHOD_PATCH, endpoint, JSONBuilderGet(&json));
+	JSONBuilderFree(&json);
+
+	if (!resp) return DISCORD_ERR_API_ERROR;
+
+	I64 status = resp->status_code;
+	HTTPResponseFree(resp);
+
+	return (status == 200) ? DISCORD_OK : DISCORD_ERR_API_ERROR;
+}
+
+// ============================================================================
+// CONVENIENCE FUNCTIONS
+// ============================================================================
+
+// Create a simple embed with title and description
+CDiscordEmbed *DiscordEmbedSimple(U8 *title, U8 *description, I64 color)
+{
+	CDiscordEmbed *embed = DiscordEmbedNew();
+	DiscordEmbedSetTitle(embed, title);
+	DiscordEmbedSetDescription(embed, description);
+	if (color >= 0) {
+		DiscordEmbedSetColor(embed, color);
+	}
+	return embed;
+}
+
+// Common embed colors
+#define DISCORD_COLOR_RED       0xFF0000
+#define DISCORD_COLOR_GREEN     0x00FF00
+#define DISCORD_COLOR_BLUE      0x0000FF
+#define DISCORD_COLOR_YELLOW    0xFFFF00
+#define DISCORD_COLOR_ORANGE    0xFF8000
+#define DISCORD_COLOR_PURPLE    0x8000FF
+#define DISCORD_COLOR_CYAN      0x00FFFF
+#define DISCORD_COLOR_MAGENTA   0xFF00FF
+#define DISCORD_COLOR_WHITE     0xFFFFFF
+#define DISCORD_COLOR_BLACK     0x000000
+#define DISCORD_COLOR_BLURPLE   0x5865F2  // Discord brand color
+

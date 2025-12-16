@@ -1,0 +1,1399 @@
+// sh.ZC - POSIX Shell Implementation for ZealOS
+// Bourne shell compatible with basic bash extensions
+
+#define SH_LINE_SIZE    4096
+#define SH_TOKEN_MAX    256
+#define SH_ARGS_MAX     256
+#define SH_VARS_MAX     512
+#define SH_FUNC_MAX     128
+#define SH_ALIAS_MAX    64
+#define SH_STACK_MAX    32
+
+// Token types
+#define TOK_WORD        1
+#define TOK_PIPE        2   // |
+#define TOK_AND         3   // &&
+#define TOK_OR          4   // ||
+#define TOK_SEMI        5   // ;
+#define TOK_AMP         6   // &
+#define TOK_LPAREN      7   // (
+#define TOK_RPAREN      8   // )
+#define TOK_LBRACE      9   // {
+#define TOK_RBRACE      10  // }
+#define TOK_NEWLINE     11
+#define TOK_REDIR_OUT   12  // >
+#define TOK_REDIR_APPEND 13 // >>
+#define TOK_REDIR_IN    14  // <
+#define TOK_REDIR_HEREDOC 15 // <<
+#define TOK_REDIR_ERR   16  // 2>
+#define TOK_REDIR_BOTH  17  // &>
+#define TOK_IF          20
+#define TOK_THEN        21
+#define TOK_ELSE        22
+#define TOK_ELIF        23
+#define TOK_FI          24
+#define TOK_FOR         25
+#define TOK_WHILE       26
+#define TOK_UNTIL       27
+#define TOK_DO          28
+#define TOK_DONE        29
+#define TOK_CASE        30
+#define TOK_ESAC        31
+#define TOK_IN          32
+#define TOK_FUNCTION    33
+#define TOK_EOF         99
+
+// Shell variable
+class CShellVar {
+    U8 name[128];
+    U8 *value;
+    Bool exported;
+    Bool readonly;
+};
+
+// Shell function
+class CShellFunc {
+    U8 name[128];
+    U8 *body;
+};
+
+// Shell alias
+class CShellAlias {
+    U8 name[64];
+    U8 *value;
+};
+
+// Shell state
+class CShellState {
+    // Variables
+    CShellVar vars[SH_VARS_MAX];
+    I64 var_count;
+
+    // Functions
+    CShellFunc funcs[SH_FUNC_MAX];
+    I64 func_count;
+
+    // Aliases
+    CShellAlias aliases[SH_ALIAS_MAX];
+    I64 alias_count;
+
+    // Special variables
+    I64 last_exit_status;    // $?
+    I64 shell_pid;           // $$
+    I64 last_bg_pid;         // $!
+    I64 argc;                // $#
+    U8 **argv;               // $0, $1, ...
+
+    // State
+    Bool interactive;
+    Bool login_shell;
+    Bool exit_requested;
+    I64 exit_code;
+
+    // Input
+    FILE *input;
+    U8 *input_string;
+    I64 input_pos;
+    I64 line_number;
+
+    // Loop control
+    I64 loop_depth;
+    Bool break_flag;
+    Bool continue_flag;
+    I64 break_count;
+};
+
+CShellState *g_shell = NULL;
+
+// ============================================================================
+// VARIABLE MANAGEMENT
+// ============================================================================
+
+CShellVar *ShellVarFind(CShellState *sh, U8 *name)
+{
+    for (I64 i = 0; i < sh->var_count; i++) {
+        if (strcmp(sh->vars[i].name, name) == 0)
+            return &sh->vars[i];
+    }
+    return NULL;
+}
+
+U8 *ShellVarGet(CShellState *sh, U8 *name)
+{
+    // Special variables
+    if (strcmp(name, "?") == 0) {
+        static U8 buf[32];
+        snprintf(buf, 32, "%ld", sh->last_exit_status);
+        return buf;
+    }
+    if (strcmp(name, "$") == 0) {
+        static U8 buf[32];
+        snprintf(buf, 32, "%ld", sh->shell_pid);
+        return buf;
+    }
+    if (strcmp(name, "!") == 0) {
+        static U8 buf[32];
+        snprintf(buf, 32, "%ld", sh->last_bg_pid);
+        return buf;
+    }
+    if (strcmp(name, "#") == 0) {
+        static U8 buf[32];
+        snprintf(buf, 32, "%ld", sh->argc);
+        return buf;
+    }
+    if (strcmp(name, "0") == 0) {
+        return sh->argv ? sh->argv[0] : "sh";
+    }
+    if (name[0] >= '1' && name[0] <= '9' && !name[1]) {
+        I64 idx = name[0] - '0';
+        if (idx <= sh->argc && sh->argv)
+            return sh->argv[idx];
+        return "";
+    }
+    if (strcmp(name, "@") == 0 || strcmp(name, "*") == 0) {
+        // Would need to join all args - simplified
+        return "";
+    }
+
+    // Check environment first
+    U8 *env_val = getenv(name);
+    if (env_val) return env_val;
+
+    // Then shell variables
+    CShellVar *var = ShellVarFind(sh, name);
+    if (var && var->value)
+        return var->value;
+
+    return "";
+}
+
+I64 ShellVarSet(CShellState *sh, U8 *name, U8 *value)
+{
+    CShellVar *var = ShellVarFind(sh, name);
+
+    if (var) {
+        if (var->readonly) {
+            fprintf(stderr, "sh: %s: readonly variable\n", name);
+            return -1;
+        }
+        if (var->value) Free(var->value);
+        var->value = StrNew(value);
+        if (var->exported)
+            setenv(name, value, 1);
+        return 0;
+    }
+
+    if (sh->var_count >= SH_VARS_MAX) {
+        fprintf(stderr, "sh: too many variables\n");
+        return -1;
+    }
+
+    var = &sh->vars[sh->var_count++];
+    strncpy(var->name, name, 127);
+    var->name[127] = 0;
+    var->value = StrNew(value);
+    var->exported = FALSE;
+    var->readonly = FALSE;
+
+    return 0;
+}
+
+I64 ShellVarExport(CShellState *sh, U8 *name)
+{
+    CShellVar *var = ShellVarFind(sh, name);
+    if (var) {
+        var->exported = TRUE;
+        if (var->value)
+            setenv(name, var->value, 1);
+    } else {
+        // Create empty exported var
+        ShellVarSet(sh, name, "");
+        var = ShellVarFind(sh, name);
+        if (var) var->exported = TRUE;
+    }
+    return 0;
+}
+
+// ============================================================================
+// STRING EXPANSION
+// ============================================================================
+
+// Expand variables, command substitution, etc.
+U8 *ShellExpand(CShellState *sh, U8 *str)
+{
+    U8 *result = MAlloc(SH_LINE_SIZE);
+    I64 rpos = 0;
+    U8 *p = str;
+
+    while (*p && rpos < SH_LINE_SIZE - 1) {
+        if (*p == '\\' && *(p+1)) {
+            // Escape sequence
+            p++;
+            switch (*p) {
+                case 'n': result[rpos++] = '\n'; break;
+                case 't': result[rpos++] = '\t'; break;
+                case 'r': result[rpos++] = '\r'; break;
+                case '$': result[rpos++] = '$'; break;
+                case '`': result[rpos++] = '`'; break;
+                case '"': result[rpos++] = '"'; break;
+                case '\\': result[rpos++] = '\\'; break;
+                default: result[rpos++] = *p;
+            }
+            p++;
+        } else if (*p == '$') {
+            p++;
+            U8 varname[256];
+            I64 vpos = 0;
+
+            if (*p == '{') {
+                // ${VAR} or ${VAR:-default} etc
+                p++;
+                U8 *end = strchr(p, '}');
+                if (!end) {
+                    result[rpos++] = '$';
+                    result[rpos++] = '{';
+                    continue;
+                }
+
+                // Check for modifiers
+                U8 *colon = strchr(p, ':');
+                U8 *modifier = NULL;
+                U8 mod_char = 0;
+
+                if (colon && colon < end) {
+                    I64 name_len = colon - p;
+                    strncpy(varname, p, name_len);
+                    varname[name_len] = 0;
+                    mod_char = *(colon + 1);
+                    modifier = colon + 2;
+                } else {
+                    I64 name_len = end - p;
+                    strncpy(varname, p, name_len);
+                    varname[name_len] = 0;
+                }
+
+                U8 *val = ShellVarGet(sh, varname);
+
+                if (mod_char == '-') {
+                    // ${VAR:-default} - use default if unset or empty
+                    if (!val || !*val) {
+                        I64 def_len = end - modifier;
+                        for (I64 i = 0; i < def_len && rpos < SH_LINE_SIZE - 1; i++)
+                            result[rpos++] = modifier[i];
+                    } else {
+                        while (*val && rpos < SH_LINE_SIZE - 1)
+                            result[rpos++] = *val++;
+                    }
+                } else if (mod_char == '+') {
+                    // ${VAR:+value} - use value if set
+                    if (val && *val) {
+                        I64 def_len = end - modifier;
+                        for (I64 i = 0; i < def_len && rpos < SH_LINE_SIZE - 1; i++)
+                            result[rpos++] = modifier[i];
+                    }
+                } else if (mod_char == '=') {
+                    // ${VAR:=default} - assign default if unset
+                    if (!val || !*val) {
+                        I64 def_len = end - modifier;
+                        U8 *def = MAlloc(def_len + 1);
+                        strncpy(def, modifier, def_len);
+                        def[def_len] = 0;
+                        ShellVarSet(sh, varname, def);
+                        for (I64 i = 0; i < def_len && rpos < SH_LINE_SIZE - 1; i++)
+                            result[rpos++] = modifier[i];
+                        Free(def);
+                    } else {
+                        while (*val && rpos < SH_LINE_SIZE - 1)
+                            result[rpos++] = *val++;
+                    }
+                } else {
+                    // Simple ${VAR}
+                    while (*val && rpos < SH_LINE_SIZE - 1)
+                        result[rpos++] = *val++;
+                }
+
+                p = end + 1;
+            } else if (*p == '(') {
+                // $(command) - command substitution
+                p++;
+                U8 cmd[SH_LINE_SIZE];
+                I64 cpos = 0;
+                I64 paren_depth = 1;
+
+                while (*p && paren_depth > 0 && cpos < SH_LINE_SIZE - 1) {
+                    if (*p == '(') paren_depth++;
+                    else if (*p == ')') paren_depth--;
+
+                    if (paren_depth > 0)
+                        cmd[cpos++] = *p;
+                    p++;
+                }
+                cmd[cpos] = 0;
+
+                // Execute command and capture output
+                // For now, simplified - would need pipe/fork
+                // TODO: Implement command substitution properly
+
+            } else if (isalnum(*p) || *p == '_' || *p == '?' || *p == '$' ||
+                       *p == '!' || *p == '#' || *p == '*' || *p == '@' ||
+                       (*p >= '0' && *p <= '9')) {
+                // $VAR or $? etc
+                if (*p == '?' || *p == '$' || *p == '!' || *p == '#' ||
+                    *p == '*' || *p == '@' || (*p >= '0' && *p <= '9')) {
+                    varname[0] = *p++;
+                    varname[1] = 0;
+                } else {
+                    while ((isalnum(*p) || *p == '_') && vpos < 255)
+                        varname[vpos++] = *p++;
+                    varname[vpos] = 0;
+                }
+
+                U8 *val = ShellVarGet(sh, varname);
+                while (*val && rpos < SH_LINE_SIZE - 1)
+                    result[rpos++] = *val++;
+            } else {
+                result[rpos++] = '$';
+            }
+        } else if (*p == '`') {
+            // `command` - old style command substitution
+            p++;
+            U8 cmd[SH_LINE_SIZE];
+            I64 cpos = 0;
+            while (*p && *p != '`' && cpos < SH_LINE_SIZE - 1)
+                cmd[cpos++] = *p++;
+            cmd[cpos] = 0;
+            if (*p == '`') p++;
+
+            // TODO: Execute and capture
+
+        } else if (*p == '~' && (p == str || *(p-1) == ':' || *(p-1) == '=')) {
+            // Tilde expansion
+            p++;
+            if (!*p || *p == '/' || *p == ':') {
+                U8 *home = ShellVarGet(sh, "HOME");
+                while (*home && rpos < SH_LINE_SIZE - 1)
+                    result[rpos++] = *home++;
+            } else {
+                result[rpos++] = '~';
+            }
+        } else {
+            result[rpos++] = *p++;
+        }
+    }
+
+    result[rpos] = 0;
+    return result;
+}
+
+// ============================================================================
+// TOKENIZER
+// ============================================================================
+
+class CShellToken {
+    I64 type;
+    U8 value[SH_TOKEN_MAX];
+};
+
+class CShellLexer {
+    U8 *input;
+    I64 pos;
+    I64 line;
+    CShellToken current;
+    Bool has_current;
+};
+
+I64 ShellLexerPeekChar(CShellLexer *lex)
+{
+    return lex->input[lex->pos];
+}
+
+I64 ShellLexerGetChar(CShellLexer *lex)
+{
+    I64 c = lex->input[lex->pos];
+    if (c) {
+        lex->pos++;
+        if (c == '\n') lex->line++;
+    }
+    return c;
+}
+
+U0 ShellLexerSkipWhitespace(CShellLexer *lex)
+{
+    while (lex->input[lex->pos] == ' ' || lex->input[lex->pos] == '\t')
+        lex->pos++;
+}
+
+U0 ShellLexerSkipComment(CShellLexer *lex)
+{
+    if (lex->input[lex->pos] == '#') {
+        while (lex->input[lex->pos] && lex->input[lex->pos] != '\n')
+            lex->pos++;
+    }
+}
+
+CShellToken *ShellLexerNext(CShellLexer *lex)
+{
+    ShellLexerSkipWhitespace(lex);
+    ShellLexerSkipComment(lex);
+
+    CShellToken *tok = &lex->current;
+    tok->value[0] = 0;
+
+    I64 c = ShellLexerPeekChar(lex);
+
+    if (!c) {
+        tok->type = TOK_EOF;
+        return tok;
+    }
+
+    // Newline
+    if (c == '\n') {
+        ShellLexerGetChar(lex);
+        tok->type = TOK_NEWLINE;
+        strcpy(tok->value, "\n");
+        return tok;
+    }
+
+    // Operators
+    if (c == '|') {
+        ShellLexerGetChar(lex);
+        if (ShellLexerPeekChar(lex) == '|') {
+            ShellLexerGetChar(lex);
+            tok->type = TOK_OR;
+            strcpy(tok->value, "||");
+        } else {
+            tok->type = TOK_PIPE;
+            strcpy(tok->value, "|");
+        }
+        return tok;
+    }
+
+    if (c == '&') {
+        ShellLexerGetChar(lex);
+        if (ShellLexerPeekChar(lex) == '&') {
+            ShellLexerGetChar(lex);
+            tok->type = TOK_AND;
+            strcpy(tok->value, "&&");
+        } else if (ShellLexerPeekChar(lex) == '>') {
+            ShellLexerGetChar(lex);
+            tok->type = TOK_REDIR_BOTH;
+            strcpy(tok->value, "&>");
+        } else {
+            tok->type = TOK_AMP;
+            strcpy(tok->value, "&");
+        }
+        return tok;
+    }
+
+    if (c == ';') {
+        ShellLexerGetChar(lex);
+        tok->type = TOK_SEMI;
+        strcpy(tok->value, ";");
+        return tok;
+    }
+
+    if (c == '(') {
+        ShellLexerGetChar(lex);
+        tok->type = TOK_LPAREN;
+        strcpy(tok->value, "(");
+        return tok;
+    }
+
+    if (c == ')') {
+        ShellLexerGetChar(lex);
+        tok->type = TOK_RPAREN;
+        strcpy(tok->value, ")");
+        return tok;
+    }
+
+    if (c == '{') {
+        ShellLexerGetChar(lex);
+        tok->type = TOK_LBRACE;
+        strcpy(tok->value, "{");
+        return tok;
+    }
+
+    if (c == '}') {
+        ShellLexerGetChar(lex);
+        tok->type = TOK_RBRACE;
+        strcpy(tok->value, "}");
+        return tok;
+    }
+
+    // Redirections
+    if (c == '>') {
+        ShellLexerGetChar(lex);
+        if (ShellLexerPeekChar(lex) == '>') {
+            ShellLexerGetChar(lex);
+            tok->type = TOK_REDIR_APPEND;
+            strcpy(tok->value, ">>");
+        } else {
+            tok->type = TOK_REDIR_OUT;
+            strcpy(tok->value, ">");
+        }
+        return tok;
+    }
+
+    if (c == '<') {
+        ShellLexerGetChar(lex);
+        if (ShellLexerPeekChar(lex) == '<') {
+            ShellLexerGetChar(lex);
+            tok->type = TOK_REDIR_HEREDOC;
+            strcpy(tok->value, "<<");
+        } else {
+            tok->type = TOK_REDIR_IN;
+            strcpy(tok->value, "<");
+        }
+        return tok;
+    }
+
+    // Check for 2> redirect
+    if (c == '2' && lex->input[lex->pos + 1] == '>') {
+        ShellLexerGetChar(lex);
+        ShellLexerGetChar(lex);
+        tok->type = TOK_REDIR_ERR;
+        strcpy(tok->value, "2>");
+        return tok;
+    }
+
+    // Word (including quoted strings)
+    tok->type = TOK_WORD;
+    I64 vpos = 0;
+    Bool in_single = FALSE;
+    Bool in_double = FALSE;
+
+    while (vpos < SH_TOKEN_MAX - 1) {
+        c = ShellLexerPeekChar(lex);
+
+        if (!c) break;
+
+        if (in_single) {
+            if (c == '\'') {
+                ShellLexerGetChar(lex);
+                in_single = FALSE;
+            } else {
+                tok->value[vpos++] = ShellLexerGetChar(lex);
+            }
+        } else if (in_double) {
+            if (c == '"') {
+                ShellLexerGetChar(lex);
+                in_double = FALSE;
+            } else if (c == '\\') {
+                ShellLexerGetChar(lex);
+                c = ShellLexerPeekChar(lex);
+                if (c == '"' || c == '\\' || c == '$' || c == '`' || c == '\n') {
+                    tok->value[vpos++] = ShellLexerGetChar(lex);
+                } else {
+                    tok->value[vpos++] = '\\';
+                }
+            } else {
+                tok->value[vpos++] = ShellLexerGetChar(lex);
+            }
+        } else {
+            if (c == '\'') {
+                ShellLexerGetChar(lex);
+                in_single = TRUE;
+            } else if (c == '"') {
+                ShellLexerGetChar(lex);
+                in_double = TRUE;
+            } else if (c == '\\') {
+                ShellLexerGetChar(lex);
+                c = ShellLexerPeekChar(lex);
+                if (c == '\n') {
+                    ShellLexerGetChar(lex);  // Line continuation
+                } else if (c) {
+                    tok->value[vpos++] = ShellLexerGetChar(lex);
+                }
+            } else if (c == ' ' || c == '\t' || c == '\n' ||
+                       c == '|' || c == '&' || c == ';' ||
+                       c == '(' || c == ')' || c == '<' || c == '>' ||
+                       c == '{' || c == '}') {
+                break;
+            } else {
+                tok->value[vpos++] = ShellLexerGetChar(lex);
+            }
+        }
+    }
+
+    tok->value[vpos] = 0;
+
+    // Check for reserved words
+    if (strcmp(tok->value, "if") == 0) tok->type = TOK_IF;
+    else if (strcmp(tok->value, "then") == 0) tok->type = TOK_THEN;
+    else if (strcmp(tok->value, "else") == 0) tok->type = TOK_ELSE;
+    else if (strcmp(tok->value, "elif") == 0) tok->type = TOK_ELIF;
+    else if (strcmp(tok->value, "fi") == 0) tok->type = TOK_FI;
+    else if (strcmp(tok->value, "for") == 0) tok->type = TOK_FOR;
+    else if (strcmp(tok->value, "while") == 0) tok->type = TOK_WHILE;
+    else if (strcmp(tok->value, "until") == 0) tok->type = TOK_UNTIL;
+    else if (strcmp(tok->value, "do") == 0) tok->type = TOK_DO;
+    else if (strcmp(tok->value, "done") == 0) tok->type = TOK_DONE;
+    else if (strcmp(tok->value, "case") == 0) tok->type = TOK_CASE;
+    else if (strcmp(tok->value, "esac") == 0) tok->type = TOK_ESAC;
+    else if (strcmp(tok->value, "in") == 0) tok->type = TOK_IN;
+    else if (strcmp(tok->value, "function") == 0) tok->type = TOK_FUNCTION;
+
+    return tok;
+}
+
+// ============================================================================
+// COMMAND EXECUTION
+// ============================================================================
+
+// Execute a simple command
+I64 ShellExecSimple(CShellState *sh, U8 **argv, I64 argc,
+                    U8 *stdin_file, U8 *stdout_file, U8 *stderr_file,
+                    Bool append_stdout, Bool append_stderr)
+{
+    if (argc == 0) return 0;
+
+    // Expand arguments
+    U8 *expanded[SH_ARGS_MAX];
+    for (I64 i = 0; i < argc; i++) {
+        expanded[i] = ShellExpand(sh, argv[i]);
+    }
+    expanded[argc] = NULL;
+
+    U8 *cmd = expanded[0];
+
+    // Built-in commands
+    if (strcmp(cmd, "cd") == 0) {
+        U8 *dir = argc > 1 ? expanded[1] : ShellVarGet(sh, "HOME");
+        if (PosixChdir(dir) < 0) {
+            fprintf(stderr, "cd: %s: %s\n", dir, strerror(errno));
+            sh->last_exit_status = 1;
+        } else {
+            // Update PWD
+            U8 cwd[PATH_MAX];
+            if (PosixGetcwd(cwd, PATH_MAX))
+                ShellVarSet(sh, "PWD", cwd);
+            sh->last_exit_status = 0;
+        }
+        goto cleanup;
+    }
+
+    if (strcmp(cmd, "pwd") == 0) {
+        U8 cwd[PATH_MAX];
+        if (PosixGetcwd(cwd, PATH_MAX)) {
+            printf("%s\n", cwd);
+            sh->last_exit_status = 0;
+        } else {
+            sh->last_exit_status = 1;
+        }
+        goto cleanup;
+    }
+
+    if (strcmp(cmd, "export") == 0) {
+        for (I64 i = 1; i < argc; i++) {
+            U8 *eq = strchr(expanded[i], '=');
+            if (eq) {
+                *eq = 0;
+                ShellVarSet(sh, expanded[i], eq + 1);
+                ShellVarExport(sh, expanded[i]);
+            } else {
+                ShellVarExport(sh, expanded[i]);
+            }
+        }
+        sh->last_exit_status = 0;
+        goto cleanup;
+    }
+
+    if (strcmp(cmd, "set") == 0) {
+        // TODO: Implement set
+        sh->last_exit_status = 0;
+        goto cleanup;
+    }
+
+    if (strcmp(cmd, "unset") == 0) {
+        for (I64 i = 1; i < argc; i++) {
+            unsetenv(expanded[i]);
+        }
+        sh->last_exit_status = 0;
+        goto cleanup;
+    }
+
+    if (strcmp(cmd, "exit") == 0) {
+        sh->exit_requested = TRUE;
+        sh->exit_code = argc > 1 ? atoi(expanded[1]) : sh->last_exit_status;
+        goto cleanup;
+    }
+
+    if (strcmp(cmd, "return") == 0) {
+        sh->last_exit_status = argc > 1 ? atoi(expanded[1]) : 0;
+        goto cleanup;
+    }
+
+    if (strcmp(cmd, "break") == 0) {
+        if (sh->loop_depth > 0) {
+            sh->break_flag = TRUE;
+            sh->break_count = argc > 1 ? atoi(expanded[1]) : 1;
+        }
+        sh->last_exit_status = 0;
+        goto cleanup;
+    }
+
+    if (strcmp(cmd, "continue") == 0) {
+        if (sh->loop_depth > 0) {
+            sh->continue_flag = TRUE;
+        }
+        sh->last_exit_status = 0;
+        goto cleanup;
+    }
+
+    if (strcmp(cmd, "true") == 0) {
+        sh->last_exit_status = 0;
+        goto cleanup;
+    }
+
+    if (strcmp(cmd, "false") == 0) {
+        sh->last_exit_status = 1;
+        goto cleanup;
+    }
+
+    if (strcmp(cmd, "echo") == 0) {
+        Bool newline = TRUE;
+        I64 start = 1;
+        if (argc > 1 && strcmp(expanded[1], "-n") == 0) {
+            newline = FALSE;
+            start = 2;
+        }
+        for (I64 i = start; i < argc; i++) {
+            if (i > start) putchar(' ');
+            printf("%s", expanded[i]);
+        }
+        if (newline) putchar('\n');
+        sh->last_exit_status = 0;
+        goto cleanup;
+    }
+
+    if (strcmp(cmd, "read") == 0) {
+        U8 line[SH_LINE_SIZE];
+        if (fgets(line, SH_LINE_SIZE, stdin)) {
+            I64 len = strlen(line);
+            if (len > 0 && line[len-1] == '\n')
+                line[len-1] = 0;
+
+            U8 *varname = argc > 1 ? expanded[1] : "REPLY";
+            ShellVarSet(sh, varname, line);
+            sh->last_exit_status = 0;
+        } else {
+            sh->last_exit_status = 1;
+        }
+        goto cleanup;
+    }
+
+    if (strcmp(cmd, "test") == 0 || strcmp(cmd, "[") == 0) {
+        // Use our test implementation
+        sh->last_exit_status = test_main(argc, expanded);
+        goto cleanup;
+    }
+
+    if (strcmp(cmd, ".") == 0 || strcmp(cmd, "source") == 0) {
+        if (argc < 2) {
+            fprintf(stderr, "%s: filename argument required\n", cmd);
+            sh->last_exit_status = 2;
+            goto cleanup;
+        }
+        // TODO: Source file
+        sh->last_exit_status = 0;
+        goto cleanup;
+    }
+
+    if (strcmp(cmd, "eval") == 0) {
+        // Join remaining args and execute
+        U8 eval_cmd[SH_LINE_SIZE] = "";
+        for (I64 i = 1; i < argc; i++) {
+            if (i > 1) strcat(eval_cmd, " ");
+            strcat(eval_cmd, expanded[i]);
+        }
+        // TODO: Parse and execute eval_cmd
+        sh->last_exit_status = 0;
+        goto cleanup;
+    }
+
+    if (strcmp(cmd, "exec") == 0) {
+        // TODO: Replace shell process
+        sh->last_exit_status = 0;
+        goto cleanup;
+    }
+
+    if (strcmp(cmd, "shift") == 0) {
+        I64 n = argc > 1 ? atoi(expanded[1]) : 1;
+        if (n > 0 && n <= sh->argc) {
+            sh->argc -= n;
+            for (I64 i = 1; i <= sh->argc; i++) {
+                sh->argv[i] = sh->argv[i + n];
+            }
+        }
+        sh->last_exit_status = 0;
+        goto cleanup;
+    }
+
+    // Check for variable assignment
+    if (strchr(cmd, '=') && !strchr(cmd, ' ')) {
+        U8 *eq = strchr(cmd, '=');
+        *eq = 0;
+        ShellVarSet(sh, cmd, eq + 1);
+        sh->last_exit_status = 0;
+        goto cleanup;
+    }
+
+    // Try GNU utilities
+    CGnuUtil *util = GnuUtilFind(cmd);
+    if (util) {
+        // Build command line
+        U8 cmdline[SH_LINE_SIZE] = "";
+        for (I64 i = 0; i < argc; i++) {
+            if (i > 0) strcat(cmdline, " ");
+            strcat(cmdline, expanded[i]);
+        }
+        sh->last_exit_status = CRun(util->main_func, cmdline);
+        goto cleanup;
+    }
+
+    // External command - not implemented yet
+    fprintf(stderr, "sh: %s: command not found\n", cmd);
+    sh->last_exit_status = 127;
+
+cleanup:
+    for (I64 i = 0; i < argc; i++) {
+        Free(expanded[i]);
+    }
+
+    return sh->last_exit_status;
+}
+
+// ============================================================================
+// PARSER AND EXECUTOR
+// ============================================================================
+
+I64 ShellParseAndExec(CShellState *sh, U8 *input);
+
+// Parse and execute a pipeline
+I64 ShellExecPipeline(CShellState *sh, CShellLexer *lex)
+{
+    U8 *argv[SH_ARGS_MAX];
+    I64 argc = 0;
+    U8 *stdin_file = NULL;
+    U8 *stdout_file = NULL;
+    U8 *stderr_file = NULL;
+    Bool append_stdout = FALSE;
+    Bool background = FALSE;
+
+    CShellToken *tok;
+
+    while (1) {
+        tok = ShellLexerNext(lex);
+
+        if (tok->type == TOK_EOF || tok->type == TOK_NEWLINE ||
+            tok->type == TOK_SEMI || tok->type == TOK_AMP ||
+            tok->type == TOK_PIPE || tok->type == TOK_AND ||
+            tok->type == TOK_OR) {
+            break;
+        }
+
+        if (tok->type == TOK_REDIR_OUT) {
+            tok = ShellLexerNext(lex);
+            if (tok->type == TOK_WORD)
+                stdout_file = StrNew(tok->value);
+            continue;
+        }
+
+        if (tok->type == TOK_REDIR_APPEND) {
+            tok = ShellLexerNext(lex);
+            if (tok->type == TOK_WORD) {
+                stdout_file = StrNew(tok->value);
+                append_stdout = TRUE;
+            }
+            continue;
+        }
+
+        if (tok->type == TOK_REDIR_IN) {
+            tok = ShellLexerNext(lex);
+            if (tok->type == TOK_WORD)
+                stdin_file = StrNew(tok->value);
+            continue;
+        }
+
+        if (tok->type == TOK_WORD) {
+            if (argc < SH_ARGS_MAX - 1)
+                argv[argc++] = StrNew(tok->value);
+        }
+    }
+
+    argv[argc] = NULL;
+
+    // Execute command
+    I64 status = 0;
+    if (argc > 0) {
+        status = ShellExecSimple(sh, argv, argc, stdin_file, stdout_file,
+                                 stderr_file, append_stdout, FALSE);
+    }
+
+    // Handle pipeline continuation
+    if (tok->type == TOK_PIPE) {
+        // TODO: Implement pipes properly
+        I64 next_status = ShellExecPipeline(sh, lex);
+        status = next_status;
+    }
+
+    // Handle && and ||
+    if (tok->type == TOK_AND) {
+        if (status == 0) {
+            status = ShellExecPipeline(sh, lex);
+        } else {
+            // Skip next command
+            while ((tok = ShellLexerNext(lex))->type != TOK_EOF &&
+                   tok->type != TOK_NEWLINE && tok->type != TOK_SEMI);
+        }
+    }
+
+    if (tok->type == TOK_OR) {
+        if (status != 0) {
+            status = ShellExecPipeline(sh, lex);
+        } else {
+            // Skip next command
+            while ((tok = ShellLexerNext(lex))->type != TOK_EOF &&
+                   tok->type != TOK_NEWLINE && tok->type != TOK_SEMI);
+        }
+    }
+
+    // Cleanup
+    for (I64 i = 0; i < argc; i++)
+        Free(argv[i]);
+    if (stdin_file) Free(stdin_file);
+    if (stdout_file) Free(stdout_file);
+    if (stderr_file) Free(stderr_file);
+
+    return status;
+}
+
+// Parse and execute if statement
+I64 ShellExecIf(CShellState *sh, CShellLexer *lex)
+{
+    I64 status;
+    CShellToken *tok;
+
+    // Execute condition
+    status = ShellExecPipeline(sh, lex);
+
+    // Expect 'then'
+    tok = ShellLexerNext(lex);
+    while (tok->type == TOK_NEWLINE || tok->type == TOK_SEMI)
+        tok = ShellLexerNext(lex);
+
+    if (tok->type != TOK_THEN) {
+        fprintf(stderr, "sh: syntax error: expected 'then'\n");
+        return 2;
+    }
+
+    if (status == 0) {
+        // Execute then-block
+        while (1) {
+            tok = ShellLexerNext(lex);
+            while (tok->type == TOK_NEWLINE || tok->type == TOK_SEMI)
+                tok = ShellLexerNext(lex);
+
+            if (tok->type == TOK_FI || tok->type == TOK_ELSE ||
+                tok->type == TOK_ELIF || tok->type == TOK_EOF)
+                break;
+
+            // Put token back and execute
+            lex->pos -= strlen(tok->value);
+            ShellExecPipeline(sh, lex);
+
+            if (sh->exit_requested || sh->break_flag || sh->continue_flag)
+                break;
+        }
+
+        // Skip else/elif blocks
+        if (tok->type == TOK_ELSE || tok->type == TOK_ELIF) {
+            I64 depth = 1;
+            while (depth > 0 && tok->type != TOK_EOF) {
+                tok = ShellLexerNext(lex);
+                if (tok->type == TOK_IF) depth++;
+                else if (tok->type == TOK_FI) depth--;
+            }
+        }
+    } else {
+        // Skip then-block
+        while (1) {
+            tok = ShellLexerNext(lex);
+            if (tok->type == TOK_FI || tok->type == TOK_ELSE ||
+                tok->type == TOK_ELIF || tok->type == TOK_EOF)
+                break;
+        }
+
+        if (tok->type == TOK_ELIF) {
+            return ShellExecIf(sh, lex);
+        }
+
+        if (tok->type == TOK_ELSE) {
+            // Execute else-block
+            while (1) {
+                tok = ShellLexerNext(lex);
+                while (tok->type == TOK_NEWLINE || tok->type == TOK_SEMI)
+                    tok = ShellLexerNext(lex);
+
+                if (tok->type == TOK_FI || tok->type == TOK_EOF)
+                    break;
+
+                lex->pos -= strlen(tok->value);
+                ShellExecPipeline(sh, lex);
+
+                if (sh->exit_requested || sh->break_flag || sh->continue_flag)
+                    break;
+            }
+        }
+    }
+
+    return sh->last_exit_status;
+}
+
+// Parse and execute for loop
+I64 ShellExecFor(CShellState *sh, CShellLexer *lex)
+{
+    CShellToken *tok;
+
+    // Get variable name
+    tok = ShellLexerNext(lex);
+    if (tok->type != TOK_WORD) {
+        fprintf(stderr, "sh: syntax error in for loop\n");
+        return 2;
+    }
+    U8 varname[128];
+    strcpy(varname, tok->value);
+
+    // Expect 'in'
+    tok = ShellLexerNext(lex);
+    if (tok->type != TOK_IN) {
+        fprintf(stderr, "sh: syntax error: expected 'in'\n");
+        return 2;
+    }
+
+    // Collect words
+    U8 *words[SH_ARGS_MAX];
+    I64 word_count = 0;
+
+    while (1) {
+        tok = ShellLexerNext(lex);
+        if (tok->type == TOK_SEMI || tok->type == TOK_NEWLINE ||
+            tok->type == TOK_DO || tok->type == TOK_EOF)
+            break;
+        if (tok->type == TOK_WORD && word_count < SH_ARGS_MAX - 1)
+            words[word_count++] = StrNew(tok->value);
+    }
+
+    // Skip to 'do'
+    while (tok->type != TOK_DO && tok->type != TOK_EOF)
+        tok = ShellLexerNext(lex);
+
+    // Remember loop body position
+    I64 body_start = lex->pos;
+
+    sh->loop_depth++;
+
+    // Execute loop
+    for (I64 i = 0; i < word_count; i++) {
+        U8 *expanded = ShellExpand(sh, words[i]);
+        ShellVarSet(sh, varname, expanded);
+        Free(expanded);
+
+        // Reset to body start
+        lex->pos = body_start;
+
+        // Execute body
+        while (1) {
+            tok = ShellLexerNext(lex);
+            while (tok->type == TOK_NEWLINE || tok->type == TOK_SEMI)
+                tok = ShellLexerNext(lex);
+
+            if (tok->type == TOK_DONE || tok->type == TOK_EOF)
+                break;
+
+            lex->pos -= strlen(tok->value);
+            ShellExecPipeline(sh, lex);
+
+            if (sh->exit_requested) break;
+            if (sh->break_flag) {
+                sh->break_count--;
+                if (sh->break_count <= 0)
+                    sh->break_flag = FALSE;
+                break;
+            }
+            if (sh->continue_flag) {
+                sh->continue_flag = FALSE;
+                break;
+            }
+        }
+
+        if (sh->exit_requested || sh->break_flag)
+            break;
+    }
+
+    sh->loop_depth--;
+
+    // Skip to end
+    I64 depth = 1;
+    while (depth > 0 && tok->type != TOK_EOF) {
+        tok = ShellLexerNext(lex);
+        if (tok->type == TOK_FOR || tok->type == TOK_WHILE || tok->type == TOK_UNTIL)
+            depth++;
+        else if (tok->type == TOK_DONE)
+            depth--;
+    }
+
+    // Cleanup
+    for (I64 i = 0; i < word_count; i++)
+        Free(words[i]);
+
+    return sh->last_exit_status;
+}
+
+// Parse and execute while/until loop
+I64 ShellExecWhile(CShellState *sh, CShellLexer *lex, Bool until)
+{
+    CShellToken *tok;
+
+    // Remember condition position
+    I64 cond_start = lex->pos;
+
+    sh->loop_depth++;
+
+    while (1) {
+        // Execute condition
+        lex->pos = cond_start;
+        I64 cond_status = ShellExecPipeline(sh, lex);
+
+        // Skip to 'do'
+        tok = ShellLexerNext(lex);
+        while (tok->type != TOK_DO && tok->type != TOK_EOF)
+            tok = ShellLexerNext(lex);
+
+        // Check condition
+        Bool run_body = until ? (cond_status != 0) : (cond_status == 0);
+        if (!run_body) break;
+
+        // Execute body
+        while (1) {
+            tok = ShellLexerNext(lex);
+            while (tok->type == TOK_NEWLINE || tok->type == TOK_SEMI)
+                tok = ShellLexerNext(lex);
+
+            if (tok->type == TOK_DONE || tok->type == TOK_EOF)
+                break;
+
+            lex->pos -= strlen(tok->value);
+            ShellExecPipeline(sh, lex);
+
+            if (sh->exit_requested) break;
+            if (sh->break_flag) {
+                sh->break_count--;
+                if (sh->break_count <= 0)
+                    sh->break_flag = FALSE;
+                break;
+            }
+            if (sh->continue_flag) {
+                sh->continue_flag = FALSE;
+                break;
+            }
+        }
+
+        if (sh->exit_requested || sh->break_flag)
+            break;
+    }
+
+    sh->loop_depth--;
+
+    // Skip to end
+    I64 depth = 1;
+    while (depth > 0) {
+        tok = ShellLexerNext(lex);
+        if (tok->type == TOK_EOF) break;
+        if (tok->type == TOK_FOR || tok->type == TOK_WHILE || tok->type == TOK_UNTIL)
+            depth++;
+        else if (tok->type == TOK_DONE)
+            depth--;
+    }
+
+    return sh->last_exit_status;
+}
+
+// Main parser entry point
+I64 ShellParseAndExec(CShellState *sh, U8 *input)
+{
+    CShellLexer lex;
+    lex.input = input;
+    lex.pos = 0;
+    lex.line = 1;
+    lex.has_current = FALSE;
+
+    CShellToken *tok;
+
+    while (!sh->exit_requested) {
+        tok = ShellLexerNext(&lex);
+
+        if (tok->type == TOK_EOF) break;
+        if (tok->type == TOK_NEWLINE || tok->type == TOK_SEMI) continue;
+
+        if (tok->type == TOK_IF) {
+            ShellExecIf(sh, &lex);
+        } else if (tok->type == TOK_FOR) {
+            ShellExecFor(sh, &lex);
+        } else if (tok->type == TOK_WHILE) {
+            ShellExecWhile(sh, &lex, FALSE);
+        } else if (tok->type == TOK_UNTIL) {
+            ShellExecWhile(sh, &lex, TRUE);
+        } else {
+            // Regular command - rewind and execute
+            lex.pos -= strlen(tok->value);
+            ShellExecPipeline(sh, &lex);
+        }
+    }
+
+    return sh->last_exit_status;
+}
+
+// ============================================================================
+// MAIN ENTRY POINT
+// ============================================================================
+
+I64 sh_main(I64 argc, U8 **argv)
+{
+    Bool command_mode = FALSE;
+    U8 *command_string = NULL;
+    U8 *script_file = NULL;
+    I64 start = 1;
+
+    // Parse options
+    while (start < argc && argv[start][0] == '-') {
+        U8 *arg = argv[start];
+
+        if (strcmp(arg, "--help") == 0) {
+            printf("Usage: sh [OPTIONS] [SCRIPT] [ARGS...]\n");
+            printf("  or:  sh -c COMMAND [ARG0 [ARGS...]]\n");
+            printf("\nPOSIX-compatible shell.\n\n");
+            printf("  -c STRING   read commands from STRING\n");
+            printf("  -i          interactive mode\n");
+            printf("  -s          read commands from stdin\n");
+            printf("      --help  display this help and exit\n");
+            printf("      --version output version information and exit\n");
+            return 0;
+        }
+
+        if (strcmp(arg, "--version") == 0) {
+            printf("sh (ZealOS) 1.0\n");
+            return 0;
+        }
+
+        if (strcmp(arg, "-c") == 0) {
+            command_mode = TRUE;
+            start++;
+            if (start < argc)
+                command_string = argv[start++];
+            break;
+        }
+
+        if (strcmp(arg, "-i") == 0) {
+            start++;
+            continue;
+        }
+
+        if (strcmp(arg, "-s") == 0) {
+            start++;
+            continue;
+        }
+
+        if (strcmp(arg, "--") == 0) {
+            start++;
+            break;
+        }
+
+        break;
+    }
+
+    // Get script file
+    if (!command_mode && start < argc) {
+        script_file = argv[start++];
+    }
+
+    // Initialize shell state
+    CShellState sh;
+    MemSet(&sh, 0, sizeof(CShellState));
+    sh.shell_pid = 1;  // Would be actual PID
+    sh.argc = argc - start;
+    sh.argv = &argv[start - 1];  // $0 is script name or "sh"
+    if (script_file) sh.argv[0] = script_file;
+    sh.interactive = (!command_mode && !script_file);
+
+    g_shell = &sh;
+
+    // Initialize environment
+    InitDefaultEnv();
+
+    // Set up default variables
+    U8 cwd[PATH_MAX];
+    if (PosixGetcwd(cwd, PATH_MAX))
+        ShellVarSet(&sh, "PWD", cwd);
+    ShellVarSet(&sh, "IFS", " \t\n");
+    ShellVarSet(&sh, "PS1", "$ ");
+    ShellVarSet(&sh, "PS2", "> ");
+
+    I64 status = 0;
+
+    if (command_mode && command_string) {
+        // Execute command string
+        status = ShellParseAndExec(&sh, command_string);
+    } else if (script_file) {
+        // Execute script file
+        FILE *fp = fopen(script_file, "r");
+        if (!fp) {
+            fprintf(stderr, "sh: %s: %s\n", script_file, strerror(errno));
+            return 127;
+        }
+
+        U8 *script = MAlloc(65536);
+        I64 total = 0;
+        I64 n;
+        while ((n = fread(script + total, 1, 65536 - total - 1, fp)) > 0) {
+            total += n;
+            if (total >= 65536 - 1) break;
+        }
+        script[total] = 0;
+        fclose(fp);
+
+        status = ShellParseAndExec(&sh, script);
+        Free(script);
+    } else {
+        // Interactive mode
+        U8 line[SH_LINE_SIZE];
+
+        while (!sh.exit_requested) {
+            // Print prompt
+            if (sh.interactive) {
+                U8 *ps1 = ShellVarGet(&sh, "PS1");
+                printf("%s", ps1);
+                fflush(stdout);
+            }
+
+            // Read line
+            if (!fgets(line, SH_LINE_SIZE, stdin)) {
+                if (sh.interactive) printf("\n");
+                break;
+            }
+
+            // Execute
+            ShellParseAndExec(&sh, line);
+        }
+
+        status = sh.exit_code;
+    }
+
+    g_shell = NULL;
+    return status;
+}
+
+U0 GnuShRegister()
+{
+    "POSIX shell (sh) loaded.\n";
+}

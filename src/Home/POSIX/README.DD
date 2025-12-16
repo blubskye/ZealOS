@@ -1,0 +1,227 @@
+$WW,1$$FG,5,0$ZealOS POSIX Compatibility Layer$FG$
+
+$TR,"Overview"$
+This is a comprehensive POSIX/libc compatibility layer for ZealOS,
+enabling cross-compiled Linux/BSD programs to run on ZealOS. The goal
+is to provide enough compatibility that existing software "just works"
+when statically compiled for Linux x86_64.
+
+$TR,"Components"$
+
+$FG,2$Core POSIX Layer (/Home/POSIX/)$FG$
+- MakePOSIX.ZC - Main loader for POSIX compatibility
+- Process management, environment, file descriptors
+
+$FG,2$C Standard Library (/Home/POSIX/libc/)$FG$
+- stddef.h.ZC, stdint.h.ZC, limits.h.ZC - Type definitions
+- string.h.ZC - String operations (strlen, strcpy, strcmp, etc.)
+- stdlib.h.ZC - Memory allocation (malloc, free, realloc)
+- stdio.h.ZC - File I/O (fopen, fread, fwrite, printf)
+- printf.ZC - Full printf/sprintf/fprintf implementation
+- unistd.h.ZC - UNIX system calls (fork, exec, pipe)
+- popen.ZC - Process I/O (popen, pclose, system)
+- time.ZC - Time functions (time, strftime, gettimeofday)
+- math.ZC - Math library (sin, cos, tan, exp, log, sqrt)
+- poll.ZC - I/O multiplexing (poll, select, epoll)
+- mman.ZC - Memory mapping (mmap, munmap, mprotect)
+- pthread.ZC - POSIX threads (pthread_create, mutex, cond)
+- netdb.ZC - DNS resolver (getaddrinfo, gethostbyname)
+- termios.ZC - Terminal I/O (tcgetattr, tcsetattr)
+- curses.ZC - Curses library (initscr, newwin, addch, getch)
+- pwd.ZC - User database (getpwuid, getpwnam)
+- locale.ZC - Locale support (setlocale, localeconv)
+- signal.ZC - Signal handling (signal, sigaction, sigsetjmp)
+- regex.ZC - Regular expressions (regcomp, regexec)
+- ctype.h.ZC - Character classification (isalpha, isdigit)
+- errno.h.ZC - Error codes
+
+$FG,2$C++ Runtime Support (/Home/POSIX/libc/)$FG$
+- cxxabi.ZC - C++ ABI (__cxa_atexit, __cxa_guard_*, __cxa_throw)
+- new.ZC - operator new/delete (throwing, nothrow, aligned)
+- unwind.ZC - Stack unwinding for exceptions
+
+$FG,2$Toolchain (/Home/POSIX/toolchain/)$FG$
+- TCC.HH, TCC_OS.ZC - TinyCC compiler integration
+- ELF.HH, ELFLoader.ZC - ELF binary loader (static)
+- DynLink.HH, DynLink.ZC - ELF dynamic linker (shared libs)
+- LibStubs.ZC - Standard library symbol stubs
+- tcc.ZC - TCC command-line driver
+- include/ - C standard headers for TCC
+
+$FG,2$Go Language Support (/Home/POSIX/go/)$FG$
+- Go.HH - Go runtime definitions
+- Futex.ZC - Futex implementation for synchronization
+- runtime/GoRuntime.ZC - M-P-G scheduler
+- runtime/GoSyscall.ZC - Linux syscall emulation
+- MakeGo.ZC - Go loader and command interface
+
+$FG,2$GNU Utilities (/Home/POSIX/libc/gnu/)$FG$
+- Shell utilities: sh, sed, awk, make
+- File utilities: tar, gzip, cat, ls, cp, mv, rm
+- Text utilities: grep, sort, head, tail, wc
+
+$FG,2$Native Utilities (/Home/POSIX/bin/)$FG$
+- wget.ZC - HTTP/HTTPS file downloader (uses native TLS)
+
+$FG,2$Configuration (/Home/POSIX/etc/)$FG$
+- lynx.cfg - Lynx browser configuration
+- mime.types - MIME type mappings
+
+$TR,"Usage"$
+
+$FG,2$Loading the POSIX Layer:$FG$
+$FG,4$
+#include "/Home/POSIX/MakePOSIX"
+#include "/Home/POSIX/libc/MakeLibc"
+$FG$
+
+$FG,2$Running a Cross-Compiled ELF Binary:$FG$
+$FG,4$
+// On Linux, compile with:
+// gcc -static -o myprogram myprogram.c
+
+// On ZealOS:
+#include "/Home/POSIX/libc/MakeLibc"
+ELFRun("/path/to/myprogram", argc, argv);
+$FG$
+
+$FG,2$Using Native wget:$FG$
+$FG,4$
+#include "/Home/POSIX/bin/MakeBin"
+wget_main(2, {"wget", "https://example.com/file.zip"});
+$FG$
+
+$TR,"Supported Functionality"$
+
+$FG,2$File I/O:$FG$
+- Standard streams (stdin, stdout, stderr)
+- File operations (open, close, read, write, lseek)
+- Directory operations (opendir, readdir, mkdir, rmdir)
+- File info (stat, fstat, access)
+
+$FG,2$Process Management:$FG$
+- fork, exec*, waitpid
+- getpid, getppid, getuid, getgid
+- system, popen, pclose
+
+$FG,2$Memory:$FG$
+- malloc, realloc, calloc, free
+- mmap, munmap, mprotect
+
+$FG,2$Networking:$FG$
+- socket, connect, bind, listen, accept
+- send, recv, sendto, recvfrom
+- getaddrinfo, gethostbyname
+- Native DNS resolver
+
+$FG,2$Terminal:$FG$
+- termios (tcgetattr, tcsetattr)
+- curses (window management, colors, input)
+- isatty, ttyname
+
+$FG,2$Threading:$FG$
+- pthread_create, pthread_join
+- Mutexes, condition variables, read-write locks
+- Thread-local storage
+
+$FG,2$Signals:$FG$
+- signal, sigaction
+- sigsetjmp, siglongjmp
+- raise, kill, alarm
+
+$TR,"Cross-Compilation Guide"$
+
+To run Linux programs on ZealOS:
+
+$FG,2$1. Compile C programs statically on Linux:$FG$
+$FG,4$
+CFLAGS="-static" LDFLAGS="-static" ./configure
+make
+$FG$
+
+$FG,2$2. Compile C++ programs statically on Linux:$FG$
+$FG,4$
+g++ -static -static-libgcc -static-libstdc++ -o myprogram myprogram.cpp
+$FG$
+
+$FG,2$3. For Go programs:$FG$
+$FG,4$
+GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -o program
+$FG$
+
+$FG,2$4. Copy binary to ZealOS disk$FG$
+
+$FG,2$5. Run via ELF loader:$FG$
+$FG,4$
+ELFRun("/path/to/program", argc, argv);
+$FG$
+
+$TR,"Running Dynamically-Linked Binaries"$
+
+ZealOS now supports running dynamically-linked Linux binaries through
+the built-in dynamic linker. This eliminates the need for static linking
+in many cases.
+
+$FG,2$Running a Dynamic Binary:$FG$
+$FG,4$
+#include "/Home/POSIX/toolchain/MakeToolchain"
+DynRun("/path/to/program", argc, argv);
+$FG$
+
+$FG,2$Using the dlopen API:$FG$
+$FG,4$
+void *handle = dlopen("libfoo.so", RTLD_NOW);
+if (!handle) {
+    printf("Error: %s\n", dlerror());
+    return -1;
+}
+
+void (*func)() = dlsym(handle, "my_function");
+func();
+
+dlclose(handle);
+$FG$
+
+$FG,2$How It Works:$FG$
+The dynamic linker provides ZealOS implementations for all standard
+library symbols (libc, libpthread, libm, etc.). When a binary needs
+libc.so.6, the dynamic linker intercepts and provides ZealOS functions.
+
+Supported fake libraries:
+- libc.so.6 - C standard library
+- libm.so.6 - Math library
+- libpthread.so.0 - POSIX threads
+- libdl.so.2 - Dynamic linking
+- libgcc_s.so.1 - GCC runtime
+- libstdc++.so.6 - C++ standard library
+- libncurses.so.6 - Terminal handling
+
+$TR,"Known Limitations"$
+
+- Single-threaded execution (cooperative multitasking)
+- Simplified signal delivery
+- No /proc or /sys filesystem
+- Limited ioctl support
+- No SystemV IPC (shared memory, semaphores)
+
+$TR,"Files Summary"$
+
+Total files in POSIX layer: ~50
+Total lines of code: ~15,000
+
+Key files:
+- MakePOSIX.ZC - Core POSIX initialization
+- libc/MakeLibc.ZC - libc loader (includes all libc modules)
+- toolchain/ELFLoader.ZC - ELF binary execution
+- go/MakeGo.ZC - Go language support
+
+$TR,"Future Work"$
+
+- X.509 certificate validation for TLS
+- More complete curses (mouse, resize)
+- fnmatch, glob pattern matching
+- getopt, getopt_long
+- Additional socket options
+- Thread-local storage (TLS) for multithreaded programs
+- More comprehensive exception handling
+

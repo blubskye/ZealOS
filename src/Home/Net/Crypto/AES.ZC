@@ -1,0 +1,588 @@
+// AES.ZC - Advanced Encryption Standard for ZealOS
+// Implementation based on FIPS 197
+// https://csrc.nist.gov/publications/detail/fips/197/final
+//
+// Supports AES-128 and AES-256
+// Uses precomputed lookup tables for performance
+
+// ============================================================================
+// AES S-BOX AND INVERSE S-BOX
+// ============================================================================
+
+// Forward S-box
+U8 aes_sbox[256] = {
+	0x63, 0x7C, 0x77, 0x7B, 0xF2, 0x6B, 0x6F, 0xC5, 0x30, 0x01, 0x67, 0x2B, 0xFE, 0xD7, 0xAB, 0x76,
+	0xCA, 0x82, 0xC9, 0x7D, 0xFA, 0x59, 0x47, 0xF0, 0xAD, 0xD4, 0xA2, 0xAF, 0x9C, 0xA4, 0x72, 0xC0,
+	0xB7, 0xFD, 0x93, 0x26, 0x36, 0x3F, 0xF7, 0xCC, 0x34, 0xA5, 0xE5, 0xF1, 0x71, 0xD8, 0x31, 0x15,
+	0x04, 0xC7, 0x23, 0xC3, 0x18, 0x96, 0x05, 0x9A, 0x07, 0x12, 0x80, 0xE2, 0xEB, 0x27, 0xB2, 0x75,
+	0x09, 0x83, 0x2C, 0x1A, 0x1B, 0x6E, 0x5A, 0xA0, 0x52, 0x3B, 0xD6, 0xB3, 0x29, 0xE3, 0x2F, 0x84,
+	0x53, 0xD1, 0x00, 0xED, 0x20, 0xFC, 0xB1, 0x5B, 0x6A, 0xCB, 0xBE, 0x39, 0x4A, 0x4C, 0x58, 0xCF,
+	0xD0, 0xEF, 0xAA, 0xFB, 0x43, 0x4D, 0x33, 0x85, 0x45, 0xF9, 0x02, 0x7F, 0x50, 0x3C, 0x9F, 0xA8,
+	0x51, 0xA3, 0x40, 0x8F, 0x92, 0x9D, 0x38, 0xF5, 0xBC, 0xB6, 0xDA, 0x21, 0x10, 0xFF, 0xF3, 0xD2,
+	0xCD, 0x0C, 0x13, 0xEC, 0x5F, 0x97, 0x44, 0x17, 0xC4, 0xA7, 0x7E, 0x3D, 0x64, 0x5D, 0x19, 0x73,
+	0x60, 0x81, 0x4F, 0xDC, 0x22, 0x2A, 0x90, 0x88, 0x46, 0xEE, 0xB8, 0x14, 0xDE, 0x5E, 0x0B, 0xDB,
+	0xE0, 0x32, 0x3A, 0x0A, 0x49, 0x06, 0x24, 0x5C, 0xC2, 0xD3, 0xAC, 0x62, 0x91, 0x95, 0xE4, 0x79,
+	0xE7, 0xC8, 0x37, 0x6D, 0x8D, 0xD5, 0x4E, 0xA9, 0x6C, 0x56, 0xF4, 0xEA, 0x65, 0x7A, 0xAE, 0x08,
+	0xBA, 0x78, 0x25, 0x2E, 0x1C, 0xA6, 0xB4, 0xC6, 0xE8, 0xDD, 0x74, 0x1F, 0x4B, 0xBD, 0x8B, 0x8A,
+	0x70, 0x3E, 0xB5, 0x66, 0x48, 0x03, 0xF6, 0x0E, 0x61, 0x35, 0x57, 0xB9, 0x86, 0xC1, 0x1D, 0x9E,
+	0xE1, 0xF8, 0x98, 0x11, 0x69, 0xD9, 0x8E, 0x94, 0x9B, 0x1E, 0x87, 0xE9, 0xCE, 0x55, 0x28, 0xDF,
+	0x8C, 0xA1, 0x89, 0x0D, 0xBF, 0xE6, 0x42, 0x68, 0x41, 0x99, 0x2D, 0x0F, 0xB0, 0x54, 0xBB, 0x16
+};
+
+// Inverse S-box
+U8 aes_inv_sbox[256] = {
+	0x52, 0x09, 0x6A, 0xD5, 0x30, 0x36, 0xA5, 0x38, 0xBF, 0x40, 0xA3, 0x9E, 0x81, 0xF3, 0xD7, 0xFB,
+	0x7C, 0xE3, 0x39, 0x82, 0x9B, 0x2F, 0xFF, 0x87, 0x34, 0x8E, 0x43, 0x44, 0xC4, 0xDE, 0xE9, 0xCB,
+	0x54, 0x7B, 0x94, 0x32, 0xA6, 0xC2, 0x23, 0x3D, 0xEE, 0x4C, 0x95, 0x0B, 0x42, 0xFA, 0xC3, 0x4E,
+	0x08, 0x2E, 0xA1, 0x66, 0x28, 0xD9, 0x24, 0xB2, 0x76, 0x5B, 0xA2, 0x49, 0x6D, 0x8B, 0xD1, 0x25,
+	0x72, 0xF8, 0xF6, 0x64, 0x86, 0x68, 0x98, 0x16, 0xD4, 0xA4, 0x5C, 0xCC, 0x5D, 0x65, 0xB6, 0x92,
+	0x6C, 0x70, 0x48, 0x50, 0xFD, 0xED, 0xB9, 0xDA, 0x5E, 0x15, 0x46, 0x57, 0xA7, 0x8D, 0x9D, 0x84,
+	0x90, 0xD8, 0xAB, 0x00, 0x8C, 0xBC, 0xD3, 0x0A, 0xF7, 0xE4, 0x58, 0x05, 0xB8, 0xB3, 0x45, 0x06,
+	0xD0, 0x2C, 0x1E, 0x8F, 0xCA, 0x3F, 0x0F, 0x02, 0xC1, 0xAF, 0xBD, 0x03, 0x01, 0x13, 0x8A, 0x6B,
+	0x3A, 0x91, 0x11, 0x41, 0x4F, 0x67, 0xDC, 0xEA, 0x97, 0xF2, 0xCF, 0xCE, 0xF0, 0xB4, 0xE6, 0x73,
+	0x96, 0xAC, 0x74, 0x22, 0xE7, 0xAD, 0x35, 0x85, 0xE2, 0xF9, 0x37, 0xE8, 0x1C, 0x75, 0xDF, 0x6E,
+	0x47, 0xF1, 0x1A, 0x71, 0x1D, 0x29, 0xC5, 0x89, 0x6F, 0xB7, 0x62, 0x0E, 0xAA, 0x18, 0xBE, 0x1B,
+	0xFC, 0x56, 0x3E, 0x4B, 0xC6, 0xD2, 0x79, 0x20, 0x9A, 0xDB, 0xC0, 0xFE, 0x78, 0xCD, 0x5A, 0xF4,
+	0x1F, 0xDD, 0xA8, 0x33, 0x88, 0x07, 0xC7, 0x31, 0xB1, 0x12, 0x10, 0x59, 0x27, 0x80, 0xEC, 0x5F,
+	0x60, 0x51, 0x7F, 0xA9, 0x19, 0xB5, 0x4A, 0x0D, 0x2D, 0xE5, 0x7A, 0x9F, 0x93, 0xC9, 0x9C, 0xEF,
+	0xA0, 0xE0, 0x3B, 0x4D, 0xAE, 0x2A, 0xF5, 0xB0, 0xC8, 0xEB, 0xBB, 0x3C, 0x83, 0x53, 0x99, 0x61,
+	0x17, 0x2B, 0x04, 0x7E, 0xBA, 0x77, 0xD6, 0x26, 0xE1, 0x69, 0x14, 0x63, 0x55, 0x21, 0x0C, 0x7D
+};
+
+// Round constants for key expansion
+U8 aes_rcon[11] = {
+	0x00, 0x01, 0x02, 0x04, 0x08, 0x10, 0x20, 0x40, 0x80, 0x1B, 0x36
+};
+
+// ============================================================================
+// AES HELPER FUNCTIONS
+// ============================================================================
+
+// Multiply by 2 in GF(2^8)
+U8 AESXtime(U8 x)
+{
+	if (x & 0x80)
+		return (x << 1) ^ 0x1B;
+	else
+		return x << 1;
+}
+
+// Multiply in GF(2^8)
+U8 AESMul(U8 a, U8 b)
+{
+	U8 result = 0;
+	U8 temp = a;
+	I64 i;
+
+	for (i = 0; i < 8; i++)
+	{
+		if (b & 1)
+			result ^= temp;
+		temp = AESXtime(temp);
+		b >>= 1;
+	}
+	return result;
+}
+
+// ============================================================================
+// AES KEY EXPANSION
+// ============================================================================
+
+U0 AESKeyExpand(CAESContext *ctx, U8 *key, I64 key_bits)
+{
+	I64 Nk;  // Number of 32-bit words in key
+	I64 Nr;  // Number of rounds
+	I64 i, j;
+	U32 temp;
+	U32 *w;
+
+	if (key_bits == 128)
+	{
+		Nk = 4;
+		Nr = 10;
+	}
+	else if (key_bits == 256)
+	{
+		Nk = 8;
+		Nr = 14;
+	}
+	else
+	{
+		NetErr("AES: Invalid key size %d (must be 128 or 256)", key_bits);
+		return;
+	}
+
+	ctx->rounds = Nr;
+	ctx->key_size = key_bits / 8;
+	w = ctx->enc_round_keys;
+
+	// Copy key to first Nk words
+	for (i = 0; i < Nk; i++)
+	{
+		w[i] = BE32_LOAD(key + i * 4);
+	}
+
+	// Expand key
+	for (i = Nk; i < 4 * (Nr + 1); i++)
+	{
+		temp = w[i - 1];
+
+		if (i % Nk == 0)
+		{
+			// RotWord and SubWord
+			temp = ((temp << 8) | (temp >> 24));  // RotWord
+			temp = (aes_sbox[(temp >> 24) & 0xFF] << 24) |
+			       (aes_sbox[(temp >> 16) & 0xFF] << 16) |
+			       (aes_sbox[(temp >>  8) & 0xFF] <<  8) |
+			       (aes_sbox[(temp      ) & 0xFF]);
+			temp ^= (aes_rcon[i / Nk] << 24);
+		}
+		else if (Nk > 6 && i % Nk == 4)
+		{
+			// AES-256: additional SubWord
+			temp = (aes_sbox[(temp >> 24) & 0xFF] << 24) |
+			       (aes_sbox[(temp >> 16) & 0xFF] << 16) |
+			       (aes_sbox[(temp >>  8) & 0xFF] <<  8) |
+			       (aes_sbox[(temp      ) & 0xFF]);
+		}
+
+		w[i] = w[i - Nk] ^ temp;
+	}
+
+	// Generate decryption round keys (inverse key schedule)
+	// Copy first and last round keys directly
+	for (i = 0; i < 4; i++)
+	{
+		ctx->dec_round_keys[i] = ctx->enc_round_keys[i];
+		ctx->dec_round_keys[4 * Nr + i] = ctx->enc_round_keys[4 * Nr + i];
+	}
+
+	// Apply InvMixColumns to middle round keys
+	for (i = 1; i < Nr; i++)
+	{
+		for (j = 0; j < 4; j++)
+		{
+			U32 word = ctx->enc_round_keys[4 * i + j];
+			U8 b0 = (word >> 24) & 0xFF;
+			U8 b1 = (word >> 16) & 0xFF;
+			U8 b2 = (word >>  8) & 0xFF;
+			U8 b3 = (word      ) & 0xFF;
+
+			// InvMixColumns transformation
+			ctx->dec_round_keys[4 * (Nr - i) + j] =
+				((AESMul(0x0E, b0) ^ AESMul(0x0B, b1) ^ AESMul(0x0D, b2) ^ AESMul(0x09, b3)) << 24) |
+				((AESMul(0x09, b0) ^ AESMul(0x0E, b1) ^ AESMul(0x0B, b2) ^ AESMul(0x0D, b3)) << 16) |
+				((AESMul(0x0D, b0) ^ AESMul(0x09, b1) ^ AESMul(0x0E, b2) ^ AESMul(0x0B, b3)) <<  8) |
+				((AESMul(0x0B, b0) ^ AESMul(0x0D, b1) ^ AESMul(0x09, b2) ^ AESMul(0x0E, b3)));
+		}
+	}
+}
+
+// ============================================================================
+// AES ENCRYPTION
+// ============================================================================
+
+U0 AESEncryptBlock(CAESContext *ctx, U8 *input, U8 *output)
+{
+	U8 state[16];
+	U8 temp[16];
+	I64 round, i, j;
+	U32 *rk = ctx->enc_round_keys;
+
+	// Copy input to state
+	MemCopy(state, input, 16);
+
+	// Initial round key addition
+	for (i = 0; i < 4; i++)
+	{
+		U32 word = rk[i];
+		state[i * 4 + 0] ^= (word >> 24) & 0xFF;
+		state[i * 4 + 1] ^= (word >> 16) & 0xFF;
+		state[i * 4 + 2] ^= (word >>  8) & 0xFF;
+		state[i * 4 + 3] ^= (word      ) & 0xFF;
+	}
+
+	// Main rounds
+	for (round = 1; round < ctx->rounds; round++)
+	{
+		// SubBytes
+		for (i = 0; i < 16; i++)
+			temp[i] = aes_sbox[state[i]];
+
+		// ShiftRows
+		// Row 0: no shift
+		state[0]  = temp[0];
+		state[4]  = temp[4];
+		state[8]  = temp[8];
+		state[12] = temp[12];
+		// Row 1: shift left 1
+		state[1]  = temp[5];
+		state[5]  = temp[9];
+		state[9]  = temp[13];
+		state[13] = temp[1];
+		// Row 2: shift left 2
+		state[2]  = temp[10];
+		state[6]  = temp[14];
+		state[10] = temp[2];
+		state[14] = temp[6];
+		// Row 3: shift left 3
+		state[3]  = temp[15];
+		state[7]  = temp[3];
+		state[11] = temp[7];
+		state[15] = temp[11];
+
+		// MixColumns
+		for (i = 0; i < 4; i++)
+		{
+			U8 s0 = state[i * 4 + 0];
+			U8 s1 = state[i * 4 + 1];
+			U8 s2 = state[i * 4 + 2];
+			U8 s3 = state[i * 4 + 3];
+
+			temp[i * 4 + 0] = AESXtime(s0) ^ AESXtime(s1) ^ s1 ^ s2 ^ s3;
+			temp[i * 4 + 1] = s0 ^ AESXtime(s1) ^ AESXtime(s2) ^ s2 ^ s3;
+			temp[i * 4 + 2] = s0 ^ s1 ^ AESXtime(s2) ^ AESXtime(s3) ^ s3;
+			temp[i * 4 + 3] = AESXtime(s0) ^ s0 ^ s1 ^ s2 ^ AESXtime(s3);
+		}
+
+		// AddRoundKey
+		for (i = 0; i < 4; i++)
+		{
+			U32 word = rk[round * 4 + i];
+			state[i * 4 + 0] = temp[i * 4 + 0] ^ ((word >> 24) & 0xFF);
+			state[i * 4 + 1] = temp[i * 4 + 1] ^ ((word >> 16) & 0xFF);
+			state[i * 4 + 2] = temp[i * 4 + 2] ^ ((word >>  8) & 0xFF);
+			state[i * 4 + 3] = temp[i * 4 + 3] ^ ((word      ) & 0xFF);
+		}
+	}
+
+	// Final round (no MixColumns)
+	// SubBytes
+	for (i = 0; i < 16; i++)
+		temp[i] = aes_sbox[state[i]];
+
+	// ShiftRows
+	state[0]  = temp[0];
+	state[4]  = temp[4];
+	state[8]  = temp[8];
+	state[12] = temp[12];
+	state[1]  = temp[5];
+	state[5]  = temp[9];
+	state[9]  = temp[13];
+	state[13] = temp[1];
+	state[2]  = temp[10];
+	state[6]  = temp[14];
+	state[10] = temp[2];
+	state[14] = temp[6];
+	state[3]  = temp[15];
+	state[7]  = temp[3];
+	state[11] = temp[7];
+	state[15] = temp[11];
+
+	// AddRoundKey
+	for (i = 0; i < 4; i++)
+	{
+		U32 word = rk[ctx->rounds * 4 + i];
+		output[i * 4 + 0] = state[i * 4 + 0] ^ ((word >> 24) & 0xFF);
+		output[i * 4 + 1] = state[i * 4 + 1] ^ ((word >> 16) & 0xFF);
+		output[i * 4 + 2] = state[i * 4 + 2] ^ ((word >>  8) & 0xFF);
+		output[i * 4 + 3] = state[i * 4 + 3] ^ ((word      ) & 0xFF);
+	}
+}
+
+// ============================================================================
+// AES DECRYPTION
+// ============================================================================
+
+U0 AESDecryptBlock(CAESContext *ctx, U8 *input, U8 *output)
+{
+	U8 state[16];
+	U8 temp[16];
+	I64 round, i;
+	U32 *rk = ctx->dec_round_keys;
+
+	// Copy input to state
+	MemCopy(state, input, 16);
+
+	// Initial round key addition (using last round key)
+	for (i = 0; i < 4; i++)
+	{
+		U32 word = ctx->enc_round_keys[ctx->rounds * 4 + i];
+		state[i * 4 + 0] ^= (word >> 24) & 0xFF;
+		state[i * 4 + 1] ^= (word >> 16) & 0xFF;
+		state[i * 4 + 2] ^= (word >>  8) & 0xFF;
+		state[i * 4 + 3] ^= (word      ) & 0xFF;
+	}
+
+	// Main rounds (in reverse)
+	for (round = ctx->rounds - 1; round >= 1; round--)
+	{
+		// InvShiftRows
+		temp[0]  = state[0];
+		temp[4]  = state[4];
+		temp[8]  = state[8];
+		temp[12] = state[12];
+		temp[1]  = state[13];
+		temp[5]  = state[1];
+		temp[9]  = state[5];
+		temp[13] = state[9];
+		temp[2]  = state[10];
+		temp[6]  = state[14];
+		temp[10] = state[2];
+		temp[14] = state[6];
+		temp[3]  = state[7];
+		temp[7]  = state[11];
+		temp[11] = state[15];
+		temp[15] = state[3];
+
+		// InvSubBytes
+		for (i = 0; i < 16; i++)
+			state[i] = aes_inv_sbox[temp[i]];
+
+		// AddRoundKey
+		for (i = 0; i < 4; i++)
+		{
+			U32 word = rk[round * 4 + i];
+			temp[i * 4 + 0] = state[i * 4 + 0] ^ ((word >> 24) & 0xFF);
+			temp[i * 4 + 1] = state[i * 4 + 1] ^ ((word >> 16) & 0xFF);
+			temp[i * 4 + 2] = state[i * 4 + 2] ^ ((word >>  8) & 0xFF);
+			temp[i * 4 + 3] = state[i * 4 + 3] ^ ((word      ) & 0xFF);
+		}
+
+		// InvMixColumns
+		for (i = 0; i < 4; i++)
+		{
+			U8 s0 = temp[i * 4 + 0];
+			U8 s1 = temp[i * 4 + 1];
+			U8 s2 = temp[i * 4 + 2];
+			U8 s3 = temp[i * 4 + 3];
+
+			state[i * 4 + 0] = AESMul(0x0E, s0) ^ AESMul(0x0B, s1) ^ AESMul(0x0D, s2) ^ AESMul(0x09, s3);
+			state[i * 4 + 1] = AESMul(0x09, s0) ^ AESMul(0x0E, s1) ^ AESMul(0x0B, s2) ^ AESMul(0x0D, s3);
+			state[i * 4 + 2] = AESMul(0x0D, s0) ^ AESMul(0x09, s1) ^ AESMul(0x0E, s2) ^ AESMul(0x0B, s3);
+			state[i * 4 + 3] = AESMul(0x0B, s0) ^ AESMul(0x0D, s1) ^ AESMul(0x09, s2) ^ AESMul(0x0E, s3);
+		}
+	}
+
+	// Final round (no InvMixColumns)
+	// InvShiftRows
+	temp[0]  = state[0];
+	temp[4]  = state[4];
+	temp[8]  = state[8];
+	temp[12] = state[12];
+	temp[1]  = state[13];
+	temp[5]  = state[1];
+	temp[9]  = state[5];
+	temp[13] = state[9];
+	temp[2]  = state[10];
+	temp[6]  = state[14];
+	temp[10] = state[2];
+	temp[14] = state[6];
+	temp[3]  = state[7];
+	temp[7]  = state[11];
+	temp[11] = state[15];
+	temp[15] = state[3];
+
+	// InvSubBytes
+	for (i = 0; i < 16; i++)
+		state[i] = aes_inv_sbox[temp[i]];
+
+	// AddRoundKey (first round key)
+	for (i = 0; i < 4; i++)
+	{
+		U32 word = ctx->enc_round_keys[i];
+		output[i * 4 + 0] = state[i * 4 + 0] ^ ((word >> 24) & 0xFF);
+		output[i * 4 + 1] = state[i * 4 + 1] ^ ((word >> 16) & 0xFF);
+		output[i * 4 + 2] = state[i * 4 + 2] ^ ((word >>  8) & 0xFF);
+		output[i * 4 + 3] = state[i * 4 + 3] ^ ((word      ) & 0xFF);
+	}
+}
+
+// ============================================================================
+// AES TEST VECTORS (FIPS 197)
+// ============================================================================
+
+U0 AESTest()
+{
+	CAESContext ctx;
+	U8 key128[16];
+	U8 key256[32];
+	U8 plaintext[16];
+	U8 ciphertext[16];
+	U8 decrypted[16];
+	U8 expected[16];
+	I64 i;
+	Bool pass;
+
+	"$$LTBLUE$$AES Test Vectors (FIPS 197):$$FG$$\n\n";
+
+	// Test 1: AES-128 Appendix B example
+	"Test 1: AES-128 encryption\n";
+
+	// Key: 2b7e151628aed2a6abf7158809cf4f3c
+	key128[0]  = 0x2B; key128[1]  = 0x7E; key128[2]  = 0x15; key128[3]  = 0x16;
+	key128[4]  = 0x28; key128[5]  = 0xAE; key128[6]  = 0xD2; key128[7]  = 0xA6;
+	key128[8]  = 0xAB; key128[9]  = 0xF7; key128[10] = 0x15; key128[11] = 0x88;
+	key128[12] = 0x09; key128[13] = 0xCF; key128[14] = 0x4F; key128[15] = 0x3C;
+
+	// Plaintext: 3243f6a8885a308d313198a2e0370734
+	plaintext[0]  = 0x32; plaintext[1]  = 0x43; plaintext[2]  = 0xF6; plaintext[3]  = 0xA8;
+	plaintext[4]  = 0x88; plaintext[5]  = 0x5A; plaintext[6]  = 0x30; plaintext[7]  = 0x8D;
+	plaintext[8]  = 0x31; plaintext[9]  = 0x31; plaintext[10] = 0x98; plaintext[11] = 0xA2;
+	plaintext[12] = 0xE0; plaintext[13] = 0x37; plaintext[14] = 0x07; plaintext[15] = 0x34;
+
+	// Expected ciphertext: 3925841d02dc09fbdc118597196a0b32
+	expected[0]  = 0x39; expected[1]  = 0x25; expected[2]  = 0x84; expected[3]  = 0x1D;
+	expected[4]  = 0x02; expected[5]  = 0xDC; expected[6]  = 0x09; expected[7]  = 0xFB;
+	expected[8]  = 0xDC; expected[9]  = 0x11; expected[10] = 0x85; expected[11] = 0x97;
+	expected[12] = 0x19; expected[13] = 0x6A; expected[14] = 0x0B; expected[15] = 0x32;
+
+	AESKeyExpand(&ctx, key128, 128);
+	AESEncryptBlock(&ctx, plaintext, ciphertext);
+
+	pass = TRUE;
+	for (i = 0; i < 16; i++)
+	{
+		if (ciphertext[i] != expected[i])
+		{
+			pass = FALSE;
+			break;
+		}
+	}
+
+	"  Plaintext:  ";
+	for (i = 0; i < 16; i++)
+		"%02X", plaintext[i];
+	"\n";
+	"  Ciphertext: ";
+	for (i = 0; i < 16; i++)
+		"%02X", ciphertext[i];
+	"\n";
+	"  Expected:   ";
+	for (i = 0; i < 16; i++)
+		"%02X", expected[i];
+	"\n";
+
+	if (pass)
+		"  $$GREEN$$PASS$$FG$$\n\n";
+	else
+		"  $$RED$$FAIL$$FG$$\n\n";
+
+	// Test 2: AES-128 decryption
+	"Test 2: AES-128 decryption\n";
+
+	AESDecryptBlock(&ctx, ciphertext, decrypted);
+
+	pass = TRUE;
+	for (i = 0; i < 16; i++)
+	{
+		if (decrypted[i] != plaintext[i])
+		{
+			pass = FALSE;
+			break;
+		}
+	}
+
+	"  Ciphertext: ";
+	for (i = 0; i < 16; i++)
+		"%02X", ciphertext[i];
+	"\n";
+	"  Decrypted:  ";
+	for (i = 0; i < 16; i++)
+		"%02X", decrypted[i];
+	"\n";
+	"  Expected:   ";
+	for (i = 0; i < 16; i++)
+		"%02X", plaintext[i];
+	"\n";
+
+	if (pass)
+		"  $$GREEN$$PASS$$FG$$\n\n";
+	else
+		"  $$RED$$FAIL$$FG$$\n\n";
+
+	// Test 3: AES-256 Appendix C.3 example
+	"Test 3: AES-256 encryption\n";
+
+	// Key: 000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f
+	for (i = 0; i < 32; i++)
+		key256[i] = i;
+
+	// Plaintext: 00112233445566778899aabbccddeeff
+	plaintext[0]  = 0x00; plaintext[1]  = 0x11; plaintext[2]  = 0x22; plaintext[3]  = 0x33;
+	plaintext[4]  = 0x44; plaintext[5]  = 0x55; plaintext[6]  = 0x66; plaintext[7]  = 0x77;
+	plaintext[8]  = 0x88; plaintext[9]  = 0x99; plaintext[10] = 0xAA; plaintext[11] = 0xBB;
+	plaintext[12] = 0xCC; plaintext[13] = 0xDD; plaintext[14] = 0xEE; plaintext[15] = 0xFF;
+
+	// Expected ciphertext: 8ea2b7ca516745bfeafc49904b496089
+	expected[0]  = 0x8E; expected[1]  = 0xA2; expected[2]  = 0xB7; expected[3]  = 0xCA;
+	expected[4]  = 0x51; expected[5]  = 0x67; expected[6]  = 0x45; expected[7]  = 0xBF;
+	expected[8]  = 0xEA; expected[9]  = 0xFC; expected[10] = 0x49; expected[11] = 0x90;
+	expected[12] = 0x4B; expected[13] = 0x49; expected[14] = 0x60; expected[15] = 0x89;
+
+	AESKeyExpand(&ctx, key256, 256);
+	AESEncryptBlock(&ctx, plaintext, ciphertext);
+
+	pass = TRUE;
+	for (i = 0; i < 16; i++)
+	{
+		if (ciphertext[i] != expected[i])
+		{
+			pass = FALSE;
+			break;
+		}
+	}
+
+	"  Plaintext:  ";
+	for (i = 0; i < 16; i++)
+		"%02X", plaintext[i];
+	"\n";
+	"  Ciphertext: ";
+	for (i = 0; i < 16; i++)
+		"%02X", ciphertext[i];
+	"\n";
+	"  Expected:   ";
+	for (i = 0; i < 16; i++)
+		"%02X", expected[i];
+	"\n";
+
+	if (pass)
+		"  $$GREEN$$PASS$$FG$$\n\n";
+	else
+		"  $$RED$$FAIL$$FG$$\n\n";
+
+	// Test 4: AES-256 decryption
+	"Test 4: AES-256 decryption\n";
+
+	AESDecryptBlock(&ctx, ciphertext, decrypted);
+
+	pass = TRUE;
+	for (i = 0; i < 16; i++)
+	{
+		if (decrypted[i] != plaintext[i])
+		{
+			pass = FALSE;
+			break;
+		}
+	}
+
+	"  Ciphertext: ";
+	for (i = 0; i < 16; i++)
+		"%02X", ciphertext[i];
+	"\n";
+	"  Decrypted:  ";
+	for (i = 0; i < 16; i++)
+		"%02X", decrypted[i];
+	"\n";
+	"  Expected:   ";
+	for (i = 0; i < 16; i++)
+		"%02X", plaintext[i];
+	"\n";
+
+	if (pass)
+		"  $$GREEN$$PASS$$FG$$\n\n";
+	else
+		"  $$RED$$FAIL$$FG$$\n\n";
+
+	"AES tests complete.\n";
+}

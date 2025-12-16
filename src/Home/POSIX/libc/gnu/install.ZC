@@ -1,0 +1,345 @@
+// install.ZC - Copy files and set attributes
+// GNU install compatible implementation for ZealOS
+// Part of the POSIX compatibility layer
+
+// ============================================================================
+// INSTALL CONFIGURATION
+// ============================================================================
+
+#define INSTALL_PATH_SIZE   512
+#define INSTALL_BUF_SIZE    65536
+
+// ============================================================================
+// HELPER FUNCTIONS
+// ============================================================================
+
+// Copy a file with optional mode setting
+I64 InstallCopyFile(U8 *src, U8 *dst, I64 mode, Bool preserve, Bool verbose)
+{
+    FILE *fin = fopen(src, "rb");
+    if (!fin) {
+        fprintf(stderr, "install: cannot stat '%s': No such file or directory\n", src);
+        return -1;
+    }
+
+    FILE *fout = fopen(dst, "wb");
+    if (!fout) {
+        fclose(fin);
+        fprintf(stderr, "install: cannot create regular file '%s': Permission denied\n", dst);
+        return -1;
+    }
+
+    // Copy contents
+    U8 *buf = MAlloc(INSTALL_BUF_SIZE);
+    I64 n;
+    while ((n = fread(buf, 1, INSTALL_BUF_SIZE, fin)) > 0) {
+        if (fwrite(buf, 1, n, fout) != n) {
+            fprintf(stderr, "install: write error\n");
+            Free(buf);
+            fclose(fin);
+            fclose(fout);
+            return -1;
+        }
+    }
+    Free(buf);
+
+    fclose(fin);
+    fclose(fout);
+
+    // Set mode
+    if (mode >= 0) {
+        PosixChmod(dst, mode);
+    }
+
+    if (verbose) {
+        printf("'%s' -> '%s'\n", src, dst);
+    }
+
+    return 0;
+}
+
+// Create directory with parents
+I64 InstallMkdirP(U8 *path, I64 mode, Bool verbose)
+{
+    U8 tmp[INSTALL_PATH_SIZE];
+    strcpy(tmp, path);
+    I64 len = strlen(tmp);
+
+    // Remove trailing slash
+    if (len > 1 && tmp[len-1] == '/')
+        tmp[--len] = 0;
+
+    // Create each component
+    for (U8 *p = tmp + 1; *p; p++) {
+        if (*p == '/') {
+            *p = 0;
+
+            CPosixStat st;
+            if (PosixStat(tmp, &st) < 0) {
+                if (PosixMkdir(tmp, mode) < 0) {
+                    fprintf(stderr, "install: cannot create directory '%s'\n", tmp);
+                    return -1;
+                }
+                if (verbose)
+                    printf("install: creating directory '%s'\n", tmp);
+            }
+
+            *p = '/';
+        }
+    }
+
+    // Create final directory
+    CPosixStat st;
+    if (PosixStat(tmp, &st) < 0) {
+        if (PosixMkdir(tmp, mode) < 0) {
+            fprintf(stderr, "install: cannot create directory '%s'\n", tmp);
+            return -1;
+        }
+        if (verbose)
+            printf("install: creating directory '%s'\n", tmp);
+    }
+
+    return 0;
+}
+
+// Check if path is a directory
+Bool InstallIsDir(U8 *path)
+{
+    CPosixStat st;
+    if (PosixStat(path, &st) < 0)
+        return FALSE;
+    return (st.st_mode & S_IFMT) == S_IFDIR;
+}
+
+// Get basename from path
+U8 *InstallBasename(U8 *path)
+{
+    U8 *p = strrchr(path, '/');
+    return p ? p + 1 : path;
+}
+
+// Parse octal mode string
+I64 InstallParseMode(U8 *str)
+{
+    I64 mode = 0;
+    U8 *p = str;
+
+    while (*p >= '0' && *p <= '7') {
+        mode = mode * 8 + (*p - '0');
+        p++;
+    }
+
+    return mode;
+}
+
+// Strip leading path components
+U0 InstallStripDir(U8 *src, U8 *dst, I64 components)
+{
+    strcpy(dst, src);
+    if (components <= 0)
+        return;
+
+    U8 *p = src;
+    I64 stripped = 0;
+
+    while (*p && stripped < components) {
+        if (*p == '/') {
+            stripped++;
+            src = p + 1;
+        }
+        p++;
+    }
+
+    strcpy(dst, src);
+}
+
+// ============================================================================
+// MAIN
+// ============================================================================
+
+U0 install_usage()
+{
+    printf("Usage: install [OPTION]... SOURCE... DEST\n");
+    printf("       install [OPTION]... -d DIRECTORY...\n");
+    printf("Copy files and set attributes.\n\n");
+    printf("Options:\n");
+    printf("  -c                    (ignored, for compatibility)\n");
+    printf("  -d, --directory       Create directories\n");
+    printf("  -D                    Create leading directories of DEST\n");
+    printf("  -g, --group=GROUP     Set group ownership (not implemented)\n");
+    printf("  -m, --mode=MODE       Set permission mode (octal)\n");
+    printf("  -o, --owner=OWNER     Set ownership (not implemented)\n");
+    printf("  -p, --preserve-timestamps  Preserve timestamps\n");
+    printf("  -s, --strip           Strip symbol tables\n");
+    printf("  -S, --suffix=SUFFIX   Override backup suffix\n");
+    printf("  -t, --target-directory=DIR  Copy all SOURCE to DIR\n");
+    printf("  -T, --no-target-directory   Treat DEST as normal file\n");
+    printf("  -v, --verbose         Print each file processed\n");
+    printf("  --help                Display this help\n");
+}
+
+I64 install_main(I64 argc, U8 **argv)
+{
+    Bool dir_mode = FALSE;          // -d: create directories
+    Bool create_leading = FALSE;    // -D: create leading dirs
+    Bool verbose = FALSE;           // -v
+    Bool preserve_times = FALSE;    // -p
+    Bool strip = FALSE;             // -s
+    Bool no_target_dir = FALSE;     // -T
+    I64 mode = 0755;                // Default mode for executables
+    I64 dir_mode_val = 0755;        // Default mode for directories
+    U8 *target_dir = NULL;          // -t
+    U8 *owner = NULL;               // -o (not implemented)
+    U8 *group = NULL;               // -g (not implemented)
+    U8 *suffix = NULL;              // -S
+
+    // Source files
+    U8 *sources[256];
+    I64 source_count = 0;
+
+    // Parse options
+    for (I64 i = 1; i < argc; i++) {
+        U8 *arg = argv[i];
+
+        if (arg[0] == '-' && arg[1]) {
+            if (strcmp(arg, "--help") == 0) {
+                install_usage();
+                return 0;
+            } else if (strcmp(arg, "-d") == 0 || strcmp(arg, "--directory") == 0) {
+                dir_mode = TRUE;
+            } else if (strcmp(arg, "-D") == 0) {
+                create_leading = TRUE;
+            } else if (strcmp(arg, "-v") == 0 || strcmp(arg, "--verbose") == 0) {
+                verbose = TRUE;
+            } else if (strcmp(arg, "-p") == 0 || strcmp(arg, "--preserve-timestamps") == 0) {
+                preserve_times = TRUE;
+            } else if (strcmp(arg, "-s") == 0 || strcmp(arg, "--strip") == 0) {
+                strip = TRUE;
+            } else if (strcmp(arg, "-T") == 0 || strcmp(arg, "--no-target-directory") == 0) {
+                no_target_dir = TRUE;
+            } else if (strcmp(arg, "-c") == 0) {
+                // Ignored for compatibility
+            } else if (arg[1] == 'm') {
+                U8 *val = NULL;
+                if (arg[2])
+                    val = arg + 2;
+                else if (i + 1 < argc)
+                    val = argv[++i];
+                if (val)
+                    mode = InstallParseMode(val);
+            } else if (arg[1] == 't') {
+                if (arg[2])
+                    target_dir = arg + 2;
+                else if (i + 1 < argc)
+                    target_dir = argv[++i];
+            } else if (arg[1] == 'o') {
+                if (arg[2])
+                    owner = arg + 2;
+                else if (i + 1 < argc)
+                    owner = argv[++i];
+            } else if (arg[1] == 'g') {
+                if (arg[2])
+                    group = arg + 2;
+                else if (i + 1 < argc)
+                    group = argv[++i];
+            } else if (arg[1] == 'S') {
+                if (arg[2])
+                    suffix = arg + 2;
+                else if (i + 1 < argc)
+                    suffix = argv[++i];
+            } else if (strncmp(arg, "--mode=", 7) == 0) {
+                mode = InstallParseMode(arg + 7);
+            } else if (strncmp(arg, "--target-directory=", 19) == 0) {
+                target_dir = arg + 19;
+            } else if (strcmp(arg, "--") == 0) {
+                i++;
+                // Remaining args are sources/dest
+                while (i < argc)
+                    sources[source_count++] = argv[i++];
+                break;
+            }
+        } else {
+            sources[source_count++] = arg;
+        }
+    }
+
+    // Directory mode: create directories
+    if (dir_mode) {
+        if (source_count == 0) {
+            fprintf(stderr, "install: missing operand\n");
+            return 1;
+        }
+
+        I64 ret = 0;
+        for (I64 i = 0; i < source_count; i++) {
+            if (InstallMkdirP(sources[i], dir_mode_val, verbose) < 0)
+                ret = 1;
+        }
+        return ret;
+    }
+
+    // Normal install mode
+    if (target_dir) {
+        // Install all sources to target directory
+        for (I64 i = 0; i < source_count; i++) {
+            U8 dst[INSTALL_PATH_SIZE];
+            snprintf(dst, INSTALL_PATH_SIZE, "%s/%s",
+                    target_dir, InstallBasename(sources[i]));
+
+            if (InstallCopyFile(sources[i], dst, mode, preserve_times, verbose) < 0)
+                return 1;
+        }
+        return 0;
+    }
+
+    // Need at least 2 arguments (source and dest)
+    if (source_count < 2) {
+        fprintf(stderr, "install: missing destination file operand\n");
+        return 1;
+    }
+
+    U8 *dest = sources[source_count - 1];
+    source_count--;
+
+    // Multiple sources: dest must be directory
+    if (source_count > 1 || (!no_target_dir && InstallIsDir(dest))) {
+        // Create directory if it doesn't exist and -D
+        if (create_leading && !InstallIsDir(dest)) {
+            if (InstallMkdirP(dest, dir_mode_val, verbose) < 0)
+                return 1;
+        }
+
+        if (!InstallIsDir(dest)) {
+            fprintf(stderr, "install: target '%s' is not a directory\n", dest);
+            return 1;
+        }
+
+        for (I64 i = 0; i < source_count; i++) {
+            U8 dst[INSTALL_PATH_SIZE];
+            snprintf(dst, INSTALL_PATH_SIZE, "%s/%s",
+                    dest, InstallBasename(sources[i]));
+
+            if (InstallCopyFile(sources[i], dst, mode, preserve_times, verbose) < 0)
+                return 1;
+        }
+    } else {
+        // Single source to single dest
+        if (create_leading) {
+            // Create leading directories
+            U8 *last_slash = strrchr(dest, '/');
+            if (last_slash) {
+                U8 dir[INSTALL_PATH_SIZE];
+                I64 len = last_slash - dest;
+                strncpy(dir, dest, len);
+                dir[len] = 0;
+                if (InstallMkdirP(dir, dir_mode_val, verbose) < 0)
+                    return 1;
+            }
+        }
+
+        if (InstallCopyFile(sources[0], dest, mode, preserve_times, verbose) < 0)
+            return 1;
+    }
+
+    return 0;
+}

@@ -1,0 +1,573 @@
+// ELFLoader.ZC - ELF Binary Loader for ZealOS
+// Part of the POSIX compatibility layer
+//
+// Loads and executes ELF64 binaries on ZealOS.
+
+#include "ELF.HH"
+
+// ============================================================================
+// ELF LOADED IMAGE
+// ============================================================================
+
+#define ELF_MAX_SECTIONS    64
+#define ELF_MAX_SEGMENTS    16
+#define ELF_MAX_SYMBOLS     4096
+
+class CELFSection {
+    U8      *name;          // Section name
+    U32     type;           // Section type
+    U64     flags;          // Section flags
+    void    *data;          // Loaded section data
+    U64     addr;           // Virtual address
+    U64     size;           // Section size
+    Bool    allocated;      // Memory allocated by us
+};
+
+class CELFSegment {
+    U32     type;           // Segment type
+    U32     flags;          // Segment flags
+    void    *data;          // Loaded segment data
+    U64     vaddr;          // Virtual address
+    U64     memsz;          // Size in memory
+    U64     filesz;         // Size in file
+    Bool    allocated;      // Memory allocated by us
+};
+
+class CELFSymbol {
+    U8      *name;          // Symbol name
+    U64     value;          // Symbol value (address)
+    U64     size;           // Symbol size
+    U8      type;           // Symbol type
+    U8      bind;           // Symbol binding
+    U16     shndx;          // Section index
+};
+
+class CELFImage {
+    // Header info
+    U64     entry;              // Entry point
+    U16     type;               // File type
+    U16     machine;            // Machine type
+
+    // Sections
+    CELFSection sections[ELF_MAX_SECTIONS];
+    I64     section_count;
+
+    // Segments (program headers)
+    CELFSegment segments[ELF_MAX_SEGMENTS];
+    I64     segment_count;
+
+    // Symbols
+    CELFSymbol symbols[ELF_MAX_SYMBOLS];
+    I64     symbol_count;
+
+    // String tables
+    U8      *shstrtab;          // Section name string table
+    U8      *strtab;            // Symbol string table
+    U8      *dynstr;            // Dynamic string table
+
+    // Memory
+    void    *base_addr;         // Base load address
+    U64     load_size;          // Total loaded size
+
+    // Error state
+    U8      error[256];
+    Bool    valid;
+};
+
+// ============================================================================
+// ELF VALIDATION
+// ============================================================================
+
+Bool ELFValidateHeader(Elf64_Ehdr *ehdr, CELFImage *img)
+{
+    // Check magic number
+    if (ehdr->e_ident[EI_MAG0] != ELFMAG0 ||
+        ehdr->e_ident[EI_MAG1] != ELFMAG1 ||
+        ehdr->e_ident[EI_MAG2] != ELFMAG2 ||
+        ehdr->e_ident[EI_MAG3] != ELFMAG3) {
+        StrCpy(img->error, "Invalid ELF magic number");
+        return FALSE;
+    }
+
+    // Check class (64-bit)
+    if (ehdr->e_ident[EI_CLASS] != ELFCLASS64) {
+        StrCpy(img->error, "Not a 64-bit ELF file");
+        return FALSE;
+    }
+
+    // Check endianness (little endian for x86-64)
+    if (ehdr->e_ident[EI_DATA] != ELFDATA2LSB) {
+        StrCpy(img->error, "Not little-endian");
+        return FALSE;
+    }
+
+    // Check machine type
+    if (ehdr->e_machine != EM_X86_64) {
+        StrCpy(img->error, "Not x86-64 architecture");
+        return FALSE;
+    }
+
+    // Check file type
+    if (ehdr->e_type != ET_EXEC && ehdr->e_type != ET_DYN) {
+        StrCpy(img->error, "Not an executable or shared object");
+        return FALSE;
+    }
+
+    return TRUE;
+}
+
+// ============================================================================
+// ELF LOADING
+// ============================================================================
+
+CELFImage *ELFLoad(U8 *filename)
+{
+    CELFImage *img = MAlloc(sizeof(CELFImage));
+    if (!img)
+        return NULL;
+
+    MemSet(img, 0, sizeof(CELFImage));
+
+    // Open file
+    FILE *fp = fopen(filename, "rb");
+    if (!fp) {
+        snprintf(img->error, 256, "Cannot open file: %s", filename);
+        return img;
+    }
+
+    // Get file size
+    fseek(fp, 0, SEEK_END);
+    I64 file_size = ftell(fp);
+    fseek(fp, 0, SEEK_SET);
+
+    // Read entire file
+    U8 *file_data = MAlloc(file_size);
+    if (!file_data) {
+        StrCpy(img->error, "Out of memory");
+        fclose(fp);
+        return img;
+    }
+
+    if (fread(file_data, 1, file_size, fp) != file_size) {
+        StrCpy(img->error, "Read error");
+        Free(file_data);
+        fclose(fp);
+        return img;
+    }
+    fclose(fp);
+
+    // Parse ELF header
+    Elf64_Ehdr *ehdr = file_data(Elf64_Ehdr*);
+
+    if (!ELFValidateHeader(ehdr, img)) {
+        Free(file_data);
+        return img;
+    }
+
+    img->entry = ehdr->e_entry;
+    img->type = ehdr->e_type;
+    img->machine = ehdr->e_machine;
+
+    // Load section headers
+    Elf64_Shdr *shdrs = (file_data + ehdr->e_shoff)(Elf64_Shdr*);
+    img->section_count = ehdr->e_shnum;
+
+    // Get section name string table
+    if (ehdr->e_shstrndx < ehdr->e_shnum) {
+        Elf64_Shdr *shstrtab_shdr = &shdrs[ehdr->e_shstrndx];
+        img->shstrtab = file_data + shstrtab_shdr->sh_offset;
+    }
+
+    // Load program headers (segments)
+    if (ehdr->e_phnum > 0) {
+        Elf64_Phdr *phdrs = (file_data + ehdr->e_phoff)(Elf64_Phdr*);
+        img->segment_count = ehdr->e_phnum;
+
+        // Calculate total memory needed
+        U64 min_addr = 0xFFFFFFFFFFFFFFFF;
+        U64 max_addr = 0;
+
+        for (I64 i = 0; i < ehdr->e_phnum && i < ELF_MAX_SEGMENTS; i++) {
+            Elf64_Phdr *phdr = &phdrs[i];
+
+            if (phdr->p_type == PT_LOAD) {
+                if (phdr->p_vaddr < min_addr)
+                    min_addr = phdr->p_vaddr;
+                if (phdr->p_vaddr + phdr->p_memsz > max_addr)
+                    max_addr = phdr->p_vaddr + phdr->p_memsz;
+            }
+        }
+
+        // Allocate memory for all loadable segments
+        if (max_addr > min_addr) {
+            img->load_size = max_addr - min_addr;
+            img->base_addr = MAlloc(img->load_size);
+
+            if (!img->base_addr) {
+                StrCpy(img->error, "Out of memory for segments");
+                Free(file_data);
+                return img;
+            }
+
+            MemSet(img->base_addr, 0, img->load_size);
+
+            // Load segments
+            for (I64 i = 0; i < ehdr->e_phnum && i < ELF_MAX_SEGMENTS; i++) {
+                Elf64_Phdr *phdr = &phdrs[i];
+
+                img->segments[i].type = phdr->p_type;
+                img->segments[i].flags = phdr->p_flags;
+                img->segments[i].vaddr = phdr->p_vaddr;
+                img->segments[i].memsz = phdr->p_memsz;
+                img->segments[i].filesz = phdr->p_filesz;
+
+                if (phdr->p_type == PT_LOAD) {
+                    // Calculate destination address
+                    void *dest = img->base_addr + (phdr->p_vaddr - min_addr);
+                    img->segments[i].data = dest;
+
+                    // Copy from file
+                    if (phdr->p_filesz > 0)
+                        MemCpy(dest, file_data + phdr->p_offset, phdr->p_filesz);
+                }
+            }
+
+            // Adjust entry point for position-independent executables
+            if (img->type == ET_DYN) {
+                img->entry = img->entry - min_addr + img->base_addr(U64);
+            } else {
+                // For static executables, entry is absolute
+                img->entry = img->entry - min_addr + img->base_addr(U64);
+            }
+        }
+    }
+
+    // Parse sections
+    for (I64 i = 0; i < ehdr->e_shnum && i < ELF_MAX_SECTIONS; i++) {
+        Elf64_Shdr *shdr = &shdrs[i];
+
+        img->sections[i].type = shdr->sh_type;
+        img->sections[i].flags = shdr->sh_flags;
+        img->sections[i].addr = shdr->sh_addr;
+        img->sections[i].size = shdr->sh_size;
+
+        // Get section name
+        if (img->shstrtab)
+            img->sections[i].name = StrNew(img->shstrtab + shdr->sh_name);
+
+        // Special handling for symbol and string tables
+        if (shdr->sh_type == SHT_STRTAB) {
+            if (img->sections[i].name && StrCmp(img->sections[i].name, ".strtab") == 0)
+                img->strtab = file_data + shdr->sh_offset;
+            else if (img->sections[i].name && StrCmp(img->sections[i].name, ".dynstr") == 0)
+                img->dynstr = file_data + shdr->sh_offset;
+        }
+
+        // Load symbol table
+        if (shdr->sh_type == SHT_SYMTAB || shdr->sh_type == SHT_DYNSYM) {
+            Elf64_Sym *syms = (file_data + shdr->sh_offset)(Elf64_Sym*);
+            I64 sym_count = shdr->sh_size / sizeof(Elf64_Sym);
+            U8 *strtab_ptr = (shdr->sh_type == SHT_DYNSYM) ? img->dynstr : img->strtab;
+
+            for (I64 j = 0; j < sym_count && img->symbol_count < ELF_MAX_SYMBOLS; j++) {
+                Elf64_Sym *sym = &syms[j];
+
+                // Skip null symbols
+                if (sym->st_name == 0 && sym->st_value == 0)
+                    continue;
+
+                CELFSymbol *elfsym = &img->symbols[img->symbol_count];
+
+                if (strtab_ptr && sym->st_name)
+                    elfsym->name = StrNew(strtab_ptr + sym->st_name);
+
+                elfsym->value = sym->st_value;
+                elfsym->size = sym->st_size;
+                elfsym->type = ELF64_ST_TYPE(sym->st_info);
+                elfsym->bind = ELF64_ST_BIND(sym->st_info);
+                elfsym->shndx = sym->st_shndx;
+
+                img->symbol_count++;
+            }
+        }
+    }
+
+    // Don't free file_data here if we're using string table pointers from it
+    // For simplicity, we'll copy string tables separately in production code
+    // For now, just mark as valid
+    img->valid = TRUE;
+
+    // Note: In production, we'd need to:
+    // 1. Copy string tables to separate allocations
+    // 2. Process relocations
+    // 3. Handle dynamic linking
+    // 4. Free file_data
+
+    return img;
+}
+
+// ============================================================================
+// ELF SYMBOL LOOKUP
+// ============================================================================
+
+CELFSymbol *ELFFindSymbol(CELFImage *img, U8 *name)
+{
+    if (!img || !name)
+        return NULL;
+
+    for (I64 i = 0; i < img->symbol_count; i++) {
+        if (img->symbols[i].name && StrCmp(img->symbols[i].name, name) == 0)
+            return &img->symbols[i];
+    }
+
+    return NULL;
+}
+
+void *ELFGetSymbolAddress(CELFImage *img, U8 *name)
+{
+    CELFSymbol *sym = ELFFindSymbol(img, name);
+    if (!sym)
+        return NULL;
+
+    // Calculate actual address
+    return img->base_addr + sym->value;
+}
+
+// ============================================================================
+// ELF EXECUTION
+// ============================================================================
+
+I64 ELFExecute(CELFImage *img, I64 argc, U8 **argv, U8 **envp)
+{
+    if (!img || !img->valid) {
+        fprintf(stderr, "ELF: Invalid image\n");
+        return -1;
+    }
+
+    if (img->entry == 0) {
+        fprintf(stderr, "ELF: No entry point\n");
+        return -1;
+    }
+
+    // Get entry point function
+    I64 (*entry_func)(I64, U8**, U8**) = img->entry(void*);
+
+    // Call entry point
+    // Note: In a real implementation, we'd need to:
+    // 1. Set up the stack properly
+    // 2. Handle auxiliary vectors
+    // 3. Call constructors
+    // 4. Set up TLS
+
+    if (img->verbose)
+        printf("ELF: Jumping to entry point 0x%X\n", img->entry);
+
+    I64 result = entry_func(argc, argv, envp);
+
+    return result;
+}
+
+// ============================================================================
+// ELF CLEANUP
+// ============================================================================
+
+U0 ELFFree(CELFImage *img)
+{
+    if (!img)
+        return;
+
+    // Free section names
+    for (I64 i = 0; i < img->section_count; i++) {
+        if (img->sections[i].name)
+            Free(img->sections[i].name);
+        if (img->sections[i].allocated && img->sections[i].data)
+            Free(img->sections[i].data);
+    }
+
+    // Free symbol names
+    for (I64 i = 0; i < img->symbol_count; i++) {
+        if (img->symbols[i].name)
+            Free(img->symbols[i].name);
+    }
+
+    // Free loaded memory
+    if (img->base_addr)
+        Free(img->base_addr);
+
+    Free(img);
+}
+
+// ============================================================================
+// ELF INFO DISPLAY
+// ============================================================================
+
+U0 ELFPrintInfo(CELFImage *img)
+{
+    if (!img) {
+        printf("ELF: No image loaded\n");
+        return;
+    }
+
+    if (!img->valid) {
+        printf("ELF: Invalid image - %s\n", img->error);
+        return;
+    }
+
+    printf("ELF Image Info:\n");
+    printf("  Type: %s\n", img->type == ET_EXEC ? "Executable" :
+                          img->type == ET_DYN ? "Shared object" : "Unknown");
+    printf("  Machine: %s\n", img->machine == EM_X86_64 ? "x86-64" : "Unknown");
+    printf("  Entry point: 0x%016X\n", img->entry);
+    printf("  Base address: 0x%016X\n", img->base_addr);
+    printf("  Load size: %d bytes\n", img->load_size);
+    printf("  Sections: %d\n", img->section_count);
+    printf("  Segments: %d\n", img->segment_count);
+    printf("  Symbols: %d\n", img->symbol_count);
+
+    // Print loadable segments
+    printf("\nLoadable Segments:\n");
+    for (I64 i = 0; i < img->segment_count; i++) {
+        CELFSegment *seg = &img->segments[i];
+        if (seg->type == PT_LOAD) {
+            printf("  [%d] vaddr=0x%X memsz=%d filesz=%d flags=%c%c%c\n",
+                   i, seg->vaddr, seg->memsz, seg->filesz,
+                   (seg->flags & PF_R) ? 'R' : '-',
+                   (seg->flags & PF_W) ? 'W' : '-',
+                   (seg->flags & PF_X) ? 'X' : '-');
+        }
+    }
+
+    // Print sections
+    printf("\nSections:\n");
+    for (I64 i = 0; i < img->section_count && i < 10; i++) {
+        CELFSection *sec = &img->sections[i];
+        if (sec->name)
+            printf("  [%d] %-16s size=%d\n", i, sec->name, sec->size);
+    }
+    if (img->section_count > 10)
+        printf("  ... and %d more\n", img->section_count - 10);
+
+    // Print key symbols
+    printf("\nKey Symbols:\n");
+    I64 shown = 0;
+    for (I64 i = 0; i < img->symbol_count && shown < 10; i++) {
+        CELFSymbol *sym = &img->symbols[i];
+        if (sym->name && sym->type == STT_FUNC && sym->bind == STB_GLOBAL) {
+            printf("  %-24s = 0x%X\n", sym->name, sym->value);
+            shown++;
+        }
+    }
+}
+
+// ============================================================================
+// CONVENIENCE FUNCTION
+// ============================================================================
+
+I64 ELFRun(U8 *filename, I64 argc, U8 **argv)
+{
+    CELFImage *img = ELFLoad(filename);
+    if (!img) {
+        fprintf(stderr, "ELF: Failed to load %s\n", filename);
+        return -1;
+    }
+
+    if (!img->valid) {
+        fprintf(stderr, "ELF: %s - %s\n", filename, img->error);
+        ELFFree(img);
+        return -1;
+    }
+
+    // Get environment
+    CPosixProcess *proc = PosixGetCurrent();
+    U8 **envp = proc ? proc->environ : NULL;
+
+    I64 result = ELFExecute(img, argc, argv, envp);
+
+    ELFFree(img);
+    return result;
+}
+
+// ============================================================================
+// RELOCATIONS (Simplified)
+// ============================================================================
+
+I64 ELFApplyRelocations(CELFImage *img, U8 *file_data, Elf64_Ehdr *ehdr)
+{
+    Elf64_Shdr *shdrs = (file_data + ehdr->e_shoff)(Elf64_Shdr*);
+
+    for (I64 i = 0; i < ehdr->e_shnum; i++) {
+        Elf64_Shdr *shdr = &shdrs[i];
+
+        if (shdr->sh_type != SHT_RELA && shdr->sh_type != SHT_REL)
+            continue;
+
+        I64 rel_count = shdr->sh_size / (shdr->sh_type == SHT_RELA ?
+                                         sizeof(Elf64_Rela) : sizeof(Elf64_Rel));
+
+        // Get target section
+        if (shdr->sh_info >= ehdr->e_shnum)
+            continue;
+
+        Elf64_Shdr *target_shdr = &shdrs[shdr->sh_info];
+
+        // Get symbol table
+        if (shdr->sh_link >= ehdr->e_shnum)
+            continue;
+
+        Elf64_Shdr *symtab_shdr = &shdrs[shdr->sh_link];
+        Elf64_Sym *symtab = (file_data + symtab_shdr->sh_offset)(Elf64_Sym*);
+
+        // Process relocations
+        if (shdr->sh_type == SHT_RELA) {
+            Elf64_Rela *relas = (file_data + shdr->sh_offset)(Elf64_Rela*);
+
+            for (I64 j = 0; j < rel_count; j++) {
+                Elf64_Rela *rela = &relas[j];
+                U32 sym_idx = ELF64_R_SYM(rela->r_info);
+                U32 rel_type = ELF64_R_TYPE(rela->r_info);
+
+                Elf64_Sym *sym = &symtab[sym_idx];
+
+                // Get symbol value
+                U64 sym_val = sym->st_value;
+                if (sym->st_shndx != SHN_UNDEF && sym->st_shndx < ehdr->e_shnum) {
+                    // Symbol is defined - adjust for base address
+                    sym_val += img->base_addr(U64);
+                }
+
+                // Calculate relocation target
+                void *target = img->base_addr + rela->r_offset;
+
+                // Apply relocation
+                switch (rel_type) {
+                    case R_X86_64_64:
+                        *(U64*)target = sym_val + rela->r_addend;
+                        break;
+                    case R_X86_64_PC32:
+                        *(U32*)target = (sym_val + rela->r_addend - target(U64))(U32);
+                        break;
+                    case R_X86_64_32:
+                        *(U32*)target = (sym_val + rela->r_addend)(U32);
+                        break;
+                    case R_X86_64_32S:
+                        *(I32*)target = (sym_val + rela->r_addend)(I32);
+                        break;
+                    case R_X86_64_RELATIVE:
+                        *(U64*)target = img->base_addr(U64) + rela->r_addend;
+                        break;
+                    default:
+                        // Unsupported relocation type
+                        break;
+                }
+            }
+        }
+    }
+
+    return 0;
+}
+
+// ============================================================================
+// INITIALIZATION
+// ============================================================================
+
+"ELFLoader loaded - ELF64 binary loader for ZealOS\n";

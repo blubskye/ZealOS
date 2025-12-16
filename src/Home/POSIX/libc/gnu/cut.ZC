@@ -1,0 +1,274 @@
+// cut.ZC - GNU coreutils 'cut' implementation
+// Remove sections from each line of files
+
+#define CUT_LINE_SIZE 4096
+#define CUT_MAX_RANGES 256
+
+class CCutRange {
+    I64 start;
+    I64 end;  // -1 for open-ended
+};
+
+// C-style main function
+I64 cut_main(I64 argc, U8 **argv)
+{
+    Bool bytes_mode = FALSE;     // -b
+    Bool chars_mode = FALSE;     // -c
+    Bool fields_mode = FALSE;    // -f
+    U8 delim = '\t';             // -d
+    U8 *output_delim = NULL;     // --output-delimiter
+    Bool only_delimited = FALSE; // -s
+    Bool complement = FALSE;     // --complement
+    Bool zero_terminated = FALSE; // -z
+    U8 *list_str = NULL;
+    I64 start = 1;
+
+    // Parse options
+    while (start < argc && argv[start][0] == '-' && argv[start][1]) {
+        U8 *arg = argv[start];
+
+        if (strcmp(arg, "--help") == 0) {
+            printf("Usage: cut OPTION... [FILE]...\n");
+            printf("Print selected parts of lines from each FILE.\n\n");
+            printf("  -b, --bytes=LIST        select only these bytes\n");
+            printf("  -c, --characters=LIST   select only these characters\n");
+            printf("  -d, --delimiter=DELIM   use DELIM instead of TAB for field delimiter\n");
+            printf("  -f, --fields=LIST       select only these fields\n");
+            printf("  -s, --only-delimited    do not print lines not containing delimiters\n");
+            printf("      --complement        complement the set of selected bytes/chars/fields\n");
+            printf("      --output-delimiter=STR use STR as output delimiter\n");
+            printf("  -z, --zero-terminated   line delimiter is NUL, not newline\n");
+            printf("      --help              display this help and exit\n");
+            printf("      --version           output version information and exit\n");
+            printf("\nLIST is comma or space separated, ranges use N-M (e.g., 1-3,5,7-)\n");
+            return 0;
+        }
+
+        if (strcmp(arg, "--version") == 0) {
+            printf("cut (ZealOS coreutils) 1.0\n");
+            return 0;
+        }
+
+        if (strncmp(arg, "-b", 2) == 0) {
+            bytes_mode = TRUE;
+            if (arg[2]) list_str = &arg[2];
+            else if (start + 1 < argc) { start++; list_str = argv[start]; }
+            start++; continue;
+        }
+
+        if (strncmp(arg, "-c", 2) == 0) {
+            chars_mode = TRUE;
+            if (arg[2]) list_str = &arg[2];
+            else if (start + 1 < argc) { start++; list_str = argv[start]; }
+            start++; continue;
+        }
+
+        if (strncmp(arg, "-f", 2) == 0) {
+            fields_mode = TRUE;
+            if (arg[2]) list_str = &arg[2];
+            else if (start + 1 < argc) { start++; list_str = argv[start]; }
+            start++; continue;
+        }
+
+        if (strncmp(arg, "-d", 2) == 0) {
+            if (arg[2]) delim = arg[2];
+            else if (start + 1 < argc) { start++; delim = argv[start][0]; }
+            start++; continue;
+        }
+
+        if (strcmp(arg, "-s") == 0 || strcmp(arg, "--only-delimited") == 0) {
+            only_delimited = TRUE; start++; continue;
+        }
+
+        if (strcmp(arg, "--complement") == 0) {
+            complement = TRUE; start++; continue;
+        }
+
+        if (strcmp(arg, "-z") == 0 || strcmp(arg, "--zero-terminated") == 0) {
+            zero_terminated = TRUE; start++; continue;
+        }
+
+        if (strncmp(arg, "--output-delimiter=", 19) == 0) {
+            output_delim = &arg[19]; start++; continue;
+        }
+
+        if (strncmp(arg, "--bytes=", 8) == 0) {
+            bytes_mode = TRUE; list_str = &arg[8]; start++; continue;
+        }
+        if (strncmp(arg, "--characters=", 13) == 0) {
+            chars_mode = TRUE; list_str = &arg[13]; start++; continue;
+        }
+        if (strncmp(arg, "--fields=", 9) == 0) {
+            fields_mode = TRUE; list_str = &arg[9]; start++; continue;
+        }
+        if (strncmp(arg, "--delimiter=", 12) == 0) {
+            delim = arg[12]; start++; continue;
+        }
+
+        if (strcmp(arg, "--") == 0) {
+            start++;
+            break;
+        }
+
+        fprintf(stderr, "cut: invalid option '%s'\n", arg);
+        return 1;
+    }
+
+    if (!bytes_mode && !chars_mode && !fields_mode) {
+        fprintf(stderr, "cut: you must specify a list of bytes, characters, or fields\n");
+        return 1;
+    }
+
+    if (!list_str) {
+        fprintf(stderr, "cut: you must specify a list of bytes, characters, or fields\n");
+        return 1;
+    }
+
+    // Parse the list into ranges
+    CCutRange ranges[CUT_MAX_RANGES];
+    I64 range_count = 0;
+
+    U8 *p = list_str;
+    while (*p && range_count < CUT_MAX_RANGES) {
+        // Skip separators
+        while (*p == ',' || *p == ' ') p++;
+        if (!*p) break;
+
+        CCutRange *r = &ranges[range_count];
+        r->start = 0;
+        r->end = 0;
+
+        if (*p == '-') {
+            // -N means 1-N
+            r->start = 1;
+            p++;
+            r->end = strtol(p, &p, 10);
+        } else {
+            r->start = strtol(p, &p, 10);
+            if (*p == '-') {
+                p++;
+                if (isdigit(*p)) {
+                    r->end = strtol(p, &p, 10);
+                } else {
+                    r->end = -1;  // Open-ended
+                }
+            } else {
+                r->end = r->start;
+            }
+        }
+
+        range_count++;
+    }
+
+    // Check if position is selected
+    auto is_selected = [&](I64 pos) -> Bool {
+        Bool selected = FALSE;
+        for (I64 i = 0; i < range_count; i++) {
+            I64 s = ranges[i].start;
+            I64 e = ranges[i].end;
+            if (e == -1) e = 0x7FFFFFFF;
+            if (pos >= s && pos <= e) {
+                selected = TRUE;
+                break;
+            }
+        }
+        return complement ? !selected : selected;
+    };
+
+    // Process a file
+    auto process_file = [&](FILE *fp) -> I64 {
+        U8 *line = MAlloc(CUT_LINE_SIZE);
+        U8 *out = MAlloc(CUT_LINE_SIZE);
+        U8 out_delim_char[2] = {delim, 0};
+        U8 *od = output_delim ? output_delim : out_delim_char;
+
+        while (fgets(line, CUT_LINE_SIZE, fp)) {
+            I64 len = strlen(line);
+            if (len > 0 && line[len-1] == '\n')
+                line[--len] = 0;
+
+            if (bytes_mode || chars_mode) {
+                // Character/byte mode
+                I64 out_pos = 0;
+                for (I64 i = 0; i < len; i++) {
+                    if (is_selected(i + 1)) {
+                        out[out_pos++] = line[i];
+                    }
+                }
+                out[out_pos] = 0;
+                printf("%s\n", out);
+            } else {
+                // Field mode
+                // Check if line contains delimiter
+                Bool has_delim = (strchr(line, delim) != NULL);
+                if (!has_delim) {
+                    if (!only_delimited) {
+                        printf("%s\n", line);
+                    }
+                    continue;
+                }
+
+                // Split into fields
+                I64 field = 1;
+                Bool first_output = TRUE;
+                U8 *field_start = line;
+
+                while (1) {
+                    U8 *field_end = strchr(field_start, delim);
+                    if (field_end) *field_end = 0;
+
+                    if (is_selected(field)) {
+                        if (!first_output) {
+                            printf("%s", od);
+                        }
+                        printf("%s", field_start);
+                        first_output = FALSE;
+                    }
+
+                    if (!field_end) break;
+
+                    field_start = field_end + 1;
+                    field++;
+                }
+                printf("\n");
+            }
+        }
+
+        Free(line);
+        Free(out);
+        return 0;
+    };
+
+    // Process files
+    I64 exit_status = 0;
+
+    if (start >= argc) {
+        process_file(stdin);
+    } else {
+        for (I64 i = start; i < argc; i++) {
+            FILE *fp;
+            if (strcmp(argv[i], "-") == 0) {
+                fp = stdin;
+            } else {
+                fp = fopen(argv[i], "r");
+                if (!fp) {
+                    fprintf(stderr, "cut: cannot open '%s': %s\n", argv[i], strerror(errno));
+                    exit_status = 1;
+                    continue;
+                }
+            }
+
+            process_file(fp);
+
+            if (fp != stdin)
+                fclose(fp);
+        }
+    }
+
+    return exit_status;
+}
+
+U0 GnuCutRegister()
+{
+    "GNU 'cut' utility loaded.\n";
+}

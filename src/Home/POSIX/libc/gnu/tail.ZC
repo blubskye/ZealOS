@@ -1,0 +1,284 @@
+// tail.ZC - GNU coreutils 'tail' implementation
+// Output the last part of files
+
+#define TAIL_DEFAULT_LINES 10
+#define TAIL_BUF_SIZE 4096
+
+// C-style main function
+I64 tail_main(I64 argc, U8 **argv)
+{
+    I64 num_lines = TAIL_DEFAULT_LINES;
+    I64 num_bytes = -1;
+    Bool quiet = FALSE;
+    Bool verbose = FALSE;
+    Bool from_start = FALSE;  // +NUM means from start
+    I64 start = 1;
+
+    // Parse options
+    while (start < argc && argv[start][0] != 0) {
+        U8 *arg = argv[start];
+
+        // Handle +NUM (from start)
+        if (arg[0] == '+' && isdigit(arg[1])) {
+            num_lines = atoi(&arg[1]);
+            from_start = TRUE;
+            start++;
+            continue;
+        }
+
+        if (arg[0] != '-')
+            break;
+
+        if (strcmp(arg, "--help") == 0) {
+            printf("Usage: tail [OPTION]... [FILE]...\n");
+            printf("Print the last 10 lines of each FILE to standard output.\n");
+            printf("With more than one FILE, precede each with a header.\n\n");
+            printf("  -c, --bytes=[+]NUM   output the last NUM bytes; or use +NUM to output\n");
+            printf("                       starting with byte NUM of each file\n");
+            printf("  -n, --lines=[+]NUM   output the last NUM lines, instead of the last 10;\n");
+            printf("                       or use +NUM to output starting with line NUM\n");
+            printf("  -q, --quiet          never output headers giving file names\n");
+            printf("  -v, --verbose        always output headers giving file names\n");
+            printf("      --help           display this help and exit\n");
+            printf("      --version        output version information and exit\n");
+            return 0;
+        }
+
+        if (strcmp(arg, "--version") == 0) {
+            printf("tail (ZealOS coreutils) 1.0\n");
+            return 0;
+        }
+
+        if (strcmp(arg, "-q") == 0 || strcmp(arg, "--quiet") == 0) {
+            quiet = TRUE;
+            start++;
+            continue;
+        }
+
+        if (strcmp(arg, "-v") == 0 || strcmp(arg, "--verbose") == 0) {
+            verbose = TRUE;
+            start++;
+            continue;
+        }
+
+        // -n NUM
+        if (arg[1] == 'n') {
+            U8 *num_str = &arg[2];
+            if (!*num_str && start + 1 < argc) {
+                start++;
+                num_str = argv[start];
+            }
+            if (*num_str == '+') {
+                from_start = TRUE;
+                num_str++;
+            }
+            num_lines = atoi(num_str);
+            start++;
+            continue;
+        }
+
+        // -c NUM
+        if (arg[1] == 'c') {
+            U8 *num_str = &arg[2];
+            if (!*num_str && start + 1 < argc) {
+                start++;
+                num_str = argv[start];
+            }
+            if (*num_str == '+') {
+                from_start = TRUE;
+                num_str++;
+            }
+            num_bytes = atoi(num_str);
+            num_lines = -1;
+            start++;
+            continue;
+        }
+
+        // -NUM shorthand
+        if (arg[1] >= '0' && arg[1] <= '9') {
+            num_lines = atoi(&arg[1]);
+            start++;
+            continue;
+        }
+
+        if (strcmp(arg, "--") == 0) {
+            start++;
+            break;
+        }
+
+        break;
+    }
+
+    I64 file_count = argc - start;
+    if (file_count == 0)
+        file_count = 1;
+
+    Bool show_headers = (file_count > 1 && !quiet) || verbose;
+    Bool first_file = TRUE;
+    I64 exit_status = 0;
+
+    // Process a file (from start)
+    auto tail_from_start = [](FILE *fp, I64 lines, I64 bytes) {
+        if (bytes >= 0) {
+            // Skip bytes then output rest
+            I64 count = 0;
+            I64 c;
+            while (count < bytes - 1 && (c = fgetc(fp)) != EOF)
+                count++;
+            while ((c = fgetc(fp)) != EOF)
+                putchar(c);
+        } else {
+            // Skip lines then output rest
+            I64 count = 1;
+            I64 c;
+            while (count < lines && (c = fgetc(fp)) != EOF) {
+                if (c == '\n')
+                    count++;
+            }
+            while ((c = fgetc(fp)) != EOF)
+                putchar(c);
+        }
+    };
+
+    // Process a file (from end) - circular buffer approach
+    auto tail_from_end = [](FILE *fp, I64 lines, I64 bytes) {
+        if (bytes >= 0) {
+            // Read whole file, output last N bytes
+            U8 *buf = MAlloc(bytes);
+            I64 pos = 0;
+            I64 total = 0;
+            I64 c;
+
+            while ((c = fgetc(fp)) != EOF) {
+                buf[pos] = c;
+                pos = (pos + 1) % bytes;
+                total++;
+            }
+
+            if (total <= bytes) {
+                // Output from beginning
+                fwrite(buf, 1, total, stdout);
+            } else {
+                // Output from circular position
+                for (I64 i = 0; i < bytes; i++) {
+                    putchar(buf[(pos + i) % bytes]);
+                }
+            }
+
+            Free(buf);
+        } else {
+            // Use line buffer - store pointers to last N lines
+            U8 **line_buf = MAlloc(lines * sizeof(U8 *));
+            I64 *line_len = MAlloc(lines * sizeof(I64));
+            MemSet(line_buf, 0, lines * sizeof(U8 *));
+            MemSet(line_len, 0, lines * sizeof(I64));
+
+            I64 pos = 0;
+            I64 total_lines = 0;
+            U8 cur_line[8192];
+            I64 cur_len = 0;
+            I64 c;
+
+            while ((c = fgetc(fp)) != EOF) {
+                if (cur_len < 8191)
+                    cur_line[cur_len++] = c;
+
+                if (c == '\n') {
+                    cur_line[cur_len] = 0;
+
+                    // Free old line at this position
+                    if (line_buf[pos])
+                        Free(line_buf[pos]);
+
+                    // Store new line
+                    line_buf[pos] = StrNew(cur_line);
+                    line_len[pos] = cur_len;
+
+                    pos = (pos + 1) % lines;
+                    total_lines++;
+                    cur_len = 0;
+                }
+            }
+
+            // Handle last line without newline
+            if (cur_len > 0) {
+                cur_line[cur_len] = 0;
+                if (line_buf[pos])
+                    Free(line_buf[pos]);
+                line_buf[pos] = StrNew(cur_line);
+                line_len[pos] = cur_len;
+                pos = (pos + 1) % lines;
+                total_lines++;
+            }
+
+            // Output lines
+            I64 output_count = (total_lines < lines) ? total_lines : lines;
+            I64 start_pos = (total_lines < lines) ? 0 : pos;
+
+            for (I64 i = 0; i < output_count; i++) {
+                I64 idx = (start_pos + i) % lines;
+                if (line_buf[idx])
+                    fputs(line_buf[idx], stdout);
+            }
+
+            // Free buffers
+            for (I64 i = 0; i < lines; i++) {
+                if (line_buf[i])
+                    Free(line_buf[i]);
+            }
+            Free(line_buf);
+            Free(line_len);
+        }
+    };
+
+    if (start >= argc) {
+        // Read from stdin
+        if (show_headers)
+            printf("==> standard input <==\n");
+        if (from_start)
+            tail_from_start(stdin, num_lines, num_bytes);
+        else
+            tail_from_end(stdin, num_lines, num_bytes);
+    } else {
+        for (I64 i = start; i < argc; i++) {
+            FILE *fp;
+
+            if (strcmp(argv[i], "-") == 0) {
+                fp = stdin;
+                if (show_headers) {
+                    if (!first_file) printf("\n");
+                    printf("==> standard input <==\n");
+                }
+            } else {
+                fp = fopen(argv[i], "r");
+                if (!fp) {
+                    fprintf(stderr, "tail: cannot open '%s' for reading: %s\n",
+                            argv[i], strerror(errno));
+                    exit_status = 1;
+                    continue;
+                }
+                if (show_headers) {
+                    if (!first_file) printf("\n");
+                    printf("==> %s <==\n", argv[i]);
+                }
+            }
+
+            if (from_start)
+                tail_from_start(fp, num_lines, num_bytes);
+            else
+                tail_from_end(fp, num_lines, num_bytes);
+
+            if (fp != stdin)
+                fclose(fp);
+
+            first_file = FALSE;
+        }
+    }
+
+    return exit_status;
+}
+
+U0 GnuTailRegister()
+{
+    "GNU 'tail' utility loaded. Run: CRun(&tail_main, \"tail -n 5 file.txt\");\n";
+}

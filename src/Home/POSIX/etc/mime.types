@@ -1,0 +1,71 @@
+# mime.types - MIME type mappings for ZealOS POSIX layer
+# Format: mime-type extension [extension ...]
+
+# Text types
+text/plain				txt text conf def list log
+text/html				html htm shtml
+text/css				css
+text/csv				csv
+text/xml				xml xsl xsd
+text/markdown				md markdown
+
+# Application types
+application/javascript			js mjs
+application/json			json
+application/pdf				pdf
+application/postscript			ps eps ai
+application/rtf				rtf
+application/xml				xml xsl xsd rng
+application/xhtml+xml			xhtml xht
+application/atom+xml			atom
+application/rss+xml			rss
+
+# Archives
+application/gzip			gz
+application/x-bzip2			bz2
+application/x-compress			Z
+application/x-tar			tar
+application/zip				zip
+application/x-7z-compressed		7z
+application/x-rar-compressed		rar
+
+# Binary/executable
+application/octet-stream		bin exe dll so dylib
+application/x-executable		exe
+application/x-sharedlib			so dylib
+
+# Images
+image/gif				gif
+image/jpeg				jpeg jpg jpe
+image/png				png
+image/svg+xml				svg svgz
+image/tiff				tiff tif
+image/webp				webp
+image/x-icon				ico
+image/bmp				bmp
+
+# Audio
+audio/mpeg				mp3 mp2 mpga
+audio/ogg				oga ogg opus
+audio/wav				wav
+audio/webm				weba
+audio/flac				flac
+audio/x-aiff				aif aiff aifc
+
+# Video
+video/mp4				mp4 mp4v mpg4
+video/mpeg				mpeg mpg mpe
+video/ogg				ogv
+video/webm				webm
+video/x-msvideo				avi
+
+# Fonts
+font/otf				otf
+font/ttf				ttf
+font/woff				woff
+font/woff2				woff2
+
+# HolyC / ZealOS specific
+text/x-holyc				HC ZC
+text/x-doldoc				DD
+application/x-zealos			ISO.C BIN

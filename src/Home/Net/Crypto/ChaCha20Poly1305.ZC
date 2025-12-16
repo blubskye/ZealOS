@@ -1,0 +1,458 @@
+// ChaCha20Poly1305.ZC - AEAD Cipher for ZealOS
+// Part of ZealOS TLS implementation
+// Implements RFC 8439 ChaCha20-Poly1305 AEAD
+
+// ============================================================================
+// CHACHA20-POLY1305 CONSTANTS
+// ============================================================================
+
+#define CHACHA20_POLY1305_KEY_SIZE   32
+#define CHACHA20_POLY1305_NONCE_SIZE 12
+#define CHACHA20_POLY1305_TAG_SIZE   16
+
+// ============================================================================
+// PAD16 HELPER
+// ============================================================================
+
+// Compute padding to 16-byte boundary
+I64 ChaCha20Poly1305Pad16(I64 len)
+{
+	I64 rem = len % 16;
+	if (rem == 0)
+		return 0;
+	return 16 - rem;
+}
+
+// ============================================================================
+// POLY1305 KEY GENERATION
+// ============================================================================
+
+// Generate Poly1305 key from ChaCha20 keystream
+U0 ChaCha20Poly1305GenKey(U8 *key, U8 *nonce, U8 *poly_key)
+{
+	CChaCha20State state;
+	U8 block[64];
+
+	// Generate keystream block with counter 0
+	ChaCha20Init(&state, key, nonce, 0);
+	ChaCha20Block(&state, block);
+
+	// First 32 bytes are the Poly1305 key
+	MemCpy(poly_key, block, 32);
+
+	// Clear sensitive data
+	MemSet(block, 0, 64);
+}
+
+// ============================================================================
+// AEAD ENCRYPTION
+// ============================================================================
+
+// Encrypt plaintext with ChaCha20-Poly1305 AEAD
+// key: 32 bytes
+// nonce: 12 bytes
+// aad: additional authenticated data (can be NULL if aad_len is 0)
+// plaintext: data to encrypt
+// ciphertext: output buffer (must be plaintext_len + 16 bytes for tag)
+// Returns: total output length (plaintext_len + 16)
+I64 ChaCha20Poly1305Encrypt(U8 *key, U8 *nonce,
+                            U8 *aad, I64 aad_len,
+                            U8 *plaintext, I64 plaintext_len,
+                            U8 *ciphertext)
+{
+	U8 poly_key[32];
+	CPoly1305State poly_state;
+	U8 len_block[16];
+	U8 padding[16];
+	I64 pad_len;
+
+	// Generate Poly1305 key
+	ChaCha20Poly1305GenKey(key, nonce, poly_key);
+
+	// Encrypt plaintext with ChaCha20 (counter starts at 1)
+	ChaCha20Encrypt(key, nonce, 1, plaintext, ciphertext, plaintext_len);
+
+	// Initialize Poly1305
+	Poly1305Init(&poly_state, poly_key);
+
+	// Authenticate AAD
+	if (aad && aad_len > 0) {
+		Poly1305Update(&poly_state, aad, aad_len);
+		// Pad AAD to 16 bytes
+		pad_len = ChaCha20Poly1305Pad16(aad_len);
+		if (pad_len > 0) {
+			MemSet(padding, 0, pad_len);
+			Poly1305Update(&poly_state, padding, pad_len);
+		}
+	}
+
+	// Authenticate ciphertext
+	Poly1305Update(&poly_state, ciphertext, plaintext_len);
+	// Pad ciphertext to 16 bytes
+	pad_len = ChaCha20Poly1305Pad16(plaintext_len);
+	if (pad_len > 0) {
+		MemSet(padding, 0, pad_len);
+		Poly1305Update(&poly_state, padding, pad_len);
+	}
+
+	// Authenticate lengths (little-endian)
+	MemSet(len_block, 0, 16);
+	len_block[0] = aad_len & 0xFF;
+	len_block[1] = (aad_len >> 8) & 0xFF;
+	len_block[2] = (aad_len >> 16) & 0xFF;
+	len_block[3] = (aad_len >> 24) & 0xFF;
+	len_block[4] = (aad_len >> 32) & 0xFF;
+	len_block[5] = (aad_len >> 40) & 0xFF;
+	len_block[6] = (aad_len >> 48) & 0xFF;
+	len_block[7] = (aad_len >> 56) & 0xFF;
+	len_block[8] = plaintext_len & 0xFF;
+	len_block[9] = (plaintext_len >> 8) & 0xFF;
+	len_block[10] = (plaintext_len >> 16) & 0xFF;
+	len_block[11] = (plaintext_len >> 24) & 0xFF;
+	len_block[12] = (plaintext_len >> 32) & 0xFF;
+	len_block[13] = (plaintext_len >> 40) & 0xFF;
+	len_block[14] = (plaintext_len >> 48) & 0xFF;
+	len_block[15] = (plaintext_len >> 56) & 0xFF;
+	Poly1305Update(&poly_state, len_block, 16);
+
+	// Generate tag (appended to ciphertext)
+	Poly1305Final(&poly_state, &ciphertext[plaintext_len]);
+
+	// Clear sensitive data
+	MemSet(poly_key, 0, 32);
+
+	return plaintext_len + CHACHA20_POLY1305_TAG_SIZE;
+}
+
+// ============================================================================
+// AEAD DECRYPTION
+// ============================================================================
+
+// Decrypt ciphertext with ChaCha20-Poly1305 AEAD
+// key: 32 bytes
+// nonce: 12 bytes
+// aad: additional authenticated data (can be NULL if aad_len is 0)
+// ciphertext: encrypted data with tag (ciphertext_len includes 16-byte tag)
+// plaintext: output buffer (must be ciphertext_len - 16 bytes)
+// Returns: plaintext length on success, -1 on authentication failure
+I64 ChaCha20Poly1305Decrypt(U8 *key, U8 *nonce,
+                            U8 *aad, I64 aad_len,
+                            U8 *ciphertext, I64 ciphertext_len,
+                            U8 *plaintext)
+{
+	U8 poly_key[32];
+	CPoly1305State poly_state;
+	U8 computed_tag[16];
+	U8 len_block[16];
+	U8 padding[16];
+	I64 pad_len;
+	I64 data_len;
+
+	// Check minimum length
+	if (ciphertext_len < CHACHA20_POLY1305_TAG_SIZE)
+		return -1;
+
+	data_len = ciphertext_len - CHACHA20_POLY1305_TAG_SIZE;
+
+	// Generate Poly1305 key
+	ChaCha20Poly1305GenKey(key, nonce, poly_key);
+
+	// Initialize Poly1305
+	Poly1305Init(&poly_state, poly_key);
+
+	// Authenticate AAD
+	if (aad && aad_len > 0) {
+		Poly1305Update(&poly_state, aad, aad_len);
+		// Pad AAD to 16 bytes
+		pad_len = ChaCha20Poly1305Pad16(aad_len);
+		if (pad_len > 0) {
+			MemSet(padding, 0, pad_len);
+			Poly1305Update(&poly_state, padding, pad_len);
+		}
+	}
+
+	// Authenticate ciphertext (without tag)
+	Poly1305Update(&poly_state, ciphertext, data_len);
+	// Pad ciphertext to 16 bytes
+	pad_len = ChaCha20Poly1305Pad16(data_len);
+	if (pad_len > 0) {
+		MemSet(padding, 0, pad_len);
+		Poly1305Update(&poly_state, padding, pad_len);
+	}
+
+	// Authenticate lengths (little-endian)
+	MemSet(len_block, 0, 16);
+	len_block[0] = aad_len & 0xFF;
+	len_block[1] = (aad_len >> 8) & 0xFF;
+	len_block[2] = (aad_len >> 16) & 0xFF;
+	len_block[3] = (aad_len >> 24) & 0xFF;
+	len_block[4] = (aad_len >> 32) & 0xFF;
+	len_block[5] = (aad_len >> 40) & 0xFF;
+	len_block[6] = (aad_len >> 48) & 0xFF;
+	len_block[7] = (aad_len >> 56) & 0xFF;
+	len_block[8] = data_len & 0xFF;
+	len_block[9] = (data_len >> 8) & 0xFF;
+	len_block[10] = (data_len >> 16) & 0xFF;
+	len_block[11] = (data_len >> 24) & 0xFF;
+	len_block[12] = (data_len >> 32) & 0xFF;
+	len_block[13] = (data_len >> 40) & 0xFF;
+	len_block[14] = (data_len >> 48) & 0xFF;
+	len_block[15] = (data_len >> 56) & 0xFF;
+	Poly1305Update(&poly_state, len_block, 16);
+
+	// Compute tag
+	Poly1305Final(&poly_state, computed_tag);
+
+	// Verify tag (constant-time comparison)
+	U8 diff = 0;
+	I64 i;
+	for (i = 0; i < CHACHA20_POLY1305_TAG_SIZE; i++) {
+		diff |= computed_tag[i] ^ ciphertext[data_len + i];
+	}
+
+	// Clear sensitive data
+	MemSet(poly_key, 0, 32);
+	MemSet(computed_tag, 0, 16);
+
+	if (diff != 0) {
+		// Authentication failed
+		return -1;
+	}
+
+	// Decrypt ciphertext (counter starts at 1)
+	ChaCha20Decrypt(key, nonce, 1, ciphertext, plaintext, data_len);
+
+	return data_len;
+}
+
+// ============================================================================
+// TLS 1.3 RECORD ENCRYPTION
+// ============================================================================
+
+// Encrypt TLS 1.3 record with ChaCha20-Poly1305
+// Uses TLS 1.3 nonce construction (XOR sequence number with IV)
+// iv: 12-byte IV from key schedule
+// seq_num: 64-bit sequence number
+// record_type: TLS record type (appended to plaintext as content type)
+// plaintext: data to encrypt
+// output: encrypted record (plaintext_len + 1 + 16 bytes)
+// Returns: total output length
+I64 ChaCha20Poly1305EncryptTLS(U8 *key, U8 *iv, U64 seq_num,
+                                U8 record_type,
+                                U8 *aad, I64 aad_len,
+                                U8 *plaintext, I64 plaintext_len,
+                                U8 *output)
+{
+	U8 nonce[12];
+	U8 *inner_plaintext;
+	I64 inner_len;
+	I64 result;
+
+	// Construct nonce: XOR IV with sequence number (right-aligned)
+	MemCpy(nonce, iv, 12);
+	nonce[4]  ^= (seq_num >> 56) & 0xFF;
+	nonce[5]  ^= (seq_num >> 48) & 0xFF;
+	nonce[6]  ^= (seq_num >> 40) & 0xFF;
+	nonce[7]  ^= (seq_num >> 32) & 0xFF;
+	nonce[8]  ^= (seq_num >> 24) & 0xFF;
+	nonce[9]  ^= (seq_num >> 16) & 0xFF;
+	nonce[10] ^= (seq_num >> 8) & 0xFF;
+	nonce[11] ^= seq_num & 0xFF;
+
+	// Build inner plaintext: plaintext + content type
+	inner_len = plaintext_len + 1;
+	inner_plaintext = MAlloc(inner_len);
+	MemCpy(inner_plaintext, plaintext, plaintext_len);
+	inner_plaintext[plaintext_len] = record_type;
+
+	// Encrypt with AEAD
+	result = ChaCha20Poly1305Encrypt(key, nonce, aad, aad_len,
+	                                  inner_plaintext, inner_len, output);
+
+	// Cleanup
+	MemSet(inner_plaintext, 0, inner_len);
+	Free(inner_plaintext);
+
+	return result;
+}
+
+// Decrypt TLS 1.3 record with ChaCha20-Poly1305
+// Returns: plaintext length on success (without content type), -1 on failure
+// record_type: output parameter for the decrypted content type
+I64 ChaCha20Poly1305DecryptTLS(U8 *key, U8 *iv, U64 seq_num,
+                                U8 *aad, I64 aad_len,
+                                U8 *ciphertext, I64 ciphertext_len,
+                                U8 *plaintext, U8 *record_type)
+{
+	U8 nonce[12];
+	U8 *inner_plaintext;
+	I64 inner_len;
+	I64 i;
+
+	// Check minimum length (at least tag + content type)
+	if (ciphertext_len < CHACHA20_POLY1305_TAG_SIZE + 1)
+		return -1;
+
+	// Construct nonce: XOR IV with sequence number (right-aligned)
+	MemCpy(nonce, iv, 12);
+	nonce[4]  ^= (seq_num >> 56) & 0xFF;
+	nonce[5]  ^= (seq_num >> 48) & 0xFF;
+	nonce[6]  ^= (seq_num >> 40) & 0xFF;
+	nonce[7]  ^= (seq_num >> 32) & 0xFF;
+	nonce[8]  ^= (seq_num >> 24) & 0xFF;
+	nonce[9]  ^= (seq_num >> 16) & 0xFF;
+	nonce[10] ^= (seq_num >> 8) & 0xFF;
+	nonce[11] ^= seq_num & 0xFF;
+
+	// Allocate buffer for inner plaintext
+	inner_len = ciphertext_len - CHACHA20_POLY1305_TAG_SIZE;
+	inner_plaintext = MAlloc(inner_len);
+
+	// Decrypt with AEAD
+	I64 result = ChaCha20Poly1305Decrypt(key, nonce, aad, aad_len,
+	                                      ciphertext, ciphertext_len,
+	                                      inner_plaintext);
+
+	if (result < 0) {
+		Free(inner_plaintext);
+		return -1;
+	}
+
+	// Extract content type (last byte before any padding)
+	// TLS 1.3 allows zero padding after content type
+	*record_type = 0;
+	for (i = inner_len - 1; i >= 0; i--) {
+		if (inner_plaintext[i] != 0) {
+			*record_type = inner_plaintext[i];
+			inner_len = i;  // Actual plaintext length
+			break;
+		}
+	}
+
+	// Copy plaintext (without content type)
+	if (inner_len > 0) {
+		MemCpy(plaintext, inner_plaintext, inner_len);
+	}
+
+	// Cleanup
+	MemSet(inner_plaintext, 0, result);
+	Free(inner_plaintext);
+
+	return inner_len;
+}
+
+// ============================================================================
+// TEST
+// ============================================================================
+
+Bool ChaCha20Poly1305Test()
+{
+	// RFC 8439 Section 2.8.2 Test Vector
+	U8 key[32] = {
+		0x80, 0x81, 0x82, 0x83, 0x84, 0x85, 0x86, 0x87,
+		0x88, 0x89, 0x8a, 0x8b, 0x8c, 0x8d, 0x8e, 0x8f,
+		0x90, 0x91, 0x92, 0x93, 0x94, 0x95, 0x96, 0x97,
+		0x98, 0x99, 0x9a, 0x9b, 0x9c, 0x9d, 0x9e, 0x9f
+	};
+	U8 nonce[12] = {
+		0x07, 0x00, 0x00, 0x00,
+		0x40, 0x41, 0x42, 0x43, 0x44, 0x45, 0x46, 0x47
+	};
+	U8 aad[12] = {
+		0x50, 0x51, 0x52, 0x53, 0xc0, 0xc1, 0xc2, 0xc3,
+		0xc4, 0xc5, 0xc6, 0xc7
+	};
+	U8 plaintext[114] = {
+		0x4c, 0x61, 0x64, 0x69, 0x65, 0x73, 0x20, 0x61,
+		0x6e, 0x64, 0x20, 0x47, 0x65, 0x6e, 0x74, 0x6c,
+		0x65, 0x6d, 0x65, 0x6e, 0x20, 0x6f, 0x66, 0x20,
+		0x74, 0x68, 0x65, 0x20, 0x63, 0x6c, 0x61, 0x73,
+		0x73, 0x20, 0x6f, 0x66, 0x20, 0x27, 0x39, 0x39,
+		0x3a, 0x20, 0x49, 0x66, 0x20, 0x49, 0x20, 0x63,
+		0x6f, 0x75, 0x6c, 0x64, 0x20, 0x6f, 0x66, 0x66,
+		0x65, 0x72, 0x20, 0x79, 0x6f, 0x75, 0x20, 0x6f,
+		0x6e, 0x6c, 0x79, 0x20, 0x6f, 0x6e, 0x65, 0x20,
+		0x74, 0x69, 0x70, 0x20, 0x66, 0x6f, 0x72, 0x20,
+		0x74, 0x68, 0x65, 0x20, 0x66, 0x75, 0x74, 0x75,
+		0x72, 0x65, 0x2c, 0x20, 0x73, 0x75, 0x6e, 0x73,
+		0x63, 0x72, 0x65, 0x65, 0x6e, 0x20, 0x77, 0x6f,
+		0x75, 0x6c, 0x64, 0x20, 0x62, 0x65, 0x20, 0x69,
+		0x74, 0x2e
+	};
+	U8 expected_ciphertext[114] = {
+		0xd3, 0x1a, 0x8d, 0x34, 0x64, 0x8e, 0x60, 0xdb,
+		0x7b, 0x86, 0xaf, 0xbc, 0x53, 0xef, 0x7e, 0xc2,
+		0xa4, 0xad, 0xed, 0x51, 0x29, 0x6e, 0x08, 0xfe,
+		0xa9, 0xe2, 0xb5, 0xa7, 0x36, 0xee, 0x62, 0xd6,
+		0x3d, 0xbe, 0xa4, 0x5e, 0x8c, 0xa9, 0x67, 0x12,
+		0x82, 0xfa, 0xfb, 0x69, 0xda, 0x92, 0x72, 0x8b,
+		0x1a, 0x71, 0xde, 0x0a, 0x9e, 0x06, 0x0b, 0x29,
+		0x05, 0xd6, 0xa5, 0xb6, 0x7e, 0xcd, 0x3b, 0x36,
+		0x92, 0xdd, 0xbd, 0x7f, 0x2d, 0x77, 0x8b, 0x8c,
+		0x98, 0x03, 0xae, 0xe3, 0x28, 0x09, 0x1b, 0x58,
+		0xfa, 0xb3, 0x24, 0xe4, 0xfa, 0xd6, 0x75, 0x94,
+		0x55, 0x85, 0x80, 0x8b, 0x48, 0x31, 0xd7, 0xbc,
+		0x3f, 0xf4, 0xde, 0xf0, 0x8e, 0x4b, 0x7a, 0x9d,
+		0xe5, 0x76, 0xd2, 0x65, 0x86, 0xce, 0xc6, 0x4b,
+		0x61, 0x16
+	};
+	U8 expected_tag[16] = {
+		0x1a, 0xe1, 0x0b, 0x59, 0x4f, 0x09, 0xe2, 0x6a,
+		0x7e, 0x90, 0x2e, 0xcb, 0xd0, 0x60, 0x06, 0x91
+	};
+
+	U8 ciphertext[130];  // 114 + 16 tag
+	U8 decrypted[114];
+	I64 ct_len, pt_len;
+	I64 i;
+
+	"ChaCha20-Poly1305 Test... ";
+
+	// Test encryption
+	ct_len = ChaCha20Poly1305Encrypt(key, nonce, aad, 12,
+	                                  plaintext, 114, ciphertext);
+
+	if (ct_len != 130) {
+		"FAILED (wrong ciphertext length)\n";
+		return FALSE;
+	}
+
+	// Verify ciphertext
+	if (MemCmp(ciphertext, expected_ciphertext, 114) != 0) {
+		"FAILED (ciphertext mismatch)\n";
+		return FALSE;
+	}
+
+	// Verify tag
+	if (MemCmp(&ciphertext[114], expected_tag, 16) != 0) {
+		"FAILED (tag mismatch)\n";
+		return FALSE;
+	}
+
+	// Test decryption
+	pt_len = ChaCha20Poly1305Decrypt(key, nonce, aad, 12,
+	                                  ciphertext, 130, decrypted);
+
+	if (pt_len != 114) {
+		"FAILED (wrong plaintext length)\n";
+		return FALSE;
+	}
+
+	if (MemCmp(decrypted, plaintext, 114) != 0) {
+		"FAILED (decryption mismatch)\n";
+		return FALSE;
+	}
+
+	// Test authentication failure (modify ciphertext)
+	ciphertext[50] ^= 0x01;
+	pt_len = ChaCha20Poly1305Decrypt(key, nonce, aad, 12,
+	                                  ciphertext, 130, decrypted);
+	if (pt_len != -1) {
+		"FAILED (should reject tampered data)\n";
+		return FALSE;
+	}
+
+	"PASSED\n";
+	return TRUE;
+}
+

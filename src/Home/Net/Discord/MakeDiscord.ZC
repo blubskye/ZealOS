@@ -1,0 +1,24 @@
+// MakeDiscord.ZC - Discord module loader for ZealOS
+// Include this file to load Discord bot functionality
+
+Cd(__DIR__);;
+
+// Load WebSocket first (includes HTTP, TLS, crypto)
+#include "../WebSocket/MakeWebSocket"
+
+// Discord definitions
+#include "Discord.HH"
+#include "JSON.HH"
+#include "RateLimit.HH"
+
+// Discord implementation
+#include "JSONParser"
+#include "DiscordJSON"
+#include "RateLimit"
+#include "DiscordEvents"
+#include "DiscordClient"
+#include "DiscordREST"
+#include "DiscordEmbed"
+#include "DiscordInteraction"
+
+NetLog("Discord module loaded.");

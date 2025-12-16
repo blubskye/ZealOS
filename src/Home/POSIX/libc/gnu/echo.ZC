@@ -1,0 +1,159 @@
+// echo.ZC - GNU coreutils 'echo' implementation
+// Display a line of text
+//
+// Supports:
+//   -n    do not output trailing newline
+//   -e    enable interpretation of backslash escapes
+//   -E    disable interpretation of backslash escapes (default)
+
+// Process escape sequences in a string
+U0 echo_print_escaped(U8 *s)
+{
+    while (*s) {
+        if (*s == '\\' && s[1]) {
+            s++;
+            switch (*s) {
+                case 'a':  putchar('\a'); break;  // Alert (bell)
+                case 'b':  putchar('\b'); break;  // Backspace
+                case 'c':  return;                // Stop output
+                case 'e':  putchar(0x1B); break;  // Escape
+                case 'f':  putchar('\f'); break;  // Form feed
+                case 'n':  putchar('\n'); break;  // Newline
+                case 'r':  putchar('\r'); break;  // Carriage return
+                case 't':  putchar('\t'); break;  // Tab
+                case 'v':  putchar('\v'); break;  // Vertical tab
+                case '\\': putchar('\\'); break;  // Backslash
+                case '0': {
+                    // Octal escape \0nnn
+                    I64 val = 0;
+                    I64 i = 0;
+                    s++;
+                    while (i < 3 && *s >= '0' && *s <= '7') {
+                        val = val * 8 + (*s - '0');
+                        s++;
+                        i++;
+                    }
+                    s--;  // Back up since loop will advance
+                    putchar(val);
+                    break;
+                }
+                case 'x': {
+                    // Hex escape \xHH
+                    I64 val = 0;
+                    s++;
+                    for (I64 i = 0; i < 2 && *s; i++) {
+                        I64 digit;
+                        if (*s >= '0' && *s <= '9')
+                            digit = *s - '0';
+                        else if (*s >= 'A' && *s <= 'F')
+                            digit = *s - 'A' + 10;
+                        else if (*s >= 'a' && *s <= 'f')
+                            digit = *s - 'a' + 10;
+                        else
+                            break;
+                        val = val * 16 + digit;
+                        s++;
+                    }
+                    s--;  // Back up
+                    putchar(val);
+                    break;
+                }
+                default:
+                    putchar('\\');
+                    putchar(*s);
+                    break;
+            }
+        } else {
+            putchar(*s);
+        }
+        s++;
+    }
+}
+
+// C-style main function
+I64 echo_main(I64 argc, U8 **argv)
+{
+    Bool newline = TRUE;
+    Bool escape = FALSE;
+    I64 start = 1;
+
+    // Parse options
+    while (start < argc) {
+        U8 *arg = argv[start];
+
+        if (arg[0] != '-')
+            break;
+
+        if (strcmp(arg, "--help") == 0) {
+            printf("Usage: echo [SHORT-OPTION]... [STRING]...\n");
+            printf("  or:  echo LONG-OPTION\n");
+            printf("Echo the STRING(s) to standard output.\n\n");
+            printf("  -n             do not output the trailing newline\n");
+            printf("  -e             enable interpretation of backslash escapes\n");
+            printf("  -E             disable interpretation of backslash escapes (default)\n");
+            printf("      --help     display this help and exit\n");
+            printf("      --version  output version information and exit\n");
+            printf("\nIf -e is in effect, the following sequences are recognized:\n");
+            printf("  \\\\      backslash\n");
+            printf("  \\a      alert (BEL)\n");
+            printf("  \\b      backspace\n");
+            printf("  \\c      produce no further output\n");
+            printf("  \\e      escape character\n");
+            printf("  \\f      form feed\n");
+            printf("  \\n      new line\n");
+            printf("  \\r      carriage return\n");
+            printf("  \\t      horizontal tab\n");
+            printf("  \\v      vertical tab\n");
+            printf("  \\0nnn   byte with octal value nnn (1 to 3 digits)\n");
+            printf("  \\xHH    byte with hexadecimal value HH (1 to 2 digits)\n");
+            return 0;
+        }
+
+        if (strcmp(arg, "--version") == 0) {
+            printf("echo (ZealOS coreutils) 1.0\n");
+            return 0;
+        }
+
+        // Check for option flags
+        Bool valid_opt = TRUE;
+        for (I64 i = 1; arg[i]; i++) {
+            switch (arg[i]) {
+                case 'n': newline = FALSE; break;
+                case 'e': escape = TRUE; break;
+                case 'E': escape = FALSE; break;
+                default:
+                    valid_opt = FALSE;
+                    break;
+            }
+            if (!valid_opt)
+                break;
+        }
+
+        if (!valid_opt)
+            break;
+
+        start++;
+    }
+
+    // Output arguments
+    for (I64 i = start; i < argc; i++) {
+        if (i > start)
+            putchar(' ');
+
+        if (escape)
+            echo_print_escaped(argv[i]);
+        else
+            fputs(argv[i], stdout);
+    }
+
+    if (newline)
+        putchar('\n');
+
+    return 0;
+}
+
+// Register as a utility
+U0 GnuEchoRegister()
+{
+    "GNU 'echo' utility loaded. Run: CRun(&echo_main, \"echo Hello World\");\n";
+}

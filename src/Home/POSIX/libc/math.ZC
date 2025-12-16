@@ -1,0 +1,1330 @@
+// math.ZC - Math library for ZealOS
+// Part of the POSIX compatibility layer
+//
+// Implements <math.h> functions using software implementations
+// where ZealOS doesn't have native support.
+
+// ============================================================================
+// MATH CONSTANTS
+// ============================================================================
+
+#define M_E         2.71828182845904523536
+#define M_LOG2E     1.44269504088896340736
+#define M_LOG10E    0.434294481903251827651
+#define M_LN2       0.693147180559945309417
+#define M_LN10      2.30258509299404568402
+#define M_PI        3.14159265358979323846
+#define M_PI_2      1.57079632679489661923
+#define M_PI_4      0.785398163397448309616
+#define M_1_PI      0.318309886183790671538
+#define M_2_PI      0.636619772367581343076
+#define M_2_SQRTPI  1.12837916709551257390
+#define M_SQRT2     1.41421356237309504880
+#define M_SQRT1_2   0.707106781186547524401
+
+#define HUGE_VAL    1e308
+#define HUGE_VALF   1e38
+#define INFINITY    (1.0 / 0.0)
+#define NAN         (0.0 / 0.0)
+
+// Classification macros
+#define FP_NAN       0
+#define FP_INFINITE  1
+#define FP_ZERO      2
+#define FP_SUBNORMAL 3
+#define FP_NORMAL    4
+
+// ============================================================================
+// HELPER FUNCTIONS
+// ============================================================================
+
+// Check if value is NaN
+I64 isnan(F64 x)
+{
+    return x != x;
+}
+
+I64 isnanf(F32 x)
+{
+    return x != x;
+}
+
+// Check if value is infinite
+I64 isinf(F64 x)
+{
+    return (x == INFINITY) || (x == -INFINITY);
+}
+
+I64 isinff(F32 x)
+{
+    return (x == INFINITY) || (x == -INFINITY);
+}
+
+// Check if value is finite
+I64 isfinite(F64 x)
+{
+    return !isnan(x) && !isinf(x);
+}
+
+I64 isfinitef(F32 x)
+{
+    return !isnanf(x) && !isinff(x);
+}
+
+// Check if value is normal
+I64 isnormal(F64 x)
+{
+    if (isnan(x) || isinf(x) || x == 0.0)
+        return FALSE;
+    return TRUE;
+}
+
+// Floating-point classification
+I64 fpclassify(F64 x)
+{
+    if (isnan(x))
+        return FP_NAN;
+    if (isinf(x))
+        return FP_INFINITE;
+    if (x == 0.0)
+        return FP_ZERO;
+    // Simplified - not detecting subnormal
+    return FP_NORMAL;
+}
+
+// Sign bit
+I64 signbit(F64 x)
+{
+    // Check if x is negative (including -0.0)
+    U64 *bits = &x;
+    return (*bits >> 63) & 1;
+}
+
+// ============================================================================
+// ABSOLUTE VALUE AND SIGN
+// ============================================================================
+
+F64 fabs(F64 x)
+{
+    return (x < 0.0) ? -x : x;
+}
+
+F32 fabsf(F32 x)
+{
+    return (x < 0.0) ? -x : x;
+}
+
+F64 copysign(F64 x, F64 y)
+{
+    F64 ax = fabs(x);
+    return (y < 0.0) ? -ax : ax;
+}
+
+F32 copysignf(F32 x, F32 y)
+{
+    F32 ax = fabsf(x);
+    return (y < 0.0) ? -ax : ax;
+}
+
+// ============================================================================
+// ROUNDING FUNCTIONS
+// ============================================================================
+
+F64 floor(F64 x)
+{
+    I64 i = x(I64);
+    if (x < 0.0 && x != i(F64))
+        return (i - 1)(F64);
+    return i(F64);
+}
+
+F32 floorf(F32 x)
+{
+    return floor(x)(F32);
+}
+
+F64 ceil(F64 x)
+{
+    I64 i = x(I64);
+    if (x > 0.0 && x != i(F64))
+        return (i + 1)(F64);
+    return i(F64);
+}
+
+F32 ceilf(F32 x)
+{
+    return ceil(x)(F32);
+}
+
+F64 trunc(F64 x)
+{
+    return x(I64)(F64);
+}
+
+F32 truncf(F32 x)
+{
+    return x(I64)(F32);
+}
+
+F64 round(F64 x)
+{
+    if (x >= 0.0)
+        return floor(x + 0.5);
+    else
+        return ceil(x - 0.5);
+}
+
+F32 roundf(F32 x)
+{
+    return round(x)(F32);
+}
+
+I64 lround(F64 x)
+{
+    return round(x)(I64);
+}
+
+I64 llround(F64 x)
+{
+    return round(x)(I64);
+}
+
+F64 rint(F64 x)
+{
+    // Round to nearest even
+    F64 t = trunc(x);
+    F64 d = fabs(x - t);
+
+    if (d < 0.5)
+        return t;
+    if (d > 0.5)
+        return t + copysign(1.0, x);
+    // Exactly 0.5 - round to even
+    I64 it = t(I64);
+    if (it & 1)
+        return t + copysign(1.0, x);
+    return t;
+}
+
+F64 nearbyint(F64 x)
+{
+    return rint(x);
+}
+
+// ============================================================================
+// MODULO AND REMAINDER
+// ============================================================================
+
+F64 fmod(F64 x, F64 y)
+{
+    if (y == 0.0)
+        return NAN;
+    I64 n = x / y;
+    return x - n * y;
+}
+
+F32 fmodf(F32 x, F32 y)
+{
+    return fmod(x, y)(F32);
+}
+
+F64 remainder(F64 x, F64 y)
+{
+    if (y == 0.0)
+        return NAN;
+    I64 n = round(x / y)(I64);
+    return x - n * y;
+}
+
+F64 modf(F64 x, F64 *iptr)
+{
+    *iptr = trunc(x);
+    return x - *iptr;
+}
+
+F32 modff(F32 x, F32 *iptr)
+{
+    F64 i;
+    F64 f = modf(x, &i);
+    *iptr = i(F32);
+    return f(F32);
+}
+
+// ============================================================================
+// EXPONENTIAL AND LOGARITHMIC FUNCTIONS
+// ============================================================================
+
+// Taylor series for exp(x)
+F64 exp(F64 x)
+{
+    if (isnan(x))
+        return NAN;
+    if (x > 709.0)
+        return INFINITY;
+    if (x < -745.0)
+        return 0.0;
+
+    // Range reduction: exp(x) = exp(k * ln(2)) * exp(r)
+    // where k is integer and -0.5*ln(2) <= r < 0.5*ln(2)
+    I64 k = round(x / M_LN2)(I64);
+    F64 r = x - k * M_LN2;
+
+    // Taylor series for exp(r) where r is small
+    F64 result = 1.0;
+    F64 term = 1.0;
+    for (I64 n = 1; n <= 20; n++) {
+        term *= r / n;
+        result += term;
+        if (fabs(term) < 1e-15 * fabs(result))
+            break;
+    }
+
+    // Multiply by 2^k
+    while (k > 0) {
+        result *= 2.0;
+        k--;
+    }
+    while (k < 0) {
+        result *= 0.5;
+        k++;
+    }
+
+    return result;
+}
+
+F32 expf(F32 x)
+{
+    return exp(x)(F32);
+}
+
+F64 exp2(F64 x)
+{
+    return exp(x * M_LN2);
+}
+
+F32 exp2f(F32 x)
+{
+    return exp2(x)(F32);
+}
+
+F64 expm1(F64 x)
+{
+    // For small x, use Taylor series directly for better precision
+    if (fabs(x) < 0.001) {
+        F64 result = x;
+        F64 term = x;
+        for (I64 n = 2; n <= 20; n++) {
+            term *= x / n;
+            result += term;
+            if (fabs(term) < 1e-15 * fabs(result))
+                break;
+        }
+        return result;
+    }
+    return exp(x) - 1.0;
+}
+
+// Natural logarithm using series expansion
+F64 log(F64 x)
+{
+    if (isnan(x) || x < 0.0)
+        return NAN;
+    if (x == 0.0)
+        return -INFINITY;
+    if (isinf(x))
+        return INFINITY;
+
+    // Range reduction: x = m * 2^e where 1 <= m < 2
+    I64 e = 0;
+    while (x >= 2.0) {
+        x *= 0.5;
+        e++;
+    }
+    while (x < 1.0) {
+        x *= 2.0;
+        e--;
+    }
+
+    // Now 1 <= x < 2
+    // Use series: ln(x) = 2 * sum((y^(2n+1))/(2n+1)) where y = (x-1)/(x+1)
+    F64 y = (x - 1.0) / (x + 1.0);
+    F64 y2 = y * y;
+    F64 result = 0.0;
+    F64 term = y;
+
+    for (I64 n = 0; n < 30; n++) {
+        result += term / (2 * n + 1);
+        term *= y2;
+        if (fabs(term) < 1e-15)
+            break;
+    }
+
+    return 2.0 * result + e * M_LN2;
+}
+
+F32 logf(F32 x)
+{
+    return log(x)(F32);
+}
+
+F64 log10(F64 x)
+{
+    return log(x) / M_LN10;
+}
+
+F32 log10f(F32 x)
+{
+    return log10(x)(F32);
+}
+
+F64 log2(F64 x)
+{
+    return log(x) / M_LN2;
+}
+
+F32 log2f(F32 x)
+{
+    return log2(x)(F32);
+}
+
+F64 log1p(F64 x)
+{
+    // For small x, use Taylor series directly for better precision
+    if (fabs(x) < 0.001) {
+        F64 result = x;
+        F64 term = x;
+        for (I64 n = 2; n <= 30; n++) {
+            term *= -x;
+            result += term / n;
+            if (fabs(term / n) < 1e-15 * fabs(result))
+                break;
+        }
+        return result;
+    }
+    return log(1.0 + x);
+}
+
+// ============================================================================
+// POWER FUNCTIONS
+// ============================================================================
+
+F64 sqrt(F64 x)
+{
+    if (isnan(x) || x < 0.0)
+        return NAN;
+    if (x == 0.0 || isinf(x))
+        return x;
+
+    // Newton-Raphson iteration
+    F64 guess = x;
+    if (guess > 1.0)
+        guess = x / 2.0;
+
+    for (I64 i = 0; i < 50; i++) {
+        F64 next = (guess + x / guess) * 0.5;
+        if (fabs(next - guess) < 1e-15 * fabs(guess))
+            break;
+        guess = next;
+    }
+
+    return guess;
+}
+
+F32 sqrtf(F32 x)
+{
+    return sqrt(x)(F32);
+}
+
+F64 cbrt(F64 x)
+{
+    if (isnan(x))
+        return NAN;
+    if (x == 0.0 || isinf(x))
+        return x;
+
+    Bool neg = FALSE;
+    if (x < 0.0) {
+        neg = TRUE;
+        x = -x;
+    }
+
+    // Newton-Raphson for x^(1/3)
+    F64 guess = x;
+    if (guess > 1.0)
+        guess = x / 3.0;
+
+    for (I64 i = 0; i < 50; i++) {
+        F64 next = (2.0 * guess + x / (guess * guess)) / 3.0;
+        if (fabs(next - guess) < 1e-15 * fabs(guess))
+            break;
+        guess = next;
+    }
+
+    return neg ? -guess : guess;
+}
+
+F32 cbrtf(F32 x)
+{
+    return cbrt(x)(F32);
+}
+
+F64 pow(F64 x, F64 y)
+{
+    // Handle special cases
+    if (y == 0.0)
+        return 1.0;
+    if (x == 0.0) {
+        if (y > 0.0)
+            return 0.0;
+        return INFINITY;
+    }
+    if (x == 1.0)
+        return 1.0;
+    if (isnan(x) || isnan(y))
+        return NAN;
+
+    // Integer power optimization
+    if (y == floor(y) && fabs(y) <= 100) {
+        I64 n = fabs(y)(I64);
+        F64 result = 1.0;
+        F64 base = x;
+
+        while (n > 0) {
+            if (n & 1)
+                result *= base;
+            base *= base;
+            n >>= 1;
+        }
+
+        if (y < 0.0)
+            return 1.0 / result;
+        return result;
+    }
+
+    // General case: x^y = exp(y * ln(x))
+    if (x < 0.0) {
+        // Negative base with non-integer exponent
+        return NAN;
+    }
+
+    return exp(y * log(x));
+}
+
+F32 powf(F32 x, F32 y)
+{
+    return pow(x, y)(F32);
+}
+
+F64 hypot(F64 x, F64 y)
+{
+    // Avoid overflow for large values
+    x = fabs(x);
+    y = fabs(y);
+
+    if (x == 0.0)
+        return y;
+    if (y == 0.0)
+        return x;
+
+    if (x > y) {
+        F64 t = y / x;
+        return x * sqrt(1.0 + t * t);
+    } else {
+        F64 t = x / y;
+        return y * sqrt(1.0 + t * t);
+    }
+}
+
+F32 hypotf(F32 x, F32 y)
+{
+    return hypot(x, y)(F32);
+}
+
+// ============================================================================
+// TRIGONOMETRIC FUNCTIONS
+// ============================================================================
+
+// Reduce angle to [-pi, pi]
+F64 _reduce_angle(F64 x)
+{
+    // Reduce to [-2pi, 2pi]
+    x = fmod(x, 2.0 * M_PI);
+
+    // Reduce to [-pi, pi]
+    if (x > M_PI)
+        x -= 2.0 * M_PI;
+    else if (x < -M_PI)
+        x += 2.0 * M_PI;
+
+    return x;
+}
+
+// Taylor series for sin(x) - x should be small
+F64 _sin_taylor(F64 x)
+{
+    F64 x2 = x * x;
+    F64 result = x;
+    F64 term = x;
+
+    for (I64 n = 1; n <= 15; n++) {
+        term *= -x2 / ((2 * n) * (2 * n + 1));
+        result += term;
+        if (fabs(term) < 1e-16 * fabs(result))
+            break;
+    }
+
+    return result;
+}
+
+// Taylor series for cos(x) - x should be small
+F64 _cos_taylor(F64 x)
+{
+    F64 x2 = x * x;
+    F64 result = 1.0;
+    F64 term = 1.0;
+
+    for (I64 n = 1; n <= 15; n++) {
+        term *= -x2 / ((2 * n - 1) * (2 * n));
+        result += term;
+        if (fabs(term) < 1e-16 * fabs(result))
+            break;
+    }
+
+    return result;
+}
+
+F64 sin(F64 x)
+{
+    if (isnan(x) || isinf(x))
+        return NAN;
+
+    x = _reduce_angle(x);
+
+    // Use symmetry to reduce to [-pi/4, pi/4]
+    if (x > M_PI_2)
+        return _cos_taylor(x - M_PI_2);
+    if (x < -M_PI_2)
+        return -_cos_taylor(x + M_PI_2);
+    if (x > M_PI_4)
+        return _cos_taylor(M_PI_2 - x);
+    if (x < -M_PI_4)
+        return -_cos_taylor(M_PI_2 + x);
+
+    return _sin_taylor(x);
+}
+
+F32 sinf(F32 x)
+{
+    return sin(x)(F32);
+}
+
+F64 cos(F64 x)
+{
+    if (isnan(x) || isinf(x))
+        return NAN;
+
+    x = _reduce_angle(x);
+
+    // Use symmetry to reduce to [-pi/4, pi/4]
+    if (x > M_PI_2)
+        return -_sin_taylor(x - M_PI_2);
+    if (x < -M_PI_2)
+        return -_sin_taylor(x + M_PI_2);
+    if (x > M_PI_4)
+        return _sin_taylor(M_PI_2 - x);
+    if (x < -M_PI_4)
+        return _sin_taylor(M_PI_2 + x);
+
+    return _cos_taylor(x);
+}
+
+F32 cosf(F32 x)
+{
+    return cos(x)(F32);
+}
+
+F64 tan(F64 x)
+{
+    F64 c = cos(x);
+    if (fabs(c) < 1e-15)
+        return copysign(INFINITY, sin(x));
+    return sin(x) / c;
+}
+
+F32 tanf(F32 x)
+{
+    return tan(x)(F32);
+}
+
+U0 sincos(F64 x, F64 *s, F64 *c)
+{
+    *s = sin(x);
+    *c = cos(x);
+}
+
+U0 sincosf(F32 x, F32 *s, F32 *c)
+{
+    *s = sinf(x);
+    *c = cosf(x);
+}
+
+// ============================================================================
+// INVERSE TRIGONOMETRIC FUNCTIONS
+// ============================================================================
+
+F64 asin(F64 x)
+{
+    if (isnan(x) || fabs(x) > 1.0)
+        return NAN;
+    if (x == 1.0)
+        return M_PI_2;
+    if (x == -1.0)
+        return -M_PI_2;
+
+    // For small x, use Taylor series
+    if (fabs(x) < 0.5) {
+        F64 x2 = x * x;
+        F64 result = x;
+        F64 term = x;
+
+        for (I64 n = 1; n <= 30; n++) {
+            term *= x2 * (2 * n - 1) * (2 * n - 1) / ((2 * n) * (2 * n + 1));
+            result += term;
+            if (fabs(term) < 1e-16 * fabs(result))
+                break;
+        }
+        return result;
+    }
+
+    // For larger x, use identity: asin(x) = pi/2 - 2*asin(sqrt((1-x)/2))
+    Bool neg = x < 0;
+    if (neg)
+        x = -x;
+
+    F64 y = sqrt((1.0 - x) / 2.0);
+    F64 result = M_PI_2 - 2.0 * asin(y);
+
+    return neg ? -result : result;
+}
+
+F32 asinf(F32 x)
+{
+    return asin(x)(F32);
+}
+
+F64 acos(F64 x)
+{
+    if (isnan(x) || fabs(x) > 1.0)
+        return NAN;
+    return M_PI_2 - asin(x);
+}
+
+F32 acosf(F32 x)
+{
+    return acos(x)(F32);
+}
+
+F64 atan(F64 x)
+{
+    if (isnan(x))
+        return NAN;
+    if (isinf(x))
+        return copysign(M_PI_2, x);
+
+    Bool neg = FALSE;
+    if (x < 0.0) {
+        neg = TRUE;
+        x = -x;
+    }
+
+    Bool invert = FALSE;
+    if (x > 1.0) {
+        invert = TRUE;
+        x = 1.0 / x;
+    }
+
+    // Reduce further using atan(x) = pi/6 + atan((x*sqrt(3)-1)/(x+sqrt(3)))
+    Bool reduce = FALSE;
+    if (x > 0.2679491924311227) { // tan(pi/12)
+        reduce = TRUE;
+        x = (x * M_SQRT1_2 * M_SQRT2 * 1.732050807568877 - 1.0) /
+            (x + 1.732050807568877);
+    }
+
+    // Taylor series for small x
+    F64 x2 = x * x;
+    F64 result = x;
+    F64 term = x;
+
+    for (I64 n = 1; n <= 40; n++) {
+        term *= -x2;
+        F64 next = term / (2 * n + 1);
+        result += next;
+        if (fabs(next) < 1e-16 * fabs(result))
+            break;
+    }
+
+    if (reduce)
+        result += M_PI / 6.0;
+    if (invert)
+        result = M_PI_2 - result;
+    if (neg)
+        result = -result;
+
+    return result;
+}
+
+F32 atanf(F32 x)
+{
+    return atan(x)(F32);
+}
+
+F64 atan2(F64 y, F64 x)
+{
+    if (isnan(x) || isnan(y))
+        return NAN;
+
+    if (x > 0.0)
+        return atan(y / x);
+    if (x < 0.0) {
+        if (y >= 0.0)
+            return atan(y / x) + M_PI;
+        else
+            return atan(y / x) - M_PI;
+    }
+    // x == 0
+    if (y > 0.0)
+        return M_PI_2;
+    if (y < 0.0)
+        return -M_PI_2;
+    return 0.0; // Both zero
+}
+
+F32 atan2f(F32 y, F32 x)
+{
+    return atan2(y, x)(F32);
+}
+
+// ============================================================================
+// HYPERBOLIC FUNCTIONS
+// ============================================================================
+
+F64 sinh(F64 x)
+{
+    if (isnan(x))
+        return NAN;
+    if (fabs(x) < 1.0) {
+        // Use Taylor series for small x
+        F64 x2 = x * x;
+        F64 result = x;
+        F64 term = x;
+
+        for (I64 n = 1; n <= 15; n++) {
+            term *= x2 / ((2 * n) * (2 * n + 1));
+            result += term;
+            if (fabs(term) < 1e-16 * fabs(result))
+                break;
+        }
+        return result;
+    }
+    // sinh(x) = (exp(x) - exp(-x)) / 2
+    F64 ex = exp(x);
+    return (ex - 1.0 / ex) / 2.0;
+}
+
+F32 sinhf(F32 x)
+{
+    return sinh(x)(F32);
+}
+
+F64 cosh(F64 x)
+{
+    if (isnan(x))
+        return NAN;
+    // cosh(x) = (exp(x) + exp(-x)) / 2
+    F64 ex = exp(fabs(x));
+    return (ex + 1.0 / ex) / 2.0;
+}
+
+F32 coshf(F32 x)
+{
+    return cosh(x)(F32);
+}
+
+F64 tanh(F64 x)
+{
+    if (isnan(x))
+        return NAN;
+    if (x > 20.0)
+        return 1.0;
+    if (x < -20.0)
+        return -1.0;
+
+    F64 ex = exp(2.0 * x);
+    return (ex - 1.0) / (ex + 1.0);
+}
+
+F32 tanhf(F32 x)
+{
+    return tanh(x)(F32);
+}
+
+// ============================================================================
+// INVERSE HYPERBOLIC FUNCTIONS
+// ============================================================================
+
+F64 asinh(F64 x)
+{
+    if (isnan(x) || isinf(x))
+        return x;
+    // asinh(x) = ln(x + sqrt(x^2 + 1))
+    return log(x + sqrt(x * x + 1.0));
+}
+
+F32 asinhf(F32 x)
+{
+    return asinh(x)(F32);
+}
+
+F64 acosh(F64 x)
+{
+    if (isnan(x) || x < 1.0)
+        return NAN;
+    if (x == 1.0)
+        return 0.0;
+    // acosh(x) = ln(x + sqrt(x^2 - 1))
+    return log(x + sqrt(x * x - 1.0));
+}
+
+F32 acoshf(F32 x)
+{
+    return acosh(x)(F32);
+}
+
+F64 atanh(F64 x)
+{
+    if (isnan(x) || fabs(x) > 1.0)
+        return NAN;
+    if (x == 1.0)
+        return INFINITY;
+    if (x == -1.0)
+        return -INFINITY;
+    // atanh(x) = 0.5 * ln((1+x)/(1-x))
+    return 0.5 * log((1.0 + x) / (1.0 - x));
+}
+
+F32 atanhf(F32 x)
+{
+    return atanh(x)(F32);
+}
+
+// ============================================================================
+// ERROR AND GAMMA FUNCTIONS
+// ============================================================================
+
+// Error function using series expansion
+F64 erf(F64 x)
+{
+    if (isnan(x))
+        return NAN;
+    if (x == 0.0)
+        return 0.0;
+    if (x > 6.0)
+        return 1.0;
+    if (x < -6.0)
+        return -1.0;
+
+    Bool neg = FALSE;
+    if (x < 0.0) {
+        neg = TRUE;
+        x = -x;
+    }
+
+    // Taylor series: erf(x) = (2/sqrt(pi)) * sum((-1)^n * x^(2n+1) / (n! * (2n+1)))
+    F64 result = x;
+    F64 term = x;
+    F64 x2 = x * x;
+
+    for (I64 n = 1; n <= 50; n++) {
+        term *= -x2 / n;
+        F64 next = term / (2 * n + 1);
+        result += next;
+        if (fabs(next) < 1e-16 * fabs(result))
+            break;
+    }
+
+    result *= 2.0 / sqrt(M_PI);
+
+    return neg ? -result : result;
+}
+
+F32 erff(F32 x)
+{
+    return erf(x)(F32);
+}
+
+F64 erfc(F64 x)
+{
+    return 1.0 - erf(x);
+}
+
+F32 erfcf(F32 x)
+{
+    return erfc(x)(F32);
+}
+
+// Gamma function using Stirling's approximation and recursion
+F64 tgamma(F64 x)
+{
+    if (isnan(x))
+        return NAN;
+    if (x <= 0.0 && x == floor(x))
+        return NAN; // Negative integer
+
+    // For small positive integers
+    if (x == floor(x) && x > 0 && x <= 20) {
+        F64 result = 1.0;
+        for (I64 i = 2; i < x(I64); i++)
+            result *= i;
+        return result;
+    }
+
+    // Reflection formula for negative x
+    if (x < 0.0) {
+        return M_PI / (sin(M_PI * x) * tgamma(1.0 - x));
+    }
+
+    // Use Stirling's approximation for large x
+    // Gamma(x) Γëê sqrt(2*pi/x) * (x/e)^x
+    // First, move x to be > 10 using Gamma(x+1) = x * Gamma(x)
+    F64 mult = 1.0;
+    while (x < 10.0) {
+        mult *= x;
+        x += 1.0;
+    }
+
+    // Stirling's approximation with correction terms
+    F64 result = sqrt(2.0 * M_PI / x) * pow(x / M_E, x);
+    // Add correction terms
+    result *= 1.0 + 1.0/(12.0*x) + 1.0/(288.0*x*x) - 139.0/(51840.0*x*x*x);
+
+    return result / mult;
+}
+
+F32 tgammaf(F32 x)
+{
+    return tgamma(x)(F32);
+}
+
+F64 lgamma(F64 x)
+{
+    // Log of absolute value of gamma
+    F64 g = tgamma(x);
+    if (g < 0.0)
+        g = -g;
+    return log(g);
+}
+
+F32 lgammaf(F32 x)
+{
+    return lgamma(x)(F32);
+}
+
+// ============================================================================
+// MIN, MAX, DIM FUNCTIONS
+// ============================================================================
+
+F64 fmax(F64 x, F64 y)
+{
+    if (isnan(x))
+        return y;
+    if (isnan(y))
+        return x;
+    return (x > y) ? x : y;
+}
+
+F32 fmaxf(F32 x, F32 y)
+{
+    return fmax(x, y)(F32);
+}
+
+F64 fmin(F64 x, F64 y)
+{
+    if (isnan(x))
+        return y;
+    if (isnan(y))
+        return x;
+    return (x < y) ? x : y;
+}
+
+F32 fminf(F32 x, F32 y)
+{
+    return fmin(x, y)(F32);
+}
+
+F64 fdim(F64 x, F64 y)
+{
+    if (isnan(x) || isnan(y))
+        return NAN;
+    return (x > y) ? (x - y) : 0.0;
+}
+
+F32 fdimf(F32 x, F32 y)
+{
+    return fdim(x, y)(F32);
+}
+
+// ============================================================================
+// OTHER FUNCTIONS
+// ============================================================================
+
+F64 fma(F64 x, F64 y, F64 z)
+{
+    // Fused multiply-add: x*y + z
+    return x * y + z;
+}
+
+F32 fmaf(F32 x, F32 y, F32 z)
+{
+    return x * y + z;
+}
+
+F64 frexp(F64 x, I64 *exp)
+{
+    if (x == 0.0) {
+        *exp = 0;
+        return 0.0;
+    }
+    if (isnan(x) || isinf(x)) {
+        *exp = 0;
+        return x;
+    }
+
+    *exp = 0;
+    Bool neg = FALSE;
+    if (x < 0.0) {
+        neg = TRUE;
+        x = -x;
+    }
+
+    while (x >= 1.0) {
+        x *= 0.5;
+        (*exp)++;
+    }
+    while (x < 0.5) {
+        x *= 2.0;
+        (*exp)--;
+    }
+
+    return neg ? -x : x;
+}
+
+F64 ldexp(F64 x, I64 exp)
+{
+    // x * 2^exp
+    while (exp > 0) {
+        x *= 2.0;
+        exp--;
+    }
+    while (exp < 0) {
+        x *= 0.5;
+        exp++;
+    }
+    return x;
+}
+
+F32 ldexpf(F32 x, I64 exp)
+{
+    return ldexp(x, exp)(F32);
+}
+
+F64 scalbn(F64 x, I64 n)
+{
+    return ldexp(x, n);
+}
+
+F64 scalbln(F64 x, I64 n)
+{
+    return ldexp(x, n);
+}
+
+I64 ilogb(F64 x)
+{
+    I64 e;
+    frexp(x, &e);
+    return e - 1;
+}
+
+F64 logb(F64 x)
+{
+    return ilogb(x)(F64);
+}
+
+F64 nan(U8 *tagp)
+{
+    return NAN;
+}
+
+F32 nanf(U8 *tagp)
+{
+    return NAN;
+}
+
+F64 nextafter(F64 x, F64 y)
+{
+    if (isnan(x) || isnan(y))
+        return NAN;
+    if (x == y)
+        return y;
+
+    // Very simplified - add/subtract smallest increment
+    U64 *bits = &x;
+    if (x < y)
+        (*bits)++;
+    else
+        (*bits)--;
+    return x;
+}
+
+// ============================================================================
+// DEGREE/RADIAN CONVERSION (non-standard but useful)
+// ============================================================================
+
+F64 deg2rad(F64 deg)
+{
+    return deg * M_PI / 180.0;
+}
+
+F64 rad2deg(F64 rad)
+{
+    return rad * 180.0 / M_PI;
+}
+
+// ============================================================================
+// BESSEL FUNCTIONS (commonly needed)
+// ============================================================================
+
+// Bessel function J0 using series
+F64 j0(F64 x)
+{
+    if (isnan(x))
+        return NAN;
+
+    x = fabs(x);
+    if (x < 8.0) {
+        // Series expansion
+        F64 x2 = x * x;
+        F64 result = 1.0;
+        F64 term = 1.0;
+
+        for (I64 n = 1; n <= 30; n++) {
+            term *= -x2 / (4.0 * n * n);
+            result += term;
+            if (fabs(term) < 1e-16 * fabs(result))
+                break;
+        }
+        return result;
+    }
+
+    // Asymptotic expansion for large x
+    F64 ax = fabs(x);
+    F64 z = 8.0 / ax;
+    F64 z2 = z * z;
+    F64 xx = ax - 0.785398163397448;  // pi/4
+
+    F64 p = 1.0 - 0.1098628627e-2 * z2 + 0.2734510407e-4 * z2 * z2;
+    F64 q = -0.1562499995e-1 * z + 0.1430488765e-3 * z * z2;
+
+    return sqrt(0.636619772 / ax) * (p * cos(xx) - q * sin(xx));
+}
+
+// Bessel function J1
+F64 j1(F64 x)
+{
+    if (isnan(x))
+        return NAN;
+
+    Bool neg = x < 0.0;
+    x = fabs(x);
+
+    if (x < 8.0) {
+        // Series expansion
+        F64 x2 = x * x;
+        F64 result = x / 2.0;
+        F64 term = x / 2.0;
+
+        for (I64 n = 1; n <= 30; n++) {
+            term *= -x2 / (4.0 * n * (n + 1));
+            result += term;
+            if (fabs(term) < 1e-16 * fabs(result))
+                break;
+        }
+        return neg ? -result : result;
+    }
+
+    // Asymptotic expansion for large x
+    F64 ax = fabs(x);
+    F64 z = 8.0 / ax;
+    F64 z2 = z * z;
+    F64 xx = ax - 2.356194491;  // 3*pi/4
+
+    F64 p = 1.0 + 0.183105e-2 * z2 - 0.3516396496e-4 * z2 * z2;
+    F64 q = 0.04687499995 * z - 0.2002690873e-3 * z * z2;
+
+    F64 result = sqrt(0.636619772 / ax) * (p * cos(xx) - q * sin(xx));
+    return neg ? -result : result;
+}
+
+// Bessel function Y0 (second kind)
+F64 y0(F64 x)
+{
+    if (isnan(x) || x <= 0.0)
+        return NAN;
+
+    if (x < 8.0) {
+        // Series + log term
+        F64 result = (2.0 / M_PI) * j0(x) * log(x);
+        // Add polynomial correction (simplified)
+        F64 x2 = x * x;
+        result += 0.36746691 - 0.60559591e-1 * x2 + 0.74350384e-2 * x2 * x2;
+        return result;
+    }
+
+    // Asymptotic
+    F64 z = 8.0 / x;
+    F64 z2 = z * z;
+    F64 xx = x - 0.785398163397448;
+
+    F64 p = 1.0 - 0.1098628627e-2 * z2;
+    F64 q = -0.1562499995e-1 * z;
+
+    return sqrt(0.636619772 / x) * (p * sin(xx) + q * cos(xx));
+}
+
+// Bessel function Y1 (second kind)
+F64 y1(F64 x)
+{
+    if (isnan(x) || x <= 0.0)
+        return NAN;
+
+    if (x < 8.0) {
+        F64 result = (2.0 / M_PI) * (j1(x) * log(x) - 1.0 / x);
+        return result;
+    }
+
+    // Asymptotic
+    F64 z = 8.0 / x;
+    F64 z2 = z * z;
+    F64 xx = x - 2.356194491;
+
+    F64 p = 1.0 + 0.183105e-2 * z2;
+    F64 q = 0.04687499995 * z;
+
+    return sqrt(0.636619772 / x) * (p * sin(xx) + q * cos(xx));
+}
+
+// ============================================================================
+// INITIALIZATION
+// ============================================================================
+
+"libm loaded - math functions for ZealOS\n";

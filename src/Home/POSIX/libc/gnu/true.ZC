@@ -1,0 +1,32 @@
+// true.ZC - GNU coreutils 'true' implementation
+// Exit with status 0 (success)
+//
+// This is a direct port of the GNU true utility
+
+// C-style main function
+I64 true_main(I64 argc, U8 **argv)
+{
+    // Handle --help and --version for GNU compatibility
+    if (argc > 1) {
+        if (strcmp(argv[1], "--help") == 0) {
+            printf("Usage: true [ignored command line arguments]\n");
+            printf("  or:  true OPTION\n");
+            printf("Exit with a status code indicating success.\n\n");
+            printf("      --help     display this help and exit\n");
+            printf("      --version  output version information and exit\n");
+            return 0;
+        }
+        if (strcmp(argv[1], "--version") == 0) {
+            printf("true (ZealOS coreutils) 1.0\n");
+            return 0;
+        }
+    }
+
+    return 0;  // Always succeed
+}
+
+// Register as a utility
+U0 GnuTrueRegister()
+{
+    "GNU 'true' utility loaded. Run: CRun(&true_main, \"true\");\n";
+}

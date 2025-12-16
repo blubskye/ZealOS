@@ -1,0 +1,429 @@
+// Random.ZC - Cryptographically Secure Pseudo-Random Number Generator
+// Part of ZealOS TLS implementation
+// See C:/Home/Net/Docs/TLSDesign.DD for design documentation
+
+// This implements a CSPRNG based on:
+// - Entropy gathering from CPU timestamp counter (TSC)
+// - SHA-256 based mixing and extraction
+// - Counter mode for output generation
+// - Periodic reseeding from entropy sources
+
+// ============================================================================
+// GLOBAL STATE
+// ============================================================================
+
+// Global random context
+CRandomContext g_random_ctx;
+
+// ============================================================================
+// ENTROPY GATHERING
+// ============================================================================
+
+// Read CPU timestamp counter for entropy
+// The TSC provides high-resolution timing that varies based on
+// execution timing, interrupts, and other factors
+U64 RandomGetTSC()
+{
+	// In ZealOS, we can use tS (timestamp in seconds) and cnts.jiffies
+	// TSC() is the CPU timestamp counter
+	return TSC();
+}
+
+// Gather entropy from various sources and add to pool
+U0 RandomGatherEntropy(CRandomContext *ctx, U8 *extra, I64 extra_len)
+{
+	U8 entropy[128];
+	I64 pos = 0;
+	U64 tsc;
+	I64 i;
+
+	// Get multiple TSC readings (timing varies)
+	for (i = 0; i < 8; i++) {
+		tsc = RandomGetTSC();
+		MemCpy(&entropy[pos], &tsc, 8);
+		pos += 8;
+	}
+
+	// Add current time (seconds since boot)
+	tsc = tS * 1000000; // Convert to microseconds
+	MemCpy(&entropy[pos], &tsc, 8);
+	pos += 8;
+
+	// Add jiffies counter
+	tsc = cnts.jiffies;
+	MemCpy(&entropy[pos], &tsc, 8);
+	pos += 8;
+
+	// Add address of stack variable (ASLR-like entropy)
+	tsc = &entropy;
+	MemCpy(&entropy[pos], &tsc, 8);
+	pos += 8;
+
+	// Add mouse position if available
+	tsc = mouse.pos.x | (mouse.pos.y << 16);
+	MemCpy(&entropy[pos], &tsc, 8);
+	pos += 8;
+
+	// Add keyboard state
+	tsc = kbd.scan_code;
+	MemCpy(&entropy[pos], &tsc, 8);
+	pos += 8;
+
+	// Use SHA-256 to mix entropy into pool
+	CSHA256Context sha;
+	SHA256Init(&sha);
+	SHA256Update(&sha, ctx->pool, 64);
+	SHA256Update(&sha, entropy, pos);
+
+	// Add any extra entropy provided
+	if (extra && extra_len > 0) {
+		SHA256Update(&sha, extra, extra_len);
+	}
+
+	// Add counter
+	SHA256Update(&sha, &ctx->counter, 8);
+
+	// Extract new pool state
+	U8 new_pool[64];
+	SHA256Final(&sha, new_pool);
+
+	// Hash again to get second half of pool
+	SHA256Init(&sha);
+	SHA256Update(&sha, new_pool, 32);
+	SHA256Update(&sha, entropy, pos);
+	SHA256Final(&sha, &new_pool[32]);
+
+	// Update pool
+	MemCpy(ctx->pool, new_pool, 64);
+
+	// Increment counter
+	ctx->counter++;
+
+	// Secure cleanup
+	CryptoSecureZero(entropy, 128);
+	CryptoSecureZero(new_pool, 64);
+}
+
+// ============================================================================
+// INITIALIZATION
+// ============================================================================
+
+// Initialize the random number generator
+U0 RandomInit(CRandomContext *ctx)
+{
+	I64 i;
+
+	// Clear context
+	MemSet(ctx, 0, sizeof(CRandomContext));
+
+	// Initial entropy gathering - do multiple rounds
+	for (i = 0; i < 16; i++) {
+		RandomGatherEntropy(ctx, NULL, 0);
+		// Small delay to vary TSC readings
+		Sleep(1);
+	}
+
+	ctx->initialized = TRUE;
+}
+
+// Initialize global random context
+U0 RandomGlobalInit()
+{
+	RandomInit(&g_random_ctx);
+}
+
+// ============================================================================
+// RANDOM GENERATION
+// ============================================================================
+
+// Generate random bytes using counter mode with SHA-256
+I64 RandomBytes(CRandomContext *ctx, U8 *output, I64 length)
+{
+	CSHA256Context sha;
+	U8 hash[32];
+	U8 counter_block[64];
+	I64 generated = 0;
+	I64 chunk;
+	I64 i;
+
+	if (!ctx->initialized) {
+		return CRYPTO_ERR_NOT_INITIALIZED;
+	}
+
+	if (!output || length <= 0) {
+		return CRYPTO_ERR_INVALID_PARAM;
+	}
+
+	// Reseed periodically (every 256 calls)
+	if ((ctx->counter & 0xFF) == 0) {
+		RandomGatherEntropy(ctx, NULL, 0);
+	}
+
+	while (generated < length) {
+		// Build counter block: pool || counter
+		MemCpy(counter_block, ctx->pool, 32);
+		MemCpy(&counter_block[32], &ctx->counter, 8);
+
+		// Fill rest with incrementing pattern
+		for (i = 40; i < 64; i++) {
+			counter_block[i] = (U8)(ctx->counter + i);
+		}
+
+		// Hash to produce output
+		SHA256Init(&sha);
+		SHA256Update(&sha, counter_block, 64);
+		SHA256Final(&sha, hash);
+
+		// Copy to output
+		chunk = length - generated;
+		if (chunk > 32) chunk = 32;
+		MemCpy(&output[generated], hash, chunk);
+		generated += chunk;
+
+		// Increment counter
+		ctx->counter++;
+	}
+
+	// Secure cleanup
+	CryptoSecureZero(hash, 32);
+	CryptoSecureZero(counter_block, 64);
+
+	return CRYPTO_OK;
+}
+
+// Generate random bytes using global context
+I64 Random(U8 *output, I64 length)
+{
+	// Auto-initialize if needed
+	if (!g_random_ctx.initialized) {
+		RandomGlobalInit();
+	}
+
+	return RandomBytes(&g_random_ctx, output, length);
+}
+
+// ============================================================================
+// CONVENIENCE FUNCTIONS
+// ============================================================================
+
+// Generate a random 32-bit unsigned integer
+U32 RandomU32()
+{
+	U32 value;
+	Random(&value, 4);
+	return value;
+}
+
+// Generate a random 64-bit unsigned integer
+U64 RandomU64()
+{
+	U64 value;
+	Random(&value, 8);
+	return value;
+}
+
+// Generate random integer in range [0, max)
+U64 RandomRange(U64 max)
+{
+	U64 value;
+	U64 threshold;
+
+	if (max <= 1) return 0;
+
+	// Avoid modulo bias by rejecting values >= threshold
+	threshold = (0 - max) % max;  // = 2^64 % max
+
+	do {
+		value = RandomU64();
+	} while (value < threshold);
+
+	return value % max;
+}
+
+// Add additional entropy to the pool
+U0 RandomAddEntropy(U8 *data, I64 length)
+{
+	if (!g_random_ctx.initialized) {
+		RandomGlobalInit();
+	}
+	RandomGatherEntropy(&g_random_ctx, data, length);
+}
+
+// ============================================================================
+// KEY GENERATION HELPERS
+// ============================================================================
+
+// Generate a random X25519 private key
+// Clamps the key per RFC 7748 requirements
+U0 RandomX25519PrivateKey(U8 *key)
+{
+	Random(key, 32);
+
+	// Clamp the key per RFC 7748
+	key[0]  &= 0xF8;  // Clear bottom 3 bits
+	key[31] &= 0x7F;  // Clear top bit
+	key[31] |= 0x40;  // Set second-highest bit
+}
+
+// Generate random nonce for GCM
+U0 RandomGCMNonce(U8 *nonce)
+{
+	Random(nonce, GCM_NONCE_SIZE);
+}
+
+// ============================================================================
+// TEST FUNCTIONS
+// ============================================================================
+
+// Basic randomness tests
+Bool RandomTestBasic()
+{
+	U8 buf1[32], buf2[32];
+	I64 i;
+
+	"Testing Random Number Generator...\n";
+
+	// Test 1: Generate two sequences, they should be different
+	"  Test 1: Uniqueness... ";
+	Random(buf1, 32);
+	Random(buf2, 32);
+
+	if (MemCmp(buf1, buf2, 32) == 0) {
+		"FAILED (identical outputs)\n";
+		return FALSE;
+	}
+	"PASSED\n";
+
+	// Test 2: Check that output isn't all zeros
+	"  Test 2: Non-zero output... ";
+	Random(buf1, 32);
+	Bool all_zero = TRUE;
+	for (i = 0; i < 32; i++) {
+		if (buf1[i] != 0) {
+			all_zero = FALSE;
+			break;
+		}
+	}
+	if (all_zero) {
+		"FAILED (all zeros)\n";
+		return FALSE;
+	}
+	"PASSED\n";
+
+	// Test 3: Check that output isn't all ones
+	"  Test 3: Non-all-ones output... ";
+	Bool all_ones = TRUE;
+	for (i = 0; i < 32; i++) {
+		if (buf1[i] != 0xFF) {
+			all_ones = FALSE;
+			break;
+		}
+	}
+	if (all_ones) {
+		"FAILED (all ones)\n";
+		return FALSE;
+	}
+	"PASSED\n";
+
+	// Test 4: Basic frequency test - count bits
+	"  Test 4: Bit frequency... ";
+	U8 large_buf[256];
+	Random(large_buf, 256);
+	I64 ones = 0;
+	for (i = 0; i < 256; i++) {
+		I64 b;
+		for (b = 0; b < 8; b++) {
+			if (large_buf[i] & (1 << b)) ones++;
+		}
+	}
+	// Should be roughly 50% ones (1024 bits total)
+	// Accept anything between 40% and 60%
+	I64 total_bits = 256 * 8;
+	I64 min_ones = total_bits * 40 / 100;
+	I64 max_ones = total_bits * 60 / 100;
+	if (ones < min_ones || ones > max_ones) {
+		"FAILED (ones=%d, expected %d-%d)\n", ones, min_ones, max_ones;
+		return FALSE;
+	}
+	"PASSED (ones=%d/%d)\n", ones, total_bits;
+
+	// Test 5: RandomRange test
+	"  Test 5: RandomRange... ";
+	Bool range_ok = TRUE;
+	for (i = 0; i < 1000; i++) {
+		U64 val = RandomRange(100);
+		if (val >= 100) {
+			range_ok = FALSE;
+			break;
+		}
+	}
+	if (!range_ok) {
+		"FAILED\n";
+		return FALSE;
+	}
+	"PASSED\n";
+
+	// Test 6: X25519 private key clamping
+	"  Test 6: X25519 key clamping... ";
+	U8 priv_key[32];
+	RandomX25519PrivateKey(priv_key);
+
+	// Check clamping: bottom 3 bits of first byte should be 0
+	if (priv_key[0] & 0x07) {
+		"FAILED (bottom bits not cleared)\n";
+		return FALSE;
+	}
+	// Top bit of last byte should be 0
+	if (priv_key[31] & 0x80) {
+		"FAILED (top bit not cleared)\n";
+		return FALSE;
+	}
+	// Second-highest bit should be set
+	if (!(priv_key[31] & 0x40)) {
+		"FAILED (second-high bit not set)\n";
+		return FALSE;
+	}
+	"PASSED\n";
+
+	return TRUE;
+}
+
+// Print random bytes (for visual inspection)
+U0 RandomPrintBytes(I64 count)
+{
+	U8 *buf = MAlloc(count);
+	I64 i;
+
+	Random(buf, count);
+
+	"%d random bytes:\n", count;
+	for (i = 0; i < count; i++) {
+		"%02X ", buf[i];
+		if ((i + 1) % 16 == 0) "\n";
+	}
+	if (count % 16 != 0) "\n";
+
+	Free(buf);
+}
+
+// Run all random tests
+Bool RandomTest()
+{
+	"====== Random Number Generator Tests ======\n\n";
+
+	// Initialize global context first
+	RandomGlobalInit();
+
+	if (!RandomTestBasic()) {
+		"\nRandom tests FAILED!\n";
+		return FALSE;
+	}
+
+	"\nRandom tests PASSED!\n";
+
+	// Show some sample output
+	"\nSample random output:\n";
+	RandomPrintBytes(64);
+
+	return TRUE;
+}

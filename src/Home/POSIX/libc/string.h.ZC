@@ -1,0 +1,443 @@
+// string.h - String functions for ZealOS libc
+// Maps to ZealOS native functions where possible
+
+#ifndef _STRING_H
+#define _STRING_H
+
+#include "stddef.h"
+
+// ============================================================================
+// STRING LENGTH
+// ============================================================================
+
+size_t strlen(U8 *s)
+{
+    return StrLen(s);
+}
+
+size_t strnlen(U8 *s, size_t maxlen)
+{
+    size_t len = 0;
+    while (len < maxlen && s[len])
+        len++;
+    return len;
+}
+
+// ============================================================================
+// STRING COPY
+// ============================================================================
+
+U8 *strcpy(U8 *dest, U8 *src)
+{
+    StrCpy(dest, src);
+    return dest;
+}
+
+U8 *strncpy(U8 *dest, U8 *src, size_t n)
+{
+    size_t i;
+    for (i = 0; i < n && src[i]; i++)
+        dest[i] = src[i];
+    for (; i < n; i++)
+        dest[i] = 0;
+    return dest;
+}
+
+// BSD strlcpy - safer than strncpy
+size_t strlcpy(U8 *dest, U8 *src, size_t size)
+{
+    size_t src_len = strlen(src);
+    if (size > 0) {
+        size_t copy_len = (src_len >= size) ? size - 1 : src_len;
+        MemCpy(dest, src, copy_len);
+        dest[copy_len] = 0;
+    }
+    return src_len;
+}
+
+// ============================================================================
+// STRING CONCATENATION
+// ============================================================================
+
+U8 *strcat(U8 *dest, U8 *src)
+{
+    StrCat(dest, src);
+    return dest;
+}
+
+U8 *strncat(U8 *dest, U8 *src, size_t n)
+{
+    size_t dest_len = strlen(dest);
+    size_t i;
+    for (i = 0; i < n && src[i]; i++)
+        dest[dest_len + i] = src[i];
+    dest[dest_len + i] = 0;
+    return dest;
+}
+
+// BSD strlcat - safer than strncat
+size_t strlcat(U8 *dest, U8 *src, size_t size)
+{
+    size_t dest_len = strnlen(dest, size);
+    size_t src_len = strlen(src);
+
+    if (dest_len == size)
+        return size + src_len;
+
+    if (src_len < size - dest_len) {
+        MemCpy(dest + dest_len, src, src_len + 1);
+    } else {
+        MemCpy(dest + dest_len, src, size - dest_len - 1);
+        dest[size - 1] = 0;
+    }
+
+    return dest_len + src_len;
+}
+
+// ============================================================================
+// STRING COMPARISON
+// ============================================================================
+
+I64 strcmp(U8 *s1, U8 *s2)
+{
+    return StrCmp(s1, s2);
+}
+
+I64 strncmp(U8 *s1, U8 *s2, size_t n)
+{
+    size_t i;
+    for (i = 0; i < n; i++) {
+        if (s1[i] != s2[i])
+            return (U8)s1[i] - (U8)s2[i];
+        if (s1[i] == 0)
+            return 0;
+    }
+    return 0;
+}
+
+I64 strcasecmp(U8 *s1, U8 *s2)
+{
+    return StrICmp(s1, s2);
+}
+
+I64 strncasecmp(U8 *s1, U8 *s2, size_t n)
+{
+    size_t i;
+    U8 c1, c2;
+    for (i = 0; i < n; i++) {
+        c1 = s1[i];
+        c2 = s2[i];
+        if (c1 >= 'A' && c1 <= 'Z') c1 += 32;
+        if (c2 >= 'A' && c2 <= 'Z') c2 += 32;
+        if (c1 != c2)
+            return c1 - c2;
+        if (c1 == 0)
+            return 0;
+    }
+    return 0;
+}
+
+// ============================================================================
+// STRING SEARCH
+// ============================================================================
+
+U8 *strchr(U8 *s, I64 c)
+{
+    while (*s) {
+        if (*s == (U8)c)
+            return s;
+        s++;
+    }
+    if (c == 0)
+        return s;
+    return NULL;
+}
+
+U8 *strrchr(U8 *s, I64 c)
+{
+    U8 *last = NULL;
+    while (*s) {
+        if (*s == (U8)c)
+            last = s;
+        s++;
+    }
+    if (c == 0)
+        return s;
+    return last;
+}
+
+U8 *strstr(U8 *haystack, U8 *needle)
+{
+    return StrFind(needle, haystack);
+}
+
+U8 *strcasestr(U8 *haystack, U8 *needle)
+{
+    return StrIFind(needle, haystack);
+}
+
+U8 *strpbrk(U8 *s, U8 *accept)
+{
+    while (*s) {
+        U8 *a = accept;
+        while (*a) {
+            if (*s == *a)
+                return s;
+            a++;
+        }
+        s++;
+    }
+    return NULL;
+}
+
+size_t strspn(U8 *s, U8 *accept)
+{
+    size_t count = 0;
+    while (*s) {
+        U8 *a = accept;
+        Bool found = FALSE;
+        while (*a) {
+            if (*s == *a) {
+                found = TRUE;
+                break;
+            }
+            a++;
+        }
+        if (!found)
+            break;
+        count++;
+        s++;
+    }
+    return count;
+}
+
+size_t strcspn(U8 *s, U8 *reject)
+{
+    size_t count = 0;
+    while (*s) {
+        U8 *r = reject;
+        while (*r) {
+            if (*s == *r)
+                return count;
+            r++;
+        }
+        count++;
+        s++;
+    }
+    return count;
+}
+
+// ============================================================================
+// STRING TOKENIZE
+// ============================================================================
+
+// Static state for strtok
+static U8 *_strtok_state = NULL;
+
+U8 *strtok(U8 *str, U8 *delim)
+{
+    return strtok_r(str, delim, &_strtok_state);
+}
+
+U8 *strtok_r(U8 *str, U8 *delim, U8 **saveptr)
+{
+    U8 *start, *end;
+
+    if (str)
+        *saveptr = str;
+
+    if (!*saveptr)
+        return NULL;
+
+    // Skip leading delimiters
+    start = *saveptr;
+    while (*start && strchr(delim, *start))
+        start++;
+
+    if (!*start) {
+        *saveptr = NULL;
+        return NULL;
+    }
+
+    // Find end of token
+    end = start;
+    while (*end && !strchr(delim, *end))
+        end++;
+
+    if (*end) {
+        *end = 0;
+        *saveptr = end + 1;
+    } else {
+        *saveptr = NULL;
+    }
+
+    return start;
+}
+
+// ============================================================================
+// MEMORY FUNCTIONS
+// ============================================================================
+
+U0 *memcpy(U0 *dest, U0 *src, size_t n)
+{
+    MemCpy(dest, src, n);
+    return dest;
+}
+
+U0 *memmove(U0 *dest, U0 *src, size_t n)
+{
+    MemMove(dest, src, n);
+    return dest;
+}
+
+U0 *memset(U0 *s, I64 c, size_t n)
+{
+    MemSet(s, c, n);
+    return s;
+}
+
+I64 memcmp(U0 *s1, U0 *s2, size_t n)
+{
+    return MemCmp(s1, s2, n);
+}
+
+U0 *memchr(U0 *s, I64 c, size_t n)
+{
+    U8 *p = s;
+    while (n--) {
+        if (*p == (U8)c)
+            return p;
+        p++;
+    }
+    return NULL;
+}
+
+U0 *memrchr(U0 *s, I64 c, size_t n)
+{
+    U8 *p = s + n - 1;
+    while (n--) {
+        if (*p == (U8)c)
+            return p;
+        p--;
+    }
+    return NULL;
+}
+
+// ============================================================================
+// STRING DUPLICATION
+// ============================================================================
+
+U8 *strdup(U8 *s)
+{
+    return StrNew(s);
+}
+
+U8 *strndup(U8 *s, size_t n)
+{
+    size_t len = strnlen(s, n);
+    U8 *new_str = MAlloc(len + 1);
+    if (new_str) {
+        MemCpy(new_str, s, len);
+        new_str[len] = 0;
+    }
+    return new_str;
+}
+
+// ============================================================================
+// ERROR STRING
+// ============================================================================
+
+static U8 *_strerror_buf[64];
+
+U8 *strerror(I64 errnum)
+{
+    switch (errnum) {
+        case 0:       return "Success";
+        case EPERM:   return "Operation not permitted";
+        case ENOENT:  return "No such file or directory";
+        case ESRCH:   return "No such process";
+        case EINTR:   return "Interrupted system call";
+        case EIO:     return "I/O error";
+        case ENXIO:   return "No such device or address";
+        case E2BIG:   return "Argument list too long";
+        case ENOEXEC: return "Exec format error";
+        case EBADF:   return "Bad file number";
+        case ECHILD:  return "No child processes";
+        case EAGAIN:  return "Try again";
+        case ENOMEM:  return "Out of memory";
+        case EACCES:  return "Permission denied";
+        case EFAULT:  return "Bad address";
+        case EBUSY:   return "Device or resource busy";
+        case EEXIST:  return "File exists";
+        case EXDEV:   return "Cross-device link";
+        case ENODEV:  return "No such device";
+        case ENOTDIR: return "Not a directory";
+        case EISDIR:  return "Is a directory";
+        case EINVAL:  return "Invalid argument";
+        case ENFILE:  return "File table overflow";
+        case EMFILE:  return "Too many open files";
+        case ENOTTY:  return "Not a typewriter";
+        case EFBIG:   return "File too large";
+        case ENOSPC:  return "No space left on device";
+        case ESPIPE:  return "Illegal seek";
+        case EROFS:   return "Read-only file system";
+        case EMLINK:  return "Too many links";
+        case EPIPE:   return "Broken pipe";
+        case EDOM:    return "Math argument out of domain";
+        case ERANGE:  return "Math result not representable";
+        case EDEADLK: return "Resource deadlock would occur";
+        case ENAMETOOLONG: return "File name too long";
+        case ENOLCK:  return "No record locks available";
+        case ENOSYS:  return "Function not implemented";
+        case ENOTEMPTY: return "Directory not empty";
+        case ELOOP:   return "Too many symbolic links";
+        case ETIMEDOUT: return "Connection timed out";
+        case ECONNREFUSED: return "Connection refused";
+        default:
+            StrPrint(_strerror_buf, "Unknown error %d", errnum);
+            return _strerror_buf;
+    }
+}
+
+I64 strerror_r(I64 errnum, U8 *buf, size_t buflen)
+{
+    U8 *msg = strerror(errnum);
+    size_t len = strlen(msg);
+    if (len >= buflen) {
+        if (buflen > 0) {
+            MemCpy(buf, msg, buflen - 1);
+            buf[buflen - 1] = 0;
+        }
+        return ERANGE;
+    }
+    StrCpy(buf, msg);
+    return 0;
+}
+
+// ============================================================================
+// SIGNAL DESCRIPTION (for compatibility)
+// ============================================================================
+
+U8 *strsignal(I64 signum)
+{
+    switch (signum) {
+        case 1:  return "Hangup";
+        case 2:  return "Interrupt";
+        case 3:  return "Quit";
+        case 4:  return "Illegal instruction";
+        case 5:  return "Trace/breakpoint trap";
+        case 6:  return "Aborted";
+        case 7:  return "Bus error";
+        case 8:  return "Floating point exception";
+        case 9:  return "Killed";
+        case 10: return "User defined signal 1";
+        case 11: return "Segmentation fault";
+        case 12: return "User defined signal 2";
+        case 13: return "Broken pipe";
+        case 14: return "Alarm clock";
+        case 15: return "Terminated";
+        default: return "Unknown signal";
+    }
+}
+
+#endif // _STRING_H

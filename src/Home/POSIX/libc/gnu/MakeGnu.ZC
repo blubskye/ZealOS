@@ -1,0 +1,294 @@
+// MakeGnu.ZC - GNU Coreutils Loader for ZealOS
+// Load all available GNU utility implementations
+
+Cd(__DIR__);;
+
+// Load the libc first
+Cd("..");;
+#include "MakeLibc"
+Cd("gnu");;
+
+// ============================================================================
+// GNU COREUTILS - TRIVIAL
+// ============================================================================
+
+#include "true.ZC"
+#include "false.ZC"
+#include "yes.ZC"
+
+// ============================================================================
+// GNU COREUTILS - TEXT OUTPUT
+// ============================================================================
+
+#include "echo.ZC"
+
+// ============================================================================
+// GNU COREUTILS - FILE DISPLAY
+// ============================================================================
+
+#include "cat.ZC"
+#include "head.ZC"
+#include "tail.ZC"
+#include "wc.ZC"
+#include "tee.ZC"
+
+// ============================================================================
+// GNU COREUTILS - PATH MANIPULATION
+// ============================================================================
+
+#include "basename.ZC"
+#include "dirname.ZC"
+
+// ============================================================================
+// GNU COREUTILS - FILE OPERATIONS (Phase 9)
+// ============================================================================
+
+#include "touch.ZC"
+#include "mkdir.ZC"
+#include "rmdir.ZC"
+#include "cp.ZC"
+#include "mv.ZC"
+#include "rm.ZC"
+#include "ln.ZC"
+#include "ls.ZC"
+
+// ============================================================================
+// GNU COREUTILS - TEXT PROCESSING (Phase 10)
+// ============================================================================
+
+#include "sort.ZC"
+#include "uniq.ZC"
+#include "cut.ZC"
+#include "tr.ZC"
+#include "paste.ZC"
+#include "grep.ZC"
+
+// ============================================================================
+// GNU COREUTILS - SYSTEM INFO (Phase 11)
+// ============================================================================
+
+#include "date.ZC"
+#include "uname.ZC"
+#include "whoami.ZC"
+#include "id.ZC"
+#include "env.ZC"
+
+// ============================================================================
+// GNU COREUTILS - ADVANCED (Phase 12)
+// ============================================================================
+
+#include "expr.ZC"
+#include "test.ZC"
+#include "seq.ZC"
+#include "sleep.ZC"
+#include "printf_cmd.ZC"
+
+// ============================================================================
+// TOOLCHAIN INFRASTRUCTURE (Phase A)
+// ============================================================================
+
+#include "sh.ZC"
+#include "sed.ZC"
+#include "awk.ZC"
+#include "find.ZC"
+#include "xargs.ZC"
+#include "make.ZC"
+#include "install.ZC"
+
+// ============================================================================
+// COMPRESSION TOOLS (Phase A4)
+// ============================================================================
+
+#include "gzip.ZC"
+#include "tar.ZC"
+#include "bzip2.ZC"
+
+// ============================================================================
+// UTILITY REGISTRY
+// ============================================================================
+
+class CGnuUtil {
+    U8      *name;
+    I64     (*main_func)(I64, U8 **);
+    U8      *description;
+};
+
+CGnuUtil gnu_utils[] = {
+    // Trivial utilities
+    {"true",     &true_main,     "Exit with success status"},
+    {"false",    &false_main,    "Exit with failure status"},
+    {"yes",      &yes_main,      "Output string repeatedly"},
+
+    // Text output
+    {"echo",     &echo_main,     "Display line of text"},
+
+    // File display
+    {"cat",      &cat_main,      "Concatenate and display files"},
+    {"head",     &head_main,     "Output first part of files"},
+    {"tail",     &tail_main,     "Output last part of files"},
+    {"wc",       &wc_main,       "Print line, word, byte counts"},
+    {"tee",      &tee_main,      "Copy stdin to files and stdout"},
+
+    // Path manipulation
+    {"basename", &basename_main, "Strip directory from filename"},
+    {"dirname",  &dirname_main,  "Strip filename from path"},
+
+    // File operations
+    {"touch",    &touch_main,    "Change file timestamps"},
+    {"mkdir",    &mkdir_main,    "Create directories"},
+    {"rmdir",    &rmdir_main,    "Remove empty directories"},
+    {"cp",       &cp_main,       "Copy files and directories"},
+    {"mv",       &mv_main,       "Move/rename files"},
+    {"rm",       &rm_main,       "Remove files or directories"},
+    {"ln",       &ln_main,       "Create links between files"},
+    {"ls",       &ls_main,       "List directory contents"},
+
+    // Text processing
+    {"sort",     &sort_main,     "Sort lines of text files"},
+    {"uniq",     &uniq_main,     "Report or omit repeated lines"},
+    {"cut",      &cut_main,      "Remove sections from lines"},
+    {"tr",       &tr_main,       "Translate or delete characters"},
+    {"paste",    &paste_main,    "Merge lines of files"},
+    {"grep",     &grep_main,     "Print lines matching pattern"},
+
+    // System info
+    {"date",     &date_main,     "Display or set date and time"},
+    {"uname",    &uname_main,    "Print system information"},
+    {"whoami",   &whoami_main,   "Print effective user name"},
+    {"id",       &id_main,       "Print user and group IDs"},
+    {"env",      &env_main,      "Run command in modified environment"},
+
+    // Advanced utilities
+    {"expr",     &expr_main,     "Evaluate expressions"},
+    {"test",     &test_main,     "Check file types and compare values"},
+    {"[",        &test_main,     "Check file types (bracket form)"},
+    {"seq",      &seq_main,      "Print sequence of numbers"},
+    {"sleep",    &sleep_main,    "Delay for specified time"},
+    {"printf",   &printf_main,   "Format and print data"},
+
+    // Toolchain infrastructure
+    {"sh",       &sh_main,       "POSIX shell"},
+    {"sed",      &sed_main,      "Stream editor"},
+    {"awk",      &awk_main,      "Pattern scanning and processing"},
+    {"find",     &find_main,     "Search for files in directory hierarchy"},
+    {"xargs",    &xargs_main,    "Build and execute command lines from stdin"},
+    {"make",     &make_main,     "GNU make build utility"},
+    {"install",  &install_main,  "Copy files and set attributes"},
+
+    // Compression tools
+    {"gzip",     &gzip_main,     "Compress files with DEFLATE"},
+    {"gunzip",   &gunzip_main,   "Decompress gzip files"},
+    {"zcat",     &zcat_main,     "Decompress gzip to stdout"},
+    {"tar",      &tar_main,      "Tape archive utility"},
+    {"bzip2",    &bzip2_main,    "Block-sorting file compressor"},
+    {"bunzip2",  &bunzip2_main,  "Decompress bzip2 files"},
+    {"bzcat",    &bzcat_main,    "Decompress bzip2 to stdout"},
+
+    {NULL, NULL, NULL}
+};
+
+// Find a utility by name
+CGnuUtil *GnuUtilFind(U8 *name)
+{
+    for (I64 i = 0; gnu_utils[i].name; i++) {
+        if (strcmp(gnu_utils[i].name, name) == 0)
+            return &gnu_utils[i];
+    }
+    return NULL;
+}
+
+// Run a GNU utility by name
+I64 GnuRun(U8 *cmdline)
+{
+    // Parse command name from cmdline
+    U8 name[256];
+    U8 *p = cmdline;
+    I64 i = 0;
+
+    while (*p && *p != ' ' && *p != '\t' && i < 255)
+        name[i++] = *p++;
+    name[i] = 0;
+
+    CGnuUtil *util = GnuUtilFind(name);
+    if (!util) {
+        fprintf(stderr, "%s: command not found\n", name);
+        return 127;
+    }
+
+    return CRun(util->main_func, cmdline);
+}
+
+// List all available utilities
+U0 GnuList()
+{
+    printf("Available GNU coreutils:\n\n");
+
+    printf("Trivial:\n");
+    printf("  true, false, yes\n\n");
+
+    printf("Text Output:\n");
+    printf("  echo\n\n");
+
+    printf("File Display:\n");
+    printf("  cat, head, tail, wc, tee\n\n");
+
+    printf("Path Manipulation:\n");
+    printf("  basename, dirname\n\n");
+
+    printf("File Operations:\n");
+    printf("  touch, mkdir, rmdir, cp, mv, rm, ln, ls\n\n");
+
+    printf("Text Processing:\n");
+    printf("  sort, uniq, cut, tr, paste, grep\n\n");
+
+    printf("System Info:\n");
+    printf("  date, uname, whoami, id, env\n\n");
+
+    printf("Advanced:\n");
+    printf("  expr, test, [, seq, sleep, printf\n\n");
+
+    printf("Toolchain Infrastructure:\n");
+    printf("  sh, sed, awk, find, xargs, make, install\n\n");
+
+    printf("Compression Tools:\n");
+    printf("  gzip, gunzip, zcat, tar, bzip2, bunzip2, bzcat\n\n");
+
+    printf("Usage: GnuRun(\"command args...\");\n");
+    printf("Example: GnuRun(\"ls -la /Home\");\n");
+}
+
+// Count utilities
+I64 GnuCount()
+{
+    I64 count = 0;
+    for (I64 i = 0; gnu_utils[i].name; i++) count++;
+    return count;
+}
+
+// ============================================================================
+// INITIALIZATION MESSAGE
+// ============================================================================
+
+"\n";
+"========================================\n";
+"ZealOS GNU Coreutils\n";
+"========================================\n";
+"\n";
+"Loaded %d utilities:\n", GnuCount();
+"\n";
+"  Trivial:         true, false, yes\n";
+"  Text Output:     echo\n";
+"  File Display:    cat, head, tail, wc, tee\n";
+"  Path:            basename, dirname\n";
+"  File Ops:        touch, mkdir, rmdir, cp, mv, rm, ln, ls\n";
+"  Text Process:    sort, uniq, cut, tr, paste, grep\n";
+"  System Info:     date, uname, whoami, id, env\n";
+"  Advanced:        expr, test, [, seq, sleep, printf\n";
+"  Toolchain:       sh, sed, awk, find, xargs, make, install\n";
+"  Compression:     gzip, gunzip, zcat, tar, bzip2, bunzip2, bzcat\n";
+"\n";
+"Commands:\n";
+"  GnuList();                    - List all utilities\n";
+"  GnuRun(\"ls -la /Home\");       - Run a utility\n";
+"  CRun(&ls_main, \"ls -la\");     - Run directly\n";
+"\n";

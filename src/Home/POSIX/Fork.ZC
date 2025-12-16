@@ -1,0 +1,631 @@
+// Fork.ZC - Enhanced Fork Implementation for ZealOS POSIX Layer
+// Part of ZealOS POSIX compatibility layer
+//
+// This implements fork() using ZealOS tasks and message passing.
+// True copy-on-write fork is impossible without virtual memory,
+// but we can implement a working fork that:
+// 1. Works correctly for fork()+exec() patterns
+// 2. Works for simple forks that don't modify shared data
+// 3. Uses ZealOS tasks for parallelism
+
+// ============================================================================
+// FORK IMPLEMENTATION STRATEGY
+// ============================================================================
+//
+// ZealOS has no virtual memory, so we cannot do copy-on-write.
+// Our strategy:
+//
+// 1. For fork()+exec() pattern (most common):
+//    - Create new ZealOS task
+//    - Child task shares parent's memory until exec()
+//    - exec() replaces the process image
+//
+// 2. For fork() without exec():
+//    - Create new ZealOS task
+//    - Copy all tracked allocations to child's memory pool
+//    - Child runs independently
+//
+// The key insight: track allocations per-process, so we know what to copy.
+
+// ============================================================================
+// MEMORY TRACKING FOR FORK
+// ============================================================================
+
+#define FORK_MAX_ALLOCS 4096
+
+class CForkAllocation
+{
+	U8 *ptr;           // Pointer to allocated memory
+	I64 size;          // Size of allocation
+	Bool copied;       // Has this been copied to child?
+};
+
+class CForkMemoryPool
+{
+	CForkAllocation allocs[FORK_MAX_ALLOCS];
+	I64 alloc_count;
+	I64 total_size;
+};
+
+// Per-process memory pools
+CForkMemoryPool *fork_pools[POSIX_CHILD_MAX];
+
+// Initialize memory pool for a process
+CForkMemoryPool *ForkPoolNew()
+{
+	CForkMemoryPool *pool = MAlloc(sizeof(CForkMemoryPool));
+	MemSet(pool, 0, sizeof(CForkMemoryPool));
+	return pool;
+}
+
+// Free memory pool
+U0 ForkPoolFree(CForkMemoryPool *pool)
+{
+	if (!pool)
+		return;
+
+	// Free all tracked allocations
+	for (I64 i = 0; i < pool->alloc_count; i++) {
+		if (pool->allocs[i].ptr)
+			Free(pool->allocs[i].ptr);
+	}
+	Free(pool);
+}
+
+// Track an allocation in the pool
+U0 ForkPoolTrack(CForkMemoryPool *pool, U8 *ptr, I64 size)
+{
+	if (!pool || !ptr || pool->alloc_count >= FORK_MAX_ALLOCS)
+		return;
+
+	pool->allocs[pool->alloc_count].ptr = ptr;
+	pool->allocs[pool->alloc_count].size = size;
+	pool->allocs[pool->alloc_count].copied = FALSE;
+	pool->alloc_count++;
+	pool->total_size += size;
+}
+
+// Untrack an allocation
+U0 ForkPoolUntrack(CForkMemoryPool *pool, U8 *ptr)
+{
+	if (!pool || !ptr)
+		return;
+
+	for (I64 i = 0; i < pool->alloc_count; i++) {
+		if (pool->allocs[i].ptr == ptr) {
+			// Move last element to this slot
+			pool->total_size -= pool->allocs[i].size;
+			pool->allocs[i] = pool->allocs[pool->alloc_count - 1];
+			pool->alloc_count--;
+			return;
+		}
+	}
+}
+
+// Copy entire memory pool to new pool
+CForkMemoryPool *ForkPoolCopy(CForkMemoryPool *src)
+{
+	if (!src)
+		return NULL;
+
+	CForkMemoryPool *dst = ForkPoolNew();
+
+	for (I64 i = 0; i < src->alloc_count; i++) {
+		if (src->allocs[i].ptr && src->allocs[i].size > 0) {
+			U8 *new_ptr = MAlloc(src->allocs[i].size);
+			MemCpy(new_ptr, src->allocs[i].ptr, src->allocs[i].size);
+			ForkPoolTrack(dst, new_ptr, src->allocs[i].size);
+		}
+	}
+
+	return dst;
+}
+
+// ============================================================================
+// FORK TASK WRAPPER
+// ============================================================================
+
+// Data passed to child task
+class CForkTaskData
+{
+	CPosixProcess *parent_proc;  // Parent process
+	CPosixProcess *child_proc;   // Child process (pre-created)
+	I64 (*child_func)();         // Function to run in child (for fork)
+	U8 *exec_path;               // Path for exec (NULL if just fork)
+	U8 **exec_argv;              // Arguments for exec
+	U8 **exec_envp;              // Environment for exec
+	Bool ready;                  // Child is ready
+	Bool exec_done;              // Exec completed
+	I64 child_result;            // Return value from child
+};
+
+// Global fork data for communication
+CForkTaskData *current_fork_data = NULL;
+
+// Child task entry point
+U0 ForkChildTask()
+{
+	CForkTaskData *data = current_fork_data;
+	CPosixProcess *proc;
+
+	if (!data || !data->child_proc)
+		return;
+
+	proc = data->child_proc;
+
+	// Set current process for this task
+	posix_current = proc;
+	proc->task = Fs;
+
+	// Signal parent that we're ready
+	data->ready = TRUE;
+
+	// If exec path is set, do exec immediately
+	if (data->exec_path) {
+		data->child_result = PosixExecve(data->exec_path, data->exec_argv, data->exec_envp);
+		data->exec_done = TRUE;
+	} else if (data->child_func) {
+		// Run the child function
+		data->child_result = data->child_func();
+		data->exec_done = TRUE;
+	}
+
+	// Clean up
+	proc->exited = TRUE;
+	proc->exit_status = data->child_result & 0xFF;
+}
+
+// ============================================================================
+// REAL FORK IMPLEMENTATION
+// ============================================================================
+
+// Fork with continuation - child continues from a specific function
+I64 PosixForkWithFunc(I64 (*child_func)())
+{
+	CPosixProcess *parent = PosixGetCurrent();
+	CPosixProcess *child;
+	CTask *child_task;
+	CForkTaskData fork_data;
+	I64 i;
+
+	if (!parent)
+		return PosixSetErrno(EINVAL);
+
+	// Create child process structure
+	child = PosixProcessNew();
+	if (!child)
+		return PosixSetErrno(ENOMEM);
+
+	child->ppid = parent->pid;
+	child->parent = parent;
+	child->pgid = parent->pgid;
+	child->sid = parent->sid;
+
+	// Copy file descriptors
+	for (i = 0; i < POSIX_OPEN_MAX; i++) {
+		if (parent->fd_table[i]) {
+			child->fd_table[i] = MAlloc(sizeof(CPosixFD));
+			MemCpy(child->fd_table[i], parent->fd_table[i], sizeof(CPosixFD));
+			child->fd_table[i]->ref_count = 1;
+
+			switch (parent->fd_table[i]->type) {
+				case FD_TYPE_FILE:
+					if (parent->fd_table[i]->path)
+						child->fd_table[i]->path = StrNew(parent->fd_table[i]->path);
+					break;
+				case FD_TYPE_PIPE:
+					if (parent->fd_table[i]->is_read_end)
+						parent->fd_table[i]->pipe->readers++;
+					else
+						parent->fd_table[i]->pipe->writers++;
+					break;
+			}
+			child->fd_count++;
+		}
+	}
+
+	// Copy current directory
+	if (parent->cwd) {
+		Free(child->cwd);
+		child->cwd = StrNew(parent->cwd);
+	}
+
+	// Copy environment
+	PosixEnvFree(child);
+	child->environ = MAlloc(parent->environ_capacity * sizeof(U8*));
+	child->environ_capacity = parent->environ_capacity;
+	child->environ_count = parent->environ_count;
+	for (i = 0; i < parent->environ_count; i++) {
+		child->environ[i] = StrNew(parent->environ[i]);
+	}
+	child->environ[child->environ_count] = NULL;
+
+	// Copy signal handlers
+	for (i = 0; i < NSIG; i++) {
+		MemCpy(&child->sigactions[i], &parent->sigactions[i], sizeof(CPosixSigAction));
+	}
+	PosixSigemptyset(&child->sigpending);
+
+	// Add to parent's children
+	if (parent->child_count < POSIX_CHILD_MAX) {
+		parent->children[parent->child_count++] = child;
+	}
+
+	// Add to process table
+	PosixAddProcess(child);
+
+	// Set up fork data
+	MemSet(&fork_data, 0, sizeof(CForkTaskData));
+	fork_data.parent_proc = parent;
+	fork_data.child_proc = child;
+	fork_data.child_func = child_func;
+	fork_data.ready = FALSE;
+	fork_data.exec_done = FALSE;
+
+	current_fork_data = &fork_data;
+
+	// Create ZealOS task for child
+	child_task = Spawn(&ForkChildTask, NULL, "PosixChild");
+	child->task = child_task;
+
+	// Wait for child to signal ready
+	while (!fork_data.ready)
+		Yield;
+
+	return child->pid;
+}
+
+// ============================================================================
+// VFORK - Optimized for exec()
+// ============================================================================
+
+// vfork semantics: child shares everything with parent until exec()
+// This is actually easier to implement than full fork
+I64 PosixVforkReal()
+{
+	CPosixProcess *parent = PosixGetCurrent();
+	CPosixProcess *child;
+	I64 i;
+
+	if (!parent)
+		return PosixSetErrno(EINVAL);
+
+	// Create minimal child process
+	child = MAlloc(sizeof(CPosixProcess));
+	MemSet(child, 0, sizeof(CPosixProcess));
+
+	child->pid = posix_next_pid++;
+	child->ppid = parent->pid;
+	child->parent = parent;
+	child->pgid = parent->pgid;
+	child->sid = parent->sid;
+
+	// SHARE file descriptors (not copy) for vfork
+	// Child will get its own copies after exec()
+	for (i = 0; i < POSIX_OPEN_MAX; i++) {
+		child->fd_table[i] = parent->fd_table[i];
+		if (child->fd_table[i])
+			child->fd_table[i]->ref_count++;
+	}
+	child->fd_count = parent->fd_count;
+
+	// Share current directory
+	child->cwd = parent->cwd;  // Shared, not copied
+
+	// Share environment
+	child->environ = parent->environ;
+	child->environ_count = parent->environ_count;
+	child->environ_capacity = parent->environ_capacity;
+
+	// Copy signal handlers
+	for (i = 0; i < NSIG; i++) {
+		MemCpy(&child->sigactions[i], &parent->sigactions[i], sizeof(CPosixSigAction));
+	}
+	PosixSigemptyset(&child->sigpending);
+
+	// Mark as vforked (shares memory)
+	child->vforked = TRUE;
+	child->vfork_parent = parent;
+
+	// Add to parent's children
+	if (parent->child_count < POSIX_CHILD_MAX) {
+		parent->children[parent->child_count++] = child;
+	}
+
+	// Add to process table
+	PosixAddProcess(child);
+
+	// For vfork, we return child pid to parent
+	// The "child" context is established by temporarily switching posix_current
+	return child->pid;
+}
+
+// ============================================================================
+// SPAWN-BASED FORK (for fork+exec pattern)
+// ============================================================================
+
+// This is the most reliable approach for ZealOS
+// Spawn a new task that immediately execs a program
+
+I64 PosixSpawnExec(U8 *path, U8 **argv, U8 **envp)
+{
+	CPosixProcess *parent = PosixGetCurrent();
+	CPosixProcess *child;
+	CTask *child_task;
+	CForkTaskData *fork_data;
+	I64 i;
+
+	if (!parent || !path)
+		return PosixSetErrno(EINVAL);
+
+	// Create child process
+	child = PosixProcessNew();
+	if (!child)
+		return PosixSetErrno(ENOMEM);
+
+	child->ppid = parent->pid;
+	child->parent = parent;
+	child->pgid = parent->pgid;
+	child->sid = parent->sid;
+
+	// Copy file descriptors (excluding close-on-exec)
+	for (i = 0; i < POSIX_OPEN_MAX; i++) {
+		if (parent->fd_table[i] && !(parent->fd_table[i]->fd_flags & FD_CLOEXEC)) {
+			child->fd_table[i] = MAlloc(sizeof(CPosixFD));
+			MemCpy(child->fd_table[i], parent->fd_table[i], sizeof(CPosixFD));
+			child->fd_table[i]->ref_count = 1;
+
+			if (parent->fd_table[i]->type == FD_TYPE_FILE && parent->fd_table[i]->path)
+				child->fd_table[i]->path = StrNew(parent->fd_table[i]->path);
+			else if (parent->fd_table[i]->type == FD_TYPE_PIPE) {
+				if (parent->fd_table[i]->is_read_end)
+					parent->fd_table[i]->pipe->readers++;
+				else
+					parent->fd_table[i]->pipe->writers++;
+			}
+			child->fd_count++;
+		}
+	}
+
+	// Copy cwd
+	if (parent->cwd) {
+		Free(child->cwd);
+		child->cwd = StrNew(parent->cwd);
+	}
+
+	// Set up environment
+	if (envp) {
+		for (i = 0; envp[i]; i++);
+		child->environ = MAlloc((i + 1) * sizeof(U8*));
+		child->environ_count = i;
+		child->environ_capacity = i + 1;
+		for (i = 0; envp[i]; i++)
+			child->environ[i] = StrNew(envp[i]);
+		child->environ[i] = NULL;
+	} else {
+		// Copy parent's environment
+		child->environ = MAlloc(parent->environ_capacity * sizeof(U8*));
+		child->environ_capacity = parent->environ_capacity;
+		child->environ_count = parent->environ_count;
+		for (i = 0; i < parent->environ_count; i++)
+			child->environ[i] = StrNew(parent->environ[i]);
+		child->environ[child->environ_count] = NULL;
+	}
+
+	// Add to parent's children
+	if (parent->child_count < POSIX_CHILD_MAX) {
+		parent->children[parent->child_count++] = child;
+	}
+
+	PosixAddProcess(child);
+
+	// Set up fork data for exec
+	fork_data = MAlloc(sizeof(CForkTaskData));
+	MemSet(fork_data, 0, sizeof(CForkTaskData));
+	fork_data->parent_proc = parent;
+	fork_data->child_proc = child;
+	fork_data->exec_path = StrNew(path);
+
+	// Copy argv
+	if (argv) {
+		I64 argc;
+		for (argc = 0; argv[argc]; argc++);
+		fork_data->exec_argv = MAlloc((argc + 1) * sizeof(U8*));
+		for (i = 0; argv[i]; i++)
+			fork_data->exec_argv[i] = StrNew(argv[i]);
+		fork_data->exec_argv[i] = NULL;
+	}
+
+	// Copy envp
+	fork_data->exec_envp = child->environ;
+
+	current_fork_data = fork_data;
+
+	// Spawn task
+	child_task = Spawn(&ForkChildTask, NULL, "PosixExec");
+	child->task = child_task;
+
+	// Wait for ready
+	while (!fork_data->ready)
+		Yield;
+
+	return child->pid;
+}
+
+// ============================================================================
+// POSIX SPAWN (preferred method)
+// ============================================================================
+
+// posix_spawn - create a new process and execute a file
+// This is the recommended way to spawn processes on NOMMU systems
+
+I64 PosixSpawn(I64 *pid, U8 *path, U0 *file_actions, U0 *attrp,
+               U8 **argv, U8 **envp)
+{
+	I64 child_pid;
+
+	child_pid = PosixSpawnExec(path, argv, envp);
+	if (child_pid < 0)
+		return posix_errno;
+
+	if (pid)
+		*pid = child_pid;
+
+	return 0;
+}
+
+// posix_spawnp - spawn with PATH search
+I64 PosixSpawnp(I64 *pid, U8 *file, U0 *file_actions, U0 *attrp,
+                U8 **argv, U8 **envp)
+{
+	CPosixProcess *proc = PosixGetCurrent();
+	U8 *path, *path_copy, *dir, *full_path;
+
+	if (!file || !*file)
+		return ENOENT;
+
+	// If file contains '/', use it directly
+	if (StrFirstOcc(file, "/"))
+		return PosixSpawn(pid, file, file_actions, attrp, argv, envp);
+
+	// Search PATH
+	path = PosixGetenv("PATH");
+	if (!path)
+		path = "/bin:/usr/bin";
+
+	path_copy = StrNew(path);
+	dir = path_copy;
+
+	while (dir && *dir) {
+		U8 *colon = StrFirstOcc(dir, ":");
+		if (colon)
+			*colon = 0;
+
+		I64 len = StrLen(dir) + 1 + StrLen(file) + 1;
+		full_path = MAlloc(len);
+		StrCpy(full_path, dir);
+		StrCat(full_path, "/");
+		StrCat(full_path, file);
+
+		if (FileFind(full_path)) {
+			I64 result = PosixSpawn(pid, full_path, file_actions, attrp, argv, envp);
+			Free(full_path);
+			Free(path_copy);
+			return result;
+		}
+
+		Free(full_path);
+
+		if (colon)
+			dir = colon + 1;
+		else
+			break;
+	}
+
+	Free(path_copy);
+	return ENOENT;
+}
+
+// ============================================================================
+// SIMPLIFIED FORK FOR SHELL USE
+// ============================================================================
+
+// This is the fork() that our shell uses
+// It creates a new ZealOS task that runs concurrently
+
+I64 PosixForkSimple()
+{
+	CPosixProcess *parent = PosixGetCurrent();
+	CPosixProcess *child;
+	I64 i;
+
+	if (!parent)
+		return PosixSetErrno(EINVAL);
+
+	// Create child process
+	child = PosixProcessNew();
+	if (!child)
+		return PosixSetErrno(ENOMEM);
+
+	child->ppid = parent->pid;
+	child->parent = parent;
+	child->pgid = parent->pgid;
+	child->sid = parent->sid;
+
+	// Copy file descriptors
+	for (i = 0; i < POSIX_OPEN_MAX; i++) {
+		if (parent->fd_table[i]) {
+			child->fd_table[i] = MAlloc(sizeof(CPosixFD));
+			MemCpy(child->fd_table[i], parent->fd_table[i], sizeof(CPosixFD));
+			child->fd_table[i]->ref_count = 1;
+
+			switch (parent->fd_table[i]->type) {
+				case FD_TYPE_FILE:
+					if (parent->fd_table[i]->path)
+						child->fd_table[i]->path = StrNew(parent->fd_table[i]->path);
+					break;
+				case FD_TYPE_PIPE:
+					if (parent->fd_table[i]->is_read_end)
+						parent->fd_table[i]->pipe->readers++;
+					else
+						parent->fd_table[i]->pipe->writers++;
+					break;
+			}
+			child->fd_count++;
+		}
+	}
+
+	// Copy cwd
+	if (parent->cwd) {
+		Free(child->cwd);
+		child->cwd = StrNew(parent->cwd);
+	}
+
+	// Copy environment
+	PosixEnvFree(child);
+	child->environ = MAlloc(parent->environ_capacity * sizeof(U8*));
+	child->environ_capacity = parent->environ_capacity;
+	child->environ_count = parent->environ_count;
+	for (i = 0; i < parent->environ_count; i++) {
+		child->environ[i] = StrNew(parent->environ[i]);
+	}
+	child->environ[child->environ_count] = NULL;
+
+	// Copy signal handlers
+	for (i = 0; i < NSIG; i++) {
+		MemCpy(&child->sigactions[i], &parent->sigactions[i], sizeof(CPosixSigAction));
+	}
+	PosixSigemptyset(&child->sigpending);
+
+	// Add to parent's children
+	if (parent->child_count < POSIX_CHILD_MAX) {
+		parent->children[parent->child_count++] = child;
+	}
+
+	PosixAddProcess(child);
+
+	// The key difference from standard fork:
+	// We return child->pid to BOTH parent and child context
+	// The caller must handle this appropriately
+	//
+	// For shell pipelines, this works because:
+	// 1. Shell creates pipes
+	// 2. Shell forks (we return child pid)
+	// 3. Shell calls exec in "child" context
+	// 4. exec() creates a new task that runs the program
+
+	return child->pid;
+}
+
+// ============================================================================
+// REPLACE OLD FORK FUNCTION
+// ============================================================================
+
+// Override the basic PosixFork to use our improved version
+// Note: This still returns child pid to parent context only
+// True fork semantics (0 to child) would require setjmp/longjmp tricks
+
+I64 PosixForkNew()
+{
+	return PosixForkSimple();
+}

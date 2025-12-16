@@ -1,0 +1,754 @@
+// FileDesc.ZC - POSIX File Descriptor Implementation for ZealOS
+// Part of ZealOS POSIX compatibility layer
+
+// ============================================================================
+// FILE DESCRIPTOR ALLOCATION
+// ============================================================================
+
+// Allocate the lowest available file descriptor
+I64 PosixFDAlloc(CPosixProcess *proc)
+{
+	return PosixFDAllocAbove(proc, 0);
+}
+
+// Allocate lowest available fd >= min
+I64 PosixFDAllocAbove(CPosixProcess *proc, I64 min)
+{
+	I64 i;
+
+	if (!proc)
+		return PosixSetErrno(EINVAL);
+
+	if (min < 0)
+		min = 0;
+
+	for (i = min; i < POSIX_OPEN_MAX; i++) {
+		if (!proc->fd_table[i]) {
+			proc->fd_table[i] = MAlloc(sizeof(CPosixFD));
+			MemSet(proc->fd_table[i], 0, sizeof(CPosixFD));
+			proc->fd_table[i]->ref_count = 1;
+			proc->fd_count++;
+			return i;
+		}
+	}
+
+	return PosixSetErrno(EMFILE);
+}
+
+// Free a file descriptor
+U0 PosixFDFree(CPosixProcess *proc, I64 fd)
+{
+	CPosixFD *fdp;
+
+	if (!proc || fd < 0 || fd >= POSIX_OPEN_MAX)
+		return;
+
+	fdp = proc->fd_table[fd];
+	if (!fdp)
+		return;
+
+	// Decrement reference count
+	fdp->ref_count--;
+
+	if (fdp->ref_count <= 0) {
+		// Actually free the descriptor
+		switch (fdp->type) {
+			case FD_TYPE_FILE:
+				if (fdp->path)
+					Free(fdp->path);
+				if (fdp->data)
+					Free(fdp->data);
+				break;
+
+			case FD_TYPE_PIPE:
+				if (fdp->pipe) {
+					if (fdp->is_read_end) {
+						fdp->pipe->readers--;
+						if (fdp->pipe->readers <= 0)
+							fdp->pipe->read_closed = TRUE;
+					} else {
+						fdp->pipe->writers--;
+						if (fdp->pipe->writers <= 0)
+							fdp->pipe->write_closed = TRUE;
+					}
+					// Free pipe if both ends closed
+					if (fdp->pipe->read_closed && fdp->pipe->write_closed) {
+						if (fdp->pipe->buffer)
+							Free(fdp->pipe->buffer);
+						Free(fdp->pipe);
+					}
+				}
+				break;
+
+			case FD_TYPE_DIR:
+				if (fdp->dir_path)
+					Free(fdp->dir_path);
+				if (fdp->entries)
+					Free(fdp->entries);
+				break;
+		}
+
+		Free(fdp);
+	}
+
+	proc->fd_table[fd] = NULL;
+	proc->fd_count--;
+}
+
+// Get file descriptor structure
+CPosixFD *PosixFDGet(CPosixProcess *proc, I64 fd)
+{
+	if (!proc || fd < 0 || fd >= POSIX_OPEN_MAX) {
+		posix_errno = EBADF;
+		return NULL;
+	}
+
+	if (!proc->fd_table[fd]) {
+		posix_errno = EBADF;
+		return NULL;
+	}
+
+	return proc->fd_table[fd];
+}
+
+// Duplicate file descriptor
+I64 PosixFDDup(CPosixProcess *proc, I64 oldfd)
+{
+	return PosixFDDup2Internal(proc, oldfd, -1, 0);
+}
+
+// Duplicate file descriptor to specific fd
+I64 PosixFDDup2(CPosixProcess *proc, I64 oldfd, I64 newfd)
+{
+	return PosixFDDup2Internal(proc, oldfd, newfd, 0);
+}
+
+// Internal dup implementation
+I64 PosixFDDup2Internal(CPosixProcess *proc, I64 oldfd, I64 newfd, I64 flags)
+{
+	CPosixFD *old_fdp;
+	I64 result_fd;
+
+	if (!proc)
+		return PosixSetErrno(EINVAL);
+
+	// Validate old fd
+	old_fdp = PosixFDGet(proc, oldfd);
+	if (!old_fdp)
+		return -1;  // errno already set
+
+	if (newfd == -1) {
+		// dup() - allocate lowest available
+		result_fd = PosixFDAlloc(proc);
+		if (result_fd < 0)
+			return -1;
+	} else {
+		// dup2() - use specific fd
+		if (newfd < 0 || newfd >= POSIX_OPEN_MAX)
+			return PosixSetErrno(EBADF);
+
+		if (oldfd == newfd)
+			return newfd;  // Same fd, nothing to do
+
+		// Close newfd if open
+		if (proc->fd_table[newfd]) {
+			PosixFDFree(proc, newfd);
+		}
+
+		// Allocate new slot
+		proc->fd_table[newfd] = MAlloc(sizeof(CPosixFD));
+		proc->fd_count++;
+		result_fd = newfd;
+	}
+
+	// Copy the file descriptor
+	MemCpy(proc->fd_table[result_fd], old_fdp, sizeof(CPosixFD));
+
+	// Increment reference count on shared resources
+	old_fdp->ref_count++;
+	proc->fd_table[result_fd]->ref_count = 1;
+
+	// Handle type-specific sharing
+	switch (old_fdp->type) {
+		case FD_TYPE_FILE:
+			// Share the same data but copy the path
+			if (old_fdp->path)
+				proc->fd_table[result_fd]->path = StrNew(old_fdp->path);
+			// Data pointer is shared
+			break;
+
+		case FD_TYPE_PIPE:
+			// Increment pipe endpoint count
+			if (old_fdp->is_read_end)
+				old_fdp->pipe->readers++;
+			else
+				old_fdp->pipe->writers++;
+			break;
+
+		case FD_TYPE_DIR:
+			if (old_fdp->dir_path)
+				proc->fd_table[result_fd]->dir_path = StrNew(old_fdp->dir_path);
+			// Entries are copied
+			break;
+	}
+
+	// Apply flags
+	if (flags & O_CLOEXEC)
+		proc->fd_table[result_fd]->fd_flags |= FD_CLOEXEC;
+
+	return result_fd;
+}
+
+// ============================================================================
+// STANDARD STREAMS INITIALIZATION
+// ============================================================================
+
+// Initialize stdin, stdout, stderr for a process
+U0 PosixFDInitStdio(CPosixProcess *proc)
+{
+	CPosixFD *fdp;
+
+	// stdin (fd 0)
+	proc->fd_table[STDIN_FILENO] = MAlloc(sizeof(CPosixFD));
+	fdp = proc->fd_table[STDIN_FILENO];
+	MemSet(fdp, 0, sizeof(CPosixFD));
+	fdp->type = FD_TYPE_TTY;
+	fdp->flags = O_RDONLY;
+	fdp->ref_count = 1;
+
+	// stdout (fd 1)
+	proc->fd_table[STDOUT_FILENO] = MAlloc(sizeof(CPosixFD));
+	fdp = proc->fd_table[STDOUT_FILENO];
+	MemSet(fdp, 0, sizeof(CPosixFD));
+	fdp->type = FD_TYPE_TTY;
+	fdp->flags = O_WRONLY;
+	fdp->ref_count = 1;
+
+	// stderr (fd 2)
+	proc->fd_table[STDERR_FILENO] = MAlloc(sizeof(CPosixFD));
+	fdp = proc->fd_table[STDERR_FILENO];
+	MemSet(fdp, 0, sizeof(CPosixFD));
+	fdp->type = FD_TYPE_TTY;
+	fdp->flags = O_WRONLY;
+	fdp->ref_count = 1;
+
+	proc->fd_count = 3;
+}
+
+// ============================================================================
+// POSIX FILE OPERATIONS
+// ============================================================================
+
+// Open a file
+I64 PosixOpen(U8 *path, I64 flags, I64 mode)
+{
+	CPosixProcess *proc = PosixGetCurrent();
+	CPosixFD *fdp;
+	I64 fd;
+	U8 *full_path;
+	U8 *data = NULL;
+	I64 size = 0;
+	Bool exists;
+	Bool is_dir;
+
+	if (!proc)
+		return PosixSetErrno(EINVAL);
+
+	if (!path || !*path)
+		return PosixSetErrno(ENOENT);
+
+	// Resolve path
+	full_path = PosixResolvePath(proc, path);
+	if (!full_path)
+		return PosixSetErrno(ENOMEM);
+
+	// Check if file exists
+	exists = FileFind(full_path) != NULL;
+	is_dir = IsDir(full_path);
+
+	// Handle O_DIRECTORY
+	if ((flags & O_DIRECTORY) && !is_dir) {
+		Free(full_path);
+		return PosixSetErrno(ENOTDIR);
+	}
+
+	// Handle creation flags
+	if (!exists) {
+		if (!(flags & O_CREAT)) {
+			Free(full_path);
+			return PosixSetErrno(ENOENT);
+		}
+		// Create empty file
+		if (!FileWrite(full_path, "", 0)) {
+			Free(full_path);
+			return PosixSetErrno(EIO);
+		}
+	} else {
+		if ((flags & O_CREAT) && (flags & O_EXCL)) {
+			Free(full_path);
+			return PosixSetErrno(EEXIST);
+		}
+	}
+
+	// Handle directories
+	if (is_dir) {
+		return PosixOpenDir(path);
+	}
+
+	// Read file if needed
+	if ((flags & O_ACCMODE) != O_WRONLY) {
+		data = FileRead(full_path, &size);
+		if (!data && exists) {
+			Free(full_path);
+			return PosixSetErrno(EIO);
+		}
+	}
+
+	// Handle O_TRUNC
+	if ((flags & O_TRUNC) && exists) {
+		if (data)
+			Free(data);
+		data = NULL;
+		size = 0;
+		// Truncate the file
+		FileWrite(full_path, "", 0);
+	}
+
+	// Allocate file descriptor
+	fd = PosixFDAlloc(proc);
+	if (fd < 0) {
+		Free(full_path);
+		if (data)
+			Free(data);
+		return -1;
+	}
+
+	fdp = proc->fd_table[fd];
+	fdp->type = FD_TYPE_FILE;
+	fdp->flags = flags;
+	fdp->path = full_path;
+	fdp->data = data;
+	fdp->data_size = size;
+	fdp->offset = (flags & O_APPEND) ? size : 0;
+
+	return fd;
+}
+
+// Close a file descriptor
+I64 PosixClose(I64 fd)
+{
+	CPosixProcess *proc = PosixGetCurrent();
+	CPosixFD *fdp;
+
+	if (!proc)
+		return PosixSetErrno(EINVAL);
+
+	fdp = PosixFDGet(proc, fd);
+	if (!fdp)
+		return -1;
+
+	// Flush file if needed
+	if (fdp->type == FD_TYPE_FILE && (fdp->flags & (O_WRONLY | O_RDWR))) {
+		if (fdp->data && fdp->path) {
+			FileWrite(fdp->path, fdp->data, fdp->data_size);
+		}
+	}
+
+	PosixFDFree(proc, fd);
+	return 0;
+}
+
+// Read from file descriptor
+I64 PosixRead(I64 fd, U8 *buf, I64 count)
+{
+	CPosixProcess *proc = PosixGetCurrent();
+	CPosixFD *fdp;
+	I64 available, to_read;
+
+	if (!proc)
+		return PosixSetErrno(EINVAL);
+
+	if (!buf)
+		return PosixSetErrno(EFAULT);
+
+	if (count < 0)
+		return PosixSetErrno(EINVAL);
+
+	if (count == 0)
+		return 0;
+
+	fdp = PosixFDGet(proc, fd);
+	if (!fdp)
+		return -1;
+
+	// Check if readable
+	if ((fdp->flags & O_ACCMODE) == O_WRONLY)
+		return PosixSetErrno(EBADF);
+
+	switch (fdp->type) {
+		case FD_TYPE_FILE:
+			if (!fdp->data)
+				return 0;  // EOF
+
+			available = fdp->data_size - fdp->offset;
+			if (available <= 0)
+				return 0;  // EOF
+
+			to_read = (count < available) ? count : available;
+			MemCpy(buf, &fdp->data[fdp->offset], to_read);
+			fdp->offset += to_read;
+			return to_read;
+
+		case FD_TYPE_PIPE:
+			return PosixPipeRead(fdp, buf, count);
+
+		case FD_TYPE_TTY:
+			// Read from console
+			return PosixTTYRead(buf, count);
+
+		default:
+			return PosixSetErrno(EINVAL);
+	}
+}
+
+// Write to file descriptor
+I64 PosixWrite(I64 fd, U8 *buf, I64 count)
+{
+	CPosixProcess *proc = PosixGetCurrent();
+	CPosixFD *fdp;
+	I64 new_size;
+	U8 *new_data;
+
+	if (!proc)
+		return PosixSetErrno(EINVAL);
+
+	if (!buf && count > 0)
+		return PosixSetErrno(EFAULT);
+
+	if (count < 0)
+		return PosixSetErrno(EINVAL);
+
+	if (count == 0)
+		return 0;
+
+	fdp = PosixFDGet(proc, fd);
+	if (!fdp)
+		return -1;
+
+	// Check if writable
+	if ((fdp->flags & O_ACCMODE) == O_RDONLY)
+		return PosixSetErrno(EBADF);
+
+	switch (fdp->type) {
+		case FD_TYPE_FILE:
+			// Handle append mode
+			if (fdp->flags & O_APPEND)
+				fdp->offset = fdp->data_size;
+
+			// Expand buffer if needed
+			new_size = fdp->offset + count;
+			if (new_size > fdp->data_size) {
+				new_data = MAlloc(new_size);
+				if (!new_data)
+					return PosixSetErrno(ENOMEM);
+
+				if (fdp->data) {
+					MemCpy(new_data, fdp->data, fdp->data_size);
+					Free(fdp->data);
+				}
+				fdp->data = new_data;
+				fdp->data_size = new_size;
+			}
+
+			MemCpy(&fdp->data[fdp->offset], buf, count);
+			fdp->offset += count;
+			return count;
+
+		case FD_TYPE_PIPE:
+			return PosixPipeWrite(fdp, buf, count);
+
+		case FD_TYPE_TTY:
+			// Write to console
+			return PosixTTYWrite(buf, count);
+
+		default:
+			return PosixSetErrno(EINVAL);
+	}
+}
+
+// Seek in file
+I64 PosixLseek(I64 fd, I64 offset, I64 whence)
+{
+	CPosixProcess *proc = PosixGetCurrent();
+	CPosixFD *fdp;
+	I64 new_offset;
+
+	if (!proc)
+		return PosixSetErrno(EINVAL);
+
+	fdp = PosixFDGet(proc, fd);
+	if (!fdp)
+		return -1;
+
+	if (fdp->type == FD_TYPE_PIPE)
+		return PosixSetErrno(ESPIPE);
+
+	if (fdp->type != FD_TYPE_FILE)
+		return PosixSetErrno(EINVAL);
+
+	switch (whence) {
+		case SEEK_SET:
+			new_offset = offset;
+			break;
+		case SEEK_CUR:
+			new_offset = fdp->offset + offset;
+			break;
+		case SEEK_END:
+			new_offset = fdp->data_size + offset;
+			break;
+		default:
+			return PosixSetErrno(EINVAL);
+	}
+
+	if (new_offset < 0)
+		return PosixSetErrno(EINVAL);
+
+	fdp->offset = new_offset;
+	return new_offset;
+}
+
+// ============================================================================
+// TTY READ/WRITE
+// ============================================================================
+
+// Read from terminal
+I64 PosixTTYRead(U8 *buf, I64 count)
+{
+	I64 i = 0;
+	U8 ch;
+
+	// Simple line-buffered read
+	while (i < count - 1) {
+		ch = GetChar;
+		if (ch == '\n' || ch == '\r') {
+			buf[i++] = '\n';
+			break;
+		}
+		if (ch == 0x03) {  // Ctrl+C
+			// TODO: Send SIGINT
+			return PosixSetErrno(EINTR);
+		}
+		buf[i++] = ch;
+	}
+
+	buf[i] = 0;
+	return i;
+}
+
+// Write to terminal
+I64 PosixTTYWrite(U8 *buf, I64 count)
+{
+	I64 i;
+
+	for (i = 0; i < count; i++) {
+		PutChars(buf[i]);
+	}
+
+	return count;
+}
+
+// ============================================================================
+// PATH RESOLUTION
+// ============================================================================
+
+// Resolve a path relative to current directory
+U8 *PosixResolvePath(CPosixProcess *proc, U8 *path)
+{
+	U8 *result;
+	I64 len;
+
+	if (!path || !*path)
+		return NULL;
+
+	// Absolute path
+	if (path[0] == '/' || path[0] == '~' || (path[1] == ':')) {
+		return StrNew(path);
+	}
+
+	// Relative path - prepend cwd
+	if (!proc->cwd)
+		return StrNew(path);
+
+	len = StrLen(proc->cwd) + 1 + StrLen(path) + 1;
+	result = MAlloc(len);
+
+	StrCpy(result, proc->cwd);
+	StrCat(result, "/");
+	StrCat(result, path);
+
+	return result;
+}
+
+// ============================================================================
+// FCNTL
+// ============================================================================
+
+I64 PosixFcntl(I64 fd, I64 cmd, I64 arg)
+{
+	CPosixProcess *proc = PosixGetCurrent();
+	CPosixFD *fdp;
+
+	if (!proc)
+		return PosixSetErrno(EINVAL);
+
+	fdp = PosixFDGet(proc, fd);
+	if (!fdp)
+		return -1;
+
+	switch (cmd) {
+		case F_DUPFD:
+			return PosixFDAllocAbove(proc, arg);
+
+		case F_DUPFD_CLOEXEC:
+			{
+				I64 new_fd = PosixFDDup2Internal(proc, fd, -1, O_CLOEXEC);
+				return new_fd;
+			}
+
+		case F_GETFD:
+			return fdp->fd_flags;
+
+		case F_SETFD:
+			fdp->fd_flags = arg;
+			return 0;
+
+		case F_GETFL:
+			return fdp->flags;
+
+		case F_SETFL:
+			// Can only change certain flags
+			fdp->flags = (fdp->flags & O_ACCMODE) | (arg & ~O_ACCMODE);
+			return 0;
+
+		default:
+			return PosixSetErrno(EINVAL);
+	}
+}
+
+// ============================================================================
+// STAT OPERATIONS
+// ============================================================================
+
+// Fill stat structure from file
+I64 PosixStatInternal(U8 *path, CPosixStat *buf, Bool follow_links)
+{
+	CDirEntry de;
+
+	if (!path || !buf)
+		return PosixSetErrno(EINVAL);
+
+	MemSet(buf, 0, sizeof(CPosixStat));
+
+	// Check if file exists
+	if (!FileFind(path, &de)) {
+		return PosixSetErrno(ENOENT);
+	}
+
+	// Fill in stat structure
+	buf->st_dev = 0;
+	buf->st_ino = 0;  // ZealOS doesn't track inodes
+	buf->st_nlink = 1;
+	buf->st_uid = 0;
+	buf->st_gid = 0;
+	buf->st_rdev = 0;
+	buf->st_size = de.size;
+	buf->st_blksize = 4096;
+	buf->st_blocks = (de.size + 511) / 512;
+
+	// Determine file type
+	if (IsDir(path)) {
+		buf->st_mode = S_IFDIR | 0755;
+	} else {
+		buf->st_mode = S_IFREG | 0644;
+	}
+
+	// Convert ZealOS datetime to Unix timestamp
+	buf->st_mtime = de.datetime;  // Approximate conversion needed
+	buf->st_atime = buf->st_mtime;
+	buf->st_ctime = buf->st_mtime;
+
+	return 0;
+}
+
+I64 PosixStat(U8 *path, CPosixStat *buf)
+{
+	CPosixProcess *proc = PosixGetCurrent();
+	U8 *full_path;
+	I64 result;
+
+	if (!proc)
+		return PosixSetErrno(EINVAL);
+
+	full_path = PosixResolvePath(proc, path);
+	if (!full_path)
+		return PosixSetErrno(ENOMEM);
+
+	result = PosixStatInternal(full_path, buf, TRUE);
+	Free(full_path);
+	return result;
+}
+
+I64 PosixLstat(U8 *path, CPosixStat *buf)
+{
+	CPosixProcess *proc = PosixGetCurrent();
+	U8 *full_path;
+	I64 result;
+
+	if (!proc)
+		return PosixSetErrno(EINVAL);
+
+	full_path = PosixResolvePath(proc, path);
+	if (!full_path)
+		return PosixSetErrno(ENOMEM);
+
+	result = PosixStatInternal(full_path, buf, FALSE);
+	Free(full_path);
+	return result;
+}
+
+I64 PosixFstat(I64 fd, CPosixStat *buf)
+{
+	CPosixProcess *proc = PosixGetCurrent();
+	CPosixFD *fdp;
+
+	if (!proc)
+		return PosixSetErrno(EINVAL);
+
+	fdp = PosixFDGet(proc, fd);
+	if (!fdp)
+		return -1;
+
+	if (fdp->type == FD_TYPE_FILE && fdp->path) {
+		return PosixStatInternal(fdp->path, buf, TRUE);
+	}
+
+	// For non-file descriptors, return basic info
+	MemSet(buf, 0, sizeof(CPosixStat));
+
+	switch (fdp->type) {
+		case FD_TYPE_PIPE:
+			buf->st_mode = S_IFIFO | 0600;
+			break;
+		case FD_TYPE_TTY:
+			buf->st_mode = S_IFCHR | 0600;
+			break;
+		case FD_TYPE_SOCKET:
+			buf->st_mode = S_IFSOCK | 0600;
+			break;
+		default:
+			buf->st_mode = S_IFREG | 0600;
+	}
+
+	return 0;
+}
+

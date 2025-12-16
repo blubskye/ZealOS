@@ -1,0 +1,1046 @@
+// curses.ZC - Curses/ncurses compatibility for ZealOS
+// Part of the POSIX compatibility layer
+//
+// Provides basic curses functionality for text-based UIs.
+// Uses ZealOS native terminal capabilities.
+
+// ============================================================================
+// CURSES TYPES AND CONSTANTS
+// ============================================================================
+
+// Boolean type
+#define TRUE  1
+#define FALSE 0
+#define ERR   -1
+#define OK    0
+
+// Key codes
+#define KEY_DOWN      0x102
+#define KEY_UP        0x103
+#define KEY_LEFT      0x104
+#define KEY_RIGHT     0x105
+#define KEY_HOME      0x106
+#define KEY_BACKSPACE 0x107
+#define KEY_F0        0x108
+#define KEY_F(n)      (KEY_F0 + (n))
+#define KEY_DL        0x148
+#define KEY_IL        0x149
+#define KEY_DC        0x14a
+#define KEY_IC        0x14b
+#define KEY_EIC       0x14c
+#define KEY_CLEAR     0x14d
+#define KEY_EOS       0x14e
+#define KEY_EOL       0x14f
+#define KEY_SF        0x150
+#define KEY_SR        0x151
+#define KEY_NPAGE     0x152
+#define KEY_PPAGE     0x153
+#define KEY_STAB      0x154
+#define KEY_CTAB      0x155
+#define KEY_CATAB     0x156
+#define KEY_ENTER     0x157
+#define KEY_PRINT     0x15a
+#define KEY_LL        0x15b
+#define KEY_A1        0x15c
+#define KEY_A3        0x15d
+#define KEY_B2        0x15e
+#define KEY_C1        0x15f
+#define KEY_C3        0x160
+#define KEY_BTAB      0x161
+#define KEY_BEG       0x162
+#define KEY_CANCEL    0x163
+#define KEY_CLOSE     0x164
+#define KEY_COMMAND   0x165
+#define KEY_COPY      0x166
+#define KEY_CREATE    0x167
+#define KEY_END       0x168
+#define KEY_EXIT      0x169
+#define KEY_FIND      0x16a
+#define KEY_HELP      0x16b
+#define KEY_MARK      0x16c
+#define KEY_MESSAGE   0x16d
+#define KEY_MOUSE     0x199
+#define KEY_MOVE      0x16e
+#define KEY_NEXT      0x16f
+#define KEY_OPEN      0x170
+#define KEY_OPTIONS   0x171
+#define KEY_PREVIOUS  0x172
+#define KEY_REDO      0x173
+#define KEY_REFERENCE 0x174
+#define KEY_REFRESH   0x175
+#define KEY_REPLACE   0x176
+#define KEY_RESIZE    0x19a
+#define KEY_RESTART   0x177
+#define KEY_RESUME    0x178
+#define KEY_SAVE      0x179
+#define KEY_SBEG      0x17a
+#define KEY_SCANCEL   0x17b
+#define KEY_SCOMMAND  0x17c
+#define KEY_SCOPY     0x17d
+#define KEY_SCREATE   0x17e
+#define KEY_SDC       0x17f
+#define KEY_SDL       0x180
+#define KEY_SELECT    0x181
+#define KEY_SEND      0x182
+#define KEY_SEOL      0x183
+#define KEY_SEXIT     0x184
+#define KEY_SFIND     0x185
+#define KEY_SHELP     0x186
+#define KEY_SHOME     0x187
+#define KEY_SIC       0x188
+#define KEY_SLEFT     0x189
+#define KEY_SMESSAGE  0x18a
+#define KEY_SMOVE     0x18b
+#define KEY_SNEXT     0x18c
+#define KEY_SOPTIONS  0x18d
+#define KEY_SPREVIOUS 0x18e
+#define KEY_SPRINT    0x18f
+#define KEY_SREDO     0x190
+#define KEY_SREPLACE  0x191
+#define KEY_SRIGHT    0x192
+#define KEY_SRSUME    0x193
+#define KEY_SSAVE     0x194
+#define KEY_SSUSPEND  0x195
+#define KEY_SUNDO     0x196
+#define KEY_SUSPEND   0x197
+#define KEY_UNDO      0x198
+
+// Attributes
+#define A_NORMAL     0x00000000
+#define A_STANDOUT   0x00010000
+#define A_UNDERLINE  0x00020000
+#define A_REVERSE    0x00040000
+#define A_BLINK      0x00080000
+#define A_DIM        0x00100000
+#define A_BOLD       0x00200000
+#define A_ALTCHARSET 0x00400000
+#define A_INVIS      0x00800000
+#define A_PROTECT    0x01000000
+#define A_CHARTEXT   0x000000FF
+
+// Colors
+#define COLOR_BLACK   0
+#define COLOR_RED     1
+#define COLOR_GREEN   2
+#define COLOR_YELLOW  3
+#define COLOR_BLUE    4
+#define COLOR_MAGENTA 5
+#define COLOR_CYAN    6
+#define COLOR_WHITE   7
+
+#define COLOR_PAIR(n) ((n) << 8)
+#define PAIR_NUMBER(a) (((a) >> 8) & 0xFF)
+
+// ACS characters (alternate character set)
+#define ACS_ULCORNER '+' // 0x250C
+#define ACS_LLCORNER '+' // 0x2514
+#define ACS_URCORNER '+' // 0x2510
+#define ACS_LRCORNER '+' // 0x2518
+#define ACS_LTEE     '+' // 0x251C
+#define ACS_RTEE     '+' // 0x2524
+#define ACS_BTEE     '+' // 0x2534
+#define ACS_TTEE     '+' // 0x252C
+#define ACS_HLINE    '-' // 0x2500
+#define ACS_VLINE    '|' // 0x2502
+#define ACS_PLUS     '+' // 0x253C
+#define ACS_S1       '-'
+#define ACS_S9       '_'
+#define ACS_DIAMOND  '+'
+#define ACS_CKBOARD  '#'
+#define ACS_DEGREE   '\''
+#define ACS_PLMINUS  '#'
+#define ACS_BULLET   'o'
+#define ACS_LARROW   '<'
+#define ACS_RARROW   '>'
+#define ACS_DARROW   'v'
+#define ACS_UARROW   '^'
+#define ACS_BOARD    '#'
+#define ACS_LANTERN  '#'
+#define ACS_BLOCK    '#'
+
+// ============================================================================
+// WINDOW STRUCTURE
+// ============================================================================
+
+class WINDOW {
+    I64 cury;           // Current cursor Y
+    I64 curx;           // Current cursor X
+    I64 maxy;           // Maximum Y
+    I64 maxx;           // Maximum X
+    I64 begy;           // Beginning Y
+    I64 begx;           // Beginning X
+    U32 attrs;          // Current attributes
+    U8  *data;          // Character data
+    U32 *attr_data;     // Attribute data
+    Bool scrollok;      // Scroll enabled
+    Bool leaveok;       // Leave cursor after update
+    Bool clearok;       // Clear on refresh
+    Bool keypad;        // Keypad mode
+    Bool nodelay;       // No delay mode
+    Bool notimeout;     // No timeout
+    Bool immedok;       // Immediate refresh
+    Bool idlok;         // Use insert/delete line
+    Bool idcok;         // Use insert/delete char
+    I64 delay;          // Input delay
+    I64 scrollreg_top;  // Scroll region top
+    I64 scrollreg_bot;  // Scroll region bottom
+};
+
+// ============================================================================
+// SCREEN STRUCTURE
+// ============================================================================
+
+class SCREEN {
+    WINDOW *stdscr;     // Standard screen
+    WINDOW *curscr;     // Current screen
+    WINDOW *newscr;     // New screen
+    I64 lines;          // Number of lines
+    I64 cols;           // Number of columns
+    I64 tabsize;        // Tab size
+    Bool has_colors;    // Has color support
+    Bool can_change;    // Can change colors
+    I64 color_pairs;    // Number of color pairs
+    I64 colors;         // Number of colors
+};
+
+// ============================================================================
+// GLOBAL VARIABLES
+// ============================================================================
+
+WINDOW *stdscr = NULL;
+WINDOW *curscr = NULL;
+I64 LINES = 25;
+I64 COLS = 80;
+I64 COLORS = 8;
+I64 COLOR_PAIRS = 64;
+SCREEN *SP = NULL;
+
+// Color pair storage
+class CColorPair {
+    I16 fg;
+    I16 bg;
+};
+CColorPair color_pairs[256];
+
+// ============================================================================
+// ANSI ESCAPE SEQUENCES
+// ============================================================================
+
+// ANSI escape codes for terminal control
+U0 curses_raw_move(I64 y, I64 x)
+{
+    // ESC[row;colH
+    printf("\x1B[%d;%dH", y + 1, x + 1);
+}
+
+U0 curses_raw_clear()
+{
+    // ESC[2J - clear screen
+    // ESC[H - home cursor
+    printf("\x1B[2J\x1B[H");
+}
+
+U0 curses_raw_clrtoeol()
+{
+    // ESC[K - clear to end of line
+    printf("\x1B[K");
+}
+
+U0 curses_raw_attr(U32 attr)
+{
+    // Reset attributes first
+    printf("\x1B[0m");
+
+    if (attr & A_BOLD) {
+        printf("\x1B[1m");
+    }
+    if (attr & A_DIM) {
+        printf("\x1B[2m");
+    }
+    if (attr & A_UNDERLINE) {
+        printf("\x1B[4m");
+    }
+    if (attr & A_BLINK) {
+        printf("\x1B[5m");
+    }
+    if (attr & A_REVERSE) {
+        printf("\x1B[7m");
+    }
+    if (attr & A_INVIS) {
+        printf("\x1B[8m");
+    }
+
+    // Handle color pairs
+    I64 pair = PAIR_NUMBER(attr);
+    if (pair > 0 && pair < 256) {
+        I16 fg = color_pairs[pair].fg;
+        I16 bg = color_pairs[pair].bg;
+        if (fg >= 0 && fg < 8) {
+            printf("\x1B[%dm", 30 + fg);
+        }
+        if (bg >= 0 && bg < 8) {
+            printf("\x1B[%dm", 40 + bg);
+        }
+    }
+}
+
+U0 curses_raw_cursor(Bool visible)
+{
+    if (visible) {
+        printf("\x1B[?25h");  // Show cursor
+    } else {
+        printf("\x1B[?25l");  // Hide cursor
+    }
+}
+
+// ============================================================================
+// WINDOW FUNCTIONS
+// ============================================================================
+
+// Create a new window
+WINDOW *newwin(I64 nlines, I64 ncols, I64 begin_y, I64 begin_x)
+{
+    WINDOW *win = MAlloc(sizeof(WINDOW));
+    MemSet(win, 0, sizeof(WINDOW));
+
+    if (nlines <= 0) nlines = LINES - begin_y;
+    if (ncols <= 0) ncols = COLS - begin_x;
+
+    win->maxy = nlines;
+    win->maxx = ncols;
+    win->begy = begin_y;
+    win->begx = begin_x;
+    win->scrollreg_top = 0;
+    win->scrollreg_bot = nlines - 1;
+
+    // Allocate character and attribute data
+    win->data = MAlloc(nlines * ncols);
+    win->attr_data = MAlloc(nlines * ncols * sizeof(U32));
+
+    // Fill with spaces
+    MemSet(win->data, ' ', nlines * ncols);
+    for (I64 i = 0; i < nlines * ncols; i++) {
+        win->attr_data[i] = A_NORMAL;
+    }
+
+    return win;
+}
+
+// Delete a window
+I64 delwin(WINDOW *win)
+{
+    if (!win) return ERR;
+    if (win == stdscr) return ERR;
+
+    if (win->data) Free(win->data);
+    if (win->attr_data) Free(win->attr_data);
+    Free(win);
+    return OK;
+}
+
+// Create a subwindow
+WINDOW *subwin(WINDOW *parent, I64 nlines, I64 ncols, I64 begin_y, I64 begin_x)
+{
+    if (!parent) return NULL;
+
+    WINDOW *win = newwin(nlines, ncols, begin_y, begin_x);
+    // Subwindow shares parent's data - simplified implementation
+    return win;
+}
+
+// Create a derived window
+WINDOW *derwin(WINDOW *parent, I64 nlines, I64 ncols, I64 begin_y, I64 begin_x)
+{
+    if (!parent) return NULL;
+    return subwin(parent, nlines, ncols, parent->begy + begin_y, parent->begx + begin_x);
+}
+
+// Duplicate a window
+WINDOW *dupwin(WINDOW *win)
+{
+    if (!win) return NULL;
+
+    WINDOW *dup = newwin(win->maxy, win->maxx, win->begy, win->begx);
+    dup->cury = win->cury;
+    dup->curx = win->curx;
+    dup->attrs = win->attrs;
+    MemCpy(dup->data, win->data, win->maxy * win->maxx);
+    MemCpy(dup->attr_data, win->attr_data, win->maxy * win->maxx * sizeof(U32));
+    return dup;
+}
+
+// ============================================================================
+// INITIALIZATION / TERMINATION
+// ============================================================================
+
+// Initialize curses
+WINDOW *initscr()
+{
+    // Get terminal size
+    // For ZealOS, use default values or query system
+    LINES = 25;
+    COLS = 80;
+
+    // Create screen structure
+    SP = MAlloc(sizeof(SCREEN));
+    MemSet(SP, 0, sizeof(SCREEN));
+    SP->lines = LINES;
+    SP->cols = COLS;
+    SP->tabsize = 8;
+    SP->has_colors = TRUE;
+    SP->colors = 8;
+    SP->color_pairs = 64;
+
+    // Create standard screen window
+    stdscr = newwin(LINES, COLS, 0, 0);
+    curscr = newwin(LINES, COLS, 0, 0);
+
+    SP->stdscr = stdscr;
+    SP->curscr = curscr;
+
+    // Initialize color pairs
+    for (I64 i = 0; i < 256; i++) {
+        color_pairs[i].fg = -1;
+        color_pairs[i].bg = -1;
+    }
+
+    // Set up terminal
+    curses_raw_clear();
+
+    return stdscr;
+}
+
+// End curses mode
+I64 endwin()
+{
+    // Reset terminal
+    printf("\x1B[0m");      // Reset attributes
+    curses_raw_cursor(TRUE);
+    curses_raw_clear();
+
+    // Don't free stdscr yet - might restart
+    return OK;
+}
+
+// Check if endwin was called
+Bool isendwin()
+{
+    return stdscr == NULL;
+}
+
+// ============================================================================
+// OUTPUT FUNCTIONS
+// ============================================================================
+
+// Move cursor
+I64 wmove(WINDOW *win, I64 y, I64 x)
+{
+    if (!win) return ERR;
+    if (y < 0 || y >= win->maxy) return ERR;
+    if (x < 0 || x >= win->maxx) return ERR;
+
+    win->cury = y;
+    win->curx = x;
+    return OK;
+}
+
+// Add character at current position
+I64 waddch(WINDOW *win, U32 ch)
+{
+    if (!win) return ERR;
+
+    U8 c = ch & A_CHARTEXT;
+    U32 attr = ch & ~A_CHARTEXT;
+    if (attr == 0) attr = win->attrs;
+
+    // Store character
+    I64 pos = win->cury * win->maxx + win->curx;
+    if (pos >= 0 && pos < win->maxy * win->maxx) {
+        win->data[pos] = c;
+        win->attr_data[pos] = attr;
+    }
+
+    // Advance cursor
+    win->curx++;
+    if (win->curx >= win->maxx) {
+        win->curx = 0;
+        win->cury++;
+        if (win->cury >= win->maxy) {
+            if (win->scrollok) {
+                // Scroll window
+                win->cury = win->maxy - 1;
+                // Move data up
+                MemCpy(win->data, &win->data[win->maxx],
+                       (win->maxy - 1) * win->maxx);
+                MemCpy(win->attr_data, &win->attr_data[win->maxx],
+                       (win->maxy - 1) * win->maxx * sizeof(U32));
+                // Clear last line
+                MemSet(&win->data[(win->maxy - 1) * win->maxx], ' ', win->maxx);
+            } else {
+                win->cury = win->maxy - 1;
+            }
+        }
+    }
+
+    return OK;
+}
+
+// Add string at current position
+I64 waddstr(WINDOW *win, U8 *str)
+{
+    if (!win || !str) return ERR;
+
+    while (*str) {
+        waddch(win, *str++);
+    }
+    return OK;
+}
+
+// Add string with length
+I64 waddnstr(WINDOW *win, U8 *str, I64 n)
+{
+    if (!win || !str) return ERR;
+
+    I64 i = 0;
+    while (*str && (n < 0 || i < n)) {
+        waddch(win, *str++);
+        i++;
+    }
+    return OK;
+}
+
+// Print formatted string
+I64 wprintw(WINDOW *win, U8 *fmt, ...)
+{
+    if (!win || !fmt) return ERR;
+
+    U8 buf[4096];
+    va_list args;
+    va_start(args, fmt);
+    vsnprintf(buf, sizeof(buf), fmt, args);
+    va_end(args);
+
+    return waddstr(win, buf);
+}
+
+// Move and add character
+I64 mvwaddch(WINDOW *win, I64 y, I64 x, U32 ch)
+{
+    wmove(win, y, x);
+    return waddch(win, ch);
+}
+
+// Move and add string
+I64 mvwaddstr(WINDOW *win, I64 y, I64 x, U8 *str)
+{
+    wmove(win, y, x);
+    return waddstr(win, str);
+}
+
+// Move and print
+I64 mvwprintw(WINDOW *win, I64 y, I64 x, U8 *fmt, ...)
+{
+    wmove(win, y, x);
+
+    U8 buf[4096];
+    va_list args;
+    va_start(args, fmt);
+    vsnprintf(buf, sizeof(buf), fmt, args);
+    va_end(args);
+
+    return waddstr(win, buf);
+}
+
+// Convenience macros for stdscr
+#define move(y, x)       wmove(stdscr, y, x)
+#define addch(ch)        waddch(stdscr, ch)
+#define addstr(str)      waddstr(stdscr, str)
+#define addnstr(str, n)  waddnstr(stdscr, str, n)
+#define printw(...)      wprintw(stdscr, __VA_ARGS__)
+#define mvaddch(y, x, ch)     mvwaddch(stdscr, y, x, ch)
+#define mvaddstr(y, x, str)   mvwaddstr(stdscr, y, x, str)
+#define mvprintw(y, x, ...)   mvwprintw(stdscr, y, x, __VA_ARGS__)
+
+// ============================================================================
+// ATTRIBUTE FUNCTIONS
+// ============================================================================
+
+// Set current attributes
+I64 wattrset(WINDOW *win, I64 attrs)
+{
+    if (!win) return ERR;
+    win->attrs = attrs;
+    return OK;
+}
+
+I64 wattron(WINDOW *win, I64 attrs)
+{
+    if (!win) return ERR;
+    win->attrs |= attrs;
+    return OK;
+}
+
+I64 wattroff(WINDOW *win, I64 attrs)
+{
+    if (!win) return ERR;
+    win->attrs &= ~attrs;
+    return OK;
+}
+
+I64 wstandout(WINDOW *win)
+{
+    return wattron(win, A_STANDOUT);
+}
+
+I64 wstandend(WINDOW *win)
+{
+    return wattrset(win, A_NORMAL);
+}
+
+#define attrset(a)   wattrset(stdscr, a)
+#define attron(a)    wattron(stdscr, a)
+#define attroff(a)   wattroff(stdscr, a)
+#define standout()   wstandout(stdscr)
+#define standend()   wstandend(stdscr)
+
+// ============================================================================
+// CLEARING FUNCTIONS
+// ============================================================================
+
+I64 werase(WINDOW *win)
+{
+    if (!win) return ERR;
+
+    MemSet(win->data, ' ', win->maxy * win->maxx);
+    for (I64 i = 0; i < win->maxy * win->maxx; i++) {
+        win->attr_data[i] = A_NORMAL;
+    }
+    win->cury = 0;
+    win->curx = 0;
+    return OK;
+}
+
+I64 wclear(WINDOW *win)
+{
+    if (!win) return ERR;
+    win->clearok = TRUE;
+    return werase(win);
+}
+
+I64 wclrtoeol(WINDOW *win)
+{
+    if (!win) return ERR;
+
+    I64 start = win->cury * win->maxx + win->curx;
+    I64 end = (win->cury + 1) * win->maxx;
+
+    for (I64 i = start; i < end && i < win->maxy * win->maxx; i++) {
+        win->data[i] = ' ';
+        win->attr_data[i] = A_NORMAL;
+    }
+    return OK;
+}
+
+I64 wclrtobot(WINDOW *win)
+{
+    if (!win) return ERR;
+
+    wclrtoeol(win);
+
+    I64 start = (win->cury + 1) * win->maxx;
+    for (I64 i = start; i < win->maxy * win->maxx; i++) {
+        win->data[i] = ' ';
+        win->attr_data[i] = A_NORMAL;
+    }
+    return OK;
+}
+
+#define erase()    werase(stdscr)
+#define clear()    wclear(stdscr)
+#define clrtoeol() wclrtoeol(stdscr)
+#define clrtobot() wclrtobot(stdscr)
+
+// ============================================================================
+// REFRESH FUNCTIONS
+// ============================================================================
+
+I64 wrefresh(WINDOW *win)
+{
+    if (!win) return ERR;
+
+    for (I64 y = 0; y < win->maxy; y++) {
+        curses_raw_move(win->begy + y, win->begx);
+
+        for (I64 x = 0; x < win->maxx; x++) {
+            I64 pos = y * win->maxx + x;
+            curses_raw_attr(win->attr_data[pos]);
+            putchar(win->data[pos]);
+        }
+    }
+
+    // Position cursor
+    curses_raw_move(win->begy + win->cury, win->begx + win->curx);
+    fflush(stdout);
+
+    return OK;
+}
+
+I64 wnoutrefresh(WINDOW *win)
+{
+    // In this simple implementation, same as wrefresh
+    return wrefresh(win);
+}
+
+I64 doupdate()
+{
+    fflush(stdout);
+    return OK;
+}
+
+#define refresh() wrefresh(stdscr)
+
+// ============================================================================
+// INPUT FUNCTIONS
+// ============================================================================
+
+// Enable/disable keypad mode
+I64 keypad(WINDOW *win, Bool bf)
+{
+    if (!win) return ERR;
+    win->keypad = bf;
+    return OK;
+}
+
+// Enable/disable nodelay mode
+I64 nodelay(WINDOW *win, Bool bf)
+{
+    if (!win) return ERR;
+    win->nodelay = bf;
+    return OK;
+}
+
+// Set input delay
+I64 wtimeout(WINDOW *win, I64 delay)
+{
+    if (!win) return ERR;
+    win->delay = delay;
+    return OK;
+}
+
+// Get character from window
+I64 wgetch(WINDOW *win)
+{
+    if (!win) return ERR;
+
+    // Refresh first
+    wrefresh(win);
+
+    // For ZealOS, use native keyboard input
+    // This is simplified - a real implementation would
+    // handle escape sequences for special keys
+
+    I64 ch;
+    if (win->nodelay) {
+        // Non-blocking
+        if (ScanKey(&ch)) {
+            return ch & 0xFF;
+        }
+        return ERR;
+    } else {
+        // Blocking
+        ch = GetKey;
+        return ch & 0xFF;
+    }
+}
+
+// Get string from window
+I64 wgetnstr(WINDOW *win, U8 *str, I64 n)
+{
+    if (!win || !str || n <= 0) return ERR;
+
+    I64 i = 0;
+    I64 ch;
+
+    while (i < n - 1) {
+        ch = wgetch(win);
+        if (ch == ERR) continue;
+        if (ch == '\n' || ch == '\r') break;
+        if (ch == 0x7F || ch == '\b') {
+            if (i > 0) {
+                i--;
+                win->curx--;
+                waddch(win, ' ');
+                win->curx--;
+                wrefresh(win);
+            }
+            continue;
+        }
+
+        str[i++] = ch;
+        waddch(win, ch);
+        wrefresh(win);
+    }
+
+    str[i] = 0;
+    return OK;
+}
+
+#define getch()          wgetch(stdscr)
+#define getnstr(s, n)    wgetnstr(stdscr, s, n)
+#define getstr(s)        wgetnstr(stdscr, s, 256)
+#define timeout(d)       wtimeout(stdscr, d)
+
+// ============================================================================
+// COLOR FUNCTIONS
+// ============================================================================
+
+// Check if terminal has colors
+Bool has_colors()
+{
+    return TRUE;  // ZealOS always has colors
+}
+
+// Check if colors can be changed
+Bool can_change_color()
+{
+    return FALSE;  // Not supported in this implementation
+}
+
+// Initialize color support
+I64 start_color()
+{
+    COLORS = 8;
+    COLOR_PAIRS = 64;
+    return OK;
+}
+
+// Initialize a color pair
+I64 init_pair(I16 pair, I16 f, I16 b)
+{
+    if (pair < 0 || pair >= 256) return ERR;
+    color_pairs[pair].fg = f;
+    color_pairs[pair].bg = b;
+    return OK;
+}
+
+// Get pair content
+I64 pair_content(I16 pair, I16 *f, I16 *b)
+{
+    if (pair < 0 || pair >= 256) return ERR;
+    if (f) *f = color_pairs[pair].fg;
+    if (b) *b = color_pairs[pair].bg;
+    return OK;
+}
+
+// ============================================================================
+// MISCELLANEOUS FUNCTIONS
+// ============================================================================
+
+I64 scrollok(WINDOW *win, Bool bf)
+{
+    if (!win) return ERR;
+    win->scrollok = bf;
+    return OK;
+}
+
+I64 leaveok(WINDOW *win, Bool bf)
+{
+    if (!win) return ERR;
+    win->leaveok = bf;
+    return OK;
+}
+
+I64 clearok(WINDOW *win, Bool bf)
+{
+    if (!win) return ERR;
+    win->clearok = bf;
+    return OK;
+}
+
+I64 immedok(WINDOW *win, Bool bf)
+{
+    if (!win) return ERR;
+    win->immedok = bf;
+    return OK;
+}
+
+I64 idlok(WINDOW *win, Bool bf)
+{
+    if (!win) return ERR;
+    win->idlok = bf;
+    return OK;
+}
+
+I64 idcok(WINDOW *win, Bool bf)
+{
+    if (!win) return ERR;
+    win->idcok = bf;
+    return OK;
+}
+
+I64 cbreak()
+{
+    // Disable line buffering
+    return OK;
+}
+
+I64 nocbreak()
+{
+    return OK;
+}
+
+I64 raw()
+{
+    // Raw mode - no signal processing
+    return OK;
+}
+
+I64 noraw()
+{
+    return OK;
+}
+
+I64 echo()
+{
+    return OK;
+}
+
+I64 noecho()
+{
+    return OK;
+}
+
+I64 nl()
+{
+    return OK;
+}
+
+I64 nonl()
+{
+    return OK;
+}
+
+I64 beep()
+{
+    putchar('\a');
+    return OK;
+}
+
+I64 flash()
+{
+    // Visual bell - reverse video briefly
+    return OK;
+}
+
+I64 curs_set(I64 visibility)
+{
+    curses_raw_cursor(visibility > 0);
+    return OK;
+}
+
+// Get window coordinates
+I64 getyx(WINDOW *win, I64 *y, I64 *x)
+{
+    if (!win) return ERR;
+    if (y) *y = win->cury;
+    if (x) *x = win->curx;
+    return OK;
+}
+
+I64 getbegyx(WINDOW *win, I64 *y, I64 *x)
+{
+    if (!win) return ERR;
+    if (y) *y = win->begy;
+    if (x) *x = win->begx;
+    return OK;
+}
+
+I64 getmaxyx(WINDOW *win, I64 *y, I64 *x)
+{
+    if (!win) return ERR;
+    if (y) *y = win->maxy;
+    if (x) *x = win->maxx;
+    return OK;
+}
+
+// ============================================================================
+// BOX AND BORDER FUNCTIONS
+// ============================================================================
+
+I64 wborder(WINDOW *win, U32 ls, U32 rs, U32 ts, U32 bs,
+           U32 tl, U32 tr, U32 bl, U32 br)
+{
+    if (!win) return ERR;
+
+    if (ls == 0) ls = ACS_VLINE;
+    if (rs == 0) rs = ACS_VLINE;
+    if (ts == 0) ts = ACS_HLINE;
+    if (bs == 0) bs = ACS_HLINE;
+    if (tl == 0) tl = ACS_ULCORNER;
+    if (tr == 0) tr = ACS_URCORNER;
+    if (bl == 0) bl = ACS_LLCORNER;
+    if (br == 0) br = ACS_LRCORNER;
+
+    // Corners
+    mvwaddch(win, 0, 0, tl);
+    mvwaddch(win, 0, win->maxx - 1, tr);
+    mvwaddch(win, win->maxy - 1, 0, bl);
+    mvwaddch(win, win->maxy - 1, win->maxx - 1, br);
+
+    // Top and bottom
+    for (I64 x = 1; x < win->maxx - 1; x++) {
+        mvwaddch(win, 0, x, ts);
+        mvwaddch(win, win->maxy - 1, x, bs);
+    }
+
+    // Left and right
+    for (I64 y = 1; y < win->maxy - 1; y++) {
+        mvwaddch(win, y, 0, ls);
+        mvwaddch(win, y, win->maxx - 1, rs);
+    }
+
+    return OK;
+}
+
+I64 box(WINDOW *win, U32 verch, U32 horch)
+{
+    return wborder(win, verch, verch, horch, horch, 0, 0, 0, 0);
+}
+
+I64 whline(WINDOW *win, U32 ch, I64 n)
+{
+    if (!win) return ERR;
+    if (ch == 0) ch = ACS_HLINE;
+
+    for (I64 i = 0; i < n && win->curx + i < win->maxx; i++) {
+        mvwaddch(win, win->cury, win->curx + i, ch);
+    }
+    return OK;
+}
+
+I64 wvline(WINDOW *win, U32 ch, I64 n)
+{
+    if (!win) return ERR;
+    if (ch == 0) ch = ACS_VLINE;
+
+    for (I64 i = 0; i < n && win->cury + i < win->maxy; i++) {
+        mvwaddch(win, win->cury + i, win->curx, ch);
+    }
+    return OK;
+}
+
+#define hline(ch, n) whline(stdscr, ch, n)
+#define vline(ch, n) wvline(stdscr, ch, n)
+#define border(ls, rs, ts, bs, tl, tr, bl, br) wborder(stdscr, ls, rs, ts, bs, tl, tr, bl, br)
+
+// ============================================================================
+// INITIALIZATION MESSAGE
+// ============================================================================
+
+"ZealOS curses library loaded.\n";
+"  - Window management: newwin, delwin, subwin\n";
+"  - Output: addch, addstr, printw, mvaddch, etc.\n";
+"  - Input: getch, getstr, keypad\n";
+"  - Attributes: attron, attroff, attrset\n";
+"  - Colors: start_color, init_pair, COLOR_PAIR\n";
+"  - Misc: refresh, clear, box, border\n";

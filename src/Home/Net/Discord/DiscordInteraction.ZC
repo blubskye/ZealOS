@@ -1,0 +1,578 @@
+// DiscordInteraction.ZC - Discord Slash Commands and Interactions for ZealOS
+// Part of ZealOS Discord implementation
+// Provides slash command registration and interaction responses
+
+// ============================================================================
+// APPLICATION COMMAND TYPES
+// ============================================================================
+
+#define DISCORD_CMD_CHAT_INPUT      1   // Slash command
+#define DISCORD_CMD_USER            2   // User context menu
+#define DISCORD_CMD_MESSAGE         3   // Message context menu
+
+// ============================================================================
+// COMMAND BUILDER STRUCTURES
+// ============================================================================
+
+// Command option
+class CDiscordCommandOption
+{
+	U8                *name;
+	U8                *description;
+	I64                type;           // DISCORD_OPTION_*
+	Bool               required;
+	CDiscordCommandOption *options;    // Sub-options (for sub-commands)
+	I64                option_count;
+	// For choices (string/int options)
+	U8               **choice_names;
+	U8               **choice_values;
+	I64                choice_count;
+};
+
+// Application command
+class CDiscordCommand
+{
+	U8                *name;
+	U8                *description;
+	I64                type;           // DISCORD_CMD_*
+	CDiscordCommandOption *options;
+	I64                option_count;
+	I64                option_capacity;
+	Bool               dm_permission;  // Can use in DMs
+};
+
+// ============================================================================
+// COMMAND CREATION/DESTRUCTION
+// ============================================================================
+
+// Create a new slash command
+CDiscordCommand *DiscordCommandNew(U8 *name, U8 *description)
+{
+	CDiscordCommand *cmd = MAlloc(sizeof(CDiscordCommand));
+	MemSet(cmd, 0, sizeof(CDiscordCommand));
+	cmd->name = StrNew(name);
+	cmd->description = StrNew(description);
+	cmd->type = DISCORD_CMD_CHAT_INPUT;
+	cmd->dm_permission = TRUE;
+	return cmd;
+}
+
+// Free command option recursively
+U0 DiscordCommandOptionFree(CDiscordCommandOption *opt)
+{
+	I64 i;
+	if (!opt) return;
+
+	if (opt->name) Free(opt->name);
+	if (opt->description) Free(opt->description);
+
+	if (opt->options) {
+		for (i = 0; i < opt->option_count; i++) {
+			DiscordCommandOptionFree(&opt->options[i]);
+		}
+		Free(opt->options);
+	}
+
+	if (opt->choice_names) {
+		for (i = 0; i < opt->choice_count; i++) {
+			if (opt->choice_names[i]) Free(opt->choice_names[i]);
+		}
+		Free(opt->choice_names);
+	}
+
+	if (opt->choice_values) {
+		for (i = 0; i < opt->choice_count; i++) {
+			if (opt->choice_values[i]) Free(opt->choice_values[i]);
+		}
+		Free(opt->choice_values);
+	}
+}
+
+// Free command
+U0 DiscordCommandFree(CDiscordCommand *cmd)
+{
+	I64 i;
+	if (!cmd) return;
+
+	if (cmd->name) Free(cmd->name);
+	if (cmd->description) Free(cmd->description);
+
+	if (cmd->options) {
+		for (i = 0; i < cmd->option_count; i++) {
+			DiscordCommandOptionFree(&cmd->options[i]);
+		}
+		Free(cmd->options);
+	}
+
+	Free(cmd);
+}
+
+// ============================================================================
+// COMMAND OPTION BUILDING
+// ============================================================================
+
+// Ensure capacity for options
+U0 DiscordCommandGrowOptions(CDiscordCommand *cmd)
+{
+	if (cmd->option_count >= cmd->option_capacity) {
+		I64 new_cap = cmd->option_capacity == 0 ? 4 : cmd->option_capacity * 2;
+		CDiscordCommandOption *new_opts = MAlloc(new_cap * sizeof(CDiscordCommandOption));
+		MemSet(new_opts, 0, new_cap * sizeof(CDiscordCommandOption));
+
+		if (cmd->options) {
+			MemCpy(new_opts, cmd->options, cmd->option_count * sizeof(CDiscordCommandOption));
+			Free(cmd->options);
+		}
+
+		cmd->options = new_opts;
+		cmd->option_capacity = new_cap;
+	}
+}
+
+// Add a string option
+U0 DiscordCommandAddStringOption(CDiscordCommand *cmd, U8 *name, U8 *description, Bool required)
+{
+	DiscordCommandGrowOptions(cmd);
+	CDiscordCommandOption *opt = &cmd->options[cmd->option_count++];
+	opt->name = StrNew(name);
+	opt->description = StrNew(description);
+	opt->type = DISCORD_OPTION_STRING;
+	opt->required = required;
+}
+
+// Add an integer option
+U0 DiscordCommandAddIntOption(CDiscordCommand *cmd, U8 *name, U8 *description, Bool required)
+{
+	DiscordCommandGrowOptions(cmd);
+	CDiscordCommandOption *opt = &cmd->options[cmd->option_count++];
+	opt->name = StrNew(name);
+	opt->description = StrNew(description);
+	opt->type = DISCORD_OPTION_INTEGER;
+	opt->required = required;
+}
+
+// Add a boolean option
+U0 DiscordCommandAddBoolOption(CDiscordCommand *cmd, U8 *name, U8 *description, Bool required)
+{
+	DiscordCommandGrowOptions(cmd);
+	CDiscordCommandOption *opt = &cmd->options[cmd->option_count++];
+	opt->name = StrNew(name);
+	opt->description = StrNew(description);
+	opt->type = DISCORD_OPTION_BOOLEAN;
+	opt->required = required;
+}
+
+// Add a user option
+U0 DiscordCommandAddUserOption(CDiscordCommand *cmd, U8 *name, U8 *description, Bool required)
+{
+	DiscordCommandGrowOptions(cmd);
+	CDiscordCommandOption *opt = &cmd->options[cmd->option_count++];
+	opt->name = StrNew(name);
+	opt->description = StrNew(description);
+	opt->type = DISCORD_OPTION_USER;
+	opt->required = required;
+}
+
+// Add a channel option
+U0 DiscordCommandAddChannelOption(CDiscordCommand *cmd, U8 *name, U8 *description, Bool required)
+{
+	DiscordCommandGrowOptions(cmd);
+	CDiscordCommandOption *opt = &cmd->options[cmd->option_count++];
+	opt->name = StrNew(name);
+	opt->description = StrNew(description);
+	opt->type = DISCORD_OPTION_CHANNEL;
+	opt->required = required;
+}
+
+// Add a role option
+U0 DiscordCommandAddRoleOption(CDiscordCommand *cmd, U8 *name, U8 *description, Bool required)
+{
+	DiscordCommandGrowOptions(cmd);
+	CDiscordCommandOption *opt = &cmd->options[cmd->option_count++];
+	opt->name = StrNew(name);
+	opt->description = StrNew(description);
+	opt->type = DISCORD_OPTION_ROLE;
+	opt->required = required;
+}
+
+// ============================================================================
+// COMMAND JSON SERIALIZATION
+// ============================================================================
+
+// Serialize command option to JSON
+U0 DiscordCommandOptionToJSON(CDiscordCommandOption *opt, CJSONBuilder *json)
+{
+	I64 i;
+
+	JSONBeginObject(json);
+	JSONKeyString(json, "name", opt->name);
+	JSONKeyString(json, "description", opt->description);
+	JSONKeyInt(json, "type", opt->type);
+	JSONKeyBool(json, "required", opt->required);
+
+	// Sub-options (for sub-commands)
+	if (opt->options && opt->option_count > 0) {
+		JSONKeyArray(json, "options");
+		for (i = 0; i < opt->option_count; i++) {
+			DiscordCommandOptionToJSON(&opt->options[i], json);
+		}
+		JSONEndArray(json);
+	}
+
+	// Choices
+	if (opt->choice_count > 0 && opt->choice_names && opt->choice_values) {
+		JSONKeyArray(json, "choices");
+		for (i = 0; i < opt->choice_count; i++) {
+			JSONBeginObject(json);
+			JSONKeyString(json, "name", opt->choice_names[i]);
+			JSONKeyString(json, "value", opt->choice_values[i]);
+			JSONEndObject(json);
+		}
+		JSONEndArray(json);
+	}
+
+	JSONEndObject(json);
+}
+
+// Serialize command to JSON
+U8 *DiscordCommandToJSON(CDiscordCommand *cmd)
+{
+	CJSONBuilder json;
+	I64 i;
+
+	JSONBuilderInit(&json, 1024);
+	JSONBeginObject(&json);
+
+	JSONKeyString(&json, "name", cmd->name);
+	JSONKeyString(&json, "description", cmd->description);
+	JSONKeyInt(&json, "type", cmd->type);
+
+	if (cmd->options && cmd->option_count > 0) {
+		JSONKeyArray(&json, "options");
+		for (i = 0; i < cmd->option_count; i++) {
+			DiscordCommandOptionToJSON(&cmd->options[i], &json);
+		}
+		JSONEndArray(&json);
+	}
+
+	JSONEndObject(&json);
+
+	U8 *result = StrNew(JSONBuilderGet(&json));
+	JSONBuilderFree(&json);
+	return result;
+}
+
+// ============================================================================
+// COMMAND REGISTRATION
+// ============================================================================
+
+// Create global command (available in all guilds)
+I64 DiscordCreateGlobalCommand(CDiscordClient *client, CDiscordCommand *cmd)
+{
+	U8 endpoint[128];
+	CHTTPResponse *resp;
+
+	// Need application ID - get from self
+	StrPrint(endpoint, "/applications/%llu/commands", client->self.id);
+
+	U8 *body = DiscordCommandToJSON(cmd);
+	resp = DiscordAPIRequest(client, HTTP_METHOD_POST, endpoint, body);
+	Free(body);
+
+	if (!resp) return DISCORD_ERR_API_ERROR;
+
+	I64 status = resp->status_code;
+	HTTPResponseFree(resp);
+
+	return (status == 200 || status == 201) ? DISCORD_OK : DISCORD_ERR_API_ERROR;
+}
+
+// Create guild command (only in specific guild)
+I64 DiscordCreateGuildCommand(CDiscordClient *client, CDiscordSnowflake guild_id, CDiscordCommand *cmd)
+{
+	U8 endpoint[128];
+	CHTTPResponse *resp;
+
+	StrPrint(endpoint, "/applications/%llu/guilds/%llu/commands", client->self.id, guild_id);
+
+	U8 *body = DiscordCommandToJSON(cmd);
+	resp = DiscordAPIRequest(client, HTTP_METHOD_POST, endpoint, body);
+	Free(body);
+
+	if (!resp) return DISCORD_ERR_API_ERROR;
+
+	I64 status = resp->status_code;
+	HTTPResponseFree(resp);
+
+	return (status == 200 || status == 201) ? DISCORD_OK : DISCORD_ERR_API_ERROR;
+}
+
+// Delete global command
+I64 DiscordDeleteGlobalCommand(CDiscordClient *client, CDiscordSnowflake command_id)
+{
+	U8 endpoint[128];
+	CHTTPResponse *resp;
+
+	StrPrint(endpoint, "/applications/%llu/commands/%llu", client->self.id, command_id);
+
+	resp = DiscordAPIRequest(client, HTTP_METHOD_DELETE, endpoint, NULL);
+	if (!resp) return DISCORD_ERR_API_ERROR;
+
+	I64 status = resp->status_code;
+	HTTPResponseFree(resp);
+
+	return (status == 204) ? DISCORD_OK : DISCORD_ERR_API_ERROR;
+}
+
+// Delete guild command
+I64 DiscordDeleteGuildCommand(CDiscordClient *client, CDiscordSnowflake guild_id, CDiscordSnowflake command_id)
+{
+	U8 endpoint[128];
+	CHTTPResponse *resp;
+
+	StrPrint(endpoint, "/applications/%llu/guilds/%llu/commands/%llu", client->self.id, guild_id, command_id);
+
+	resp = DiscordAPIRequest(client, HTTP_METHOD_DELETE, endpoint, NULL);
+	if (!resp) return DISCORD_ERR_API_ERROR;
+
+	I64 status = resp->status_code;
+	HTTPResponseFree(resp);
+
+	return (status == 204) ? DISCORD_OK : DISCORD_ERR_API_ERROR;
+}
+
+// Get global commands
+CJSONValue *DiscordGetGlobalCommands(CDiscordClient *client)
+{
+	U8 endpoint[128];
+	CHTTPResponse *resp;
+
+	StrPrint(endpoint, "/applications/%llu/commands", client->self.id);
+
+	resp = DiscordAPIRequest(client, HTTP_METHOD_GET, endpoint, NULL);
+	if (!resp) return NULL;
+
+	CJSONValue *result = NULL;
+	if (resp->status_code == 200 && resp->body) {
+		result = JSONParse(resp->body);
+	}
+
+	HTTPResponseFree(resp);
+	return result;
+}
+
+// ============================================================================
+// INTERACTION RESPONSES
+// ============================================================================
+
+// Respond to interaction with message
+I64 DiscordInteractionRespond(CDiscordClient *client, CDiscordInteraction *interaction,
+                              I64 response_type, U8 *content, CDiscordEmbed *embed)
+{
+	U8 endpoint[192];
+	CJSONBuilder json;
+	CHTTPResponse *resp;
+
+	StrPrint(endpoint, "/interactions/%llu/%s/callback", interaction->id, interaction->token);
+
+	JSONBuilderInit(&json, 2048);
+	JSONBeginObject(&json);
+	JSONKeyInt(&json, "type", response_type);
+
+	// Data object
+	JSONKeyObject(&json, "data");
+	if (content) {
+		JSONKeyString(&json, "content", content);
+	}
+	if (embed) {
+		JSONKeyArray(&json, "embeds");
+		DiscordEmbedToJSON(embed, &json);
+		JSONEndArray(&json);
+	}
+	JSONEndObject(&json);  // data
+
+	JSONEndObject(&json);
+
+	resp = DiscordAPIRequest(client, HTTP_METHOD_POST, endpoint, JSONBuilderGet(&json));
+	JSONBuilderFree(&json);
+
+	if (!resp) return DISCORD_ERR_API_ERROR;
+
+	I64 status = resp->status_code;
+	HTTPResponseFree(resp);
+
+	return (status == 200 || status == 204) ? DISCORD_OK : DISCORD_ERR_API_ERROR;
+}
+
+// Defer interaction (acknowledge, send response later)
+I64 DiscordInteractionDefer(CDiscordClient *client, CDiscordInteraction *interaction, Bool ephemeral)
+{
+	U8 endpoint[192];
+	CJSONBuilder json;
+	CHTTPResponse *resp;
+
+	StrPrint(endpoint, "/interactions/%llu/%s/callback", interaction->id, interaction->token);
+
+	JSONBuilderInit(&json, 128);
+	JSONBeginObject(&json);
+	JSONKeyInt(&json, "type", DISCORD_RESPONSE_DEFERRED_CHANNEL_MESSAGE);
+
+	if (ephemeral) {
+		JSONKeyObject(&json, "data");
+		JSONKeyInt(&json, "flags", 64);  // EPHEMERAL flag
+		JSONEndObject(&json);
+	}
+
+	JSONEndObject(&json);
+
+	resp = DiscordAPIRequest(client, HTTP_METHOD_POST, endpoint, JSONBuilderGet(&json));
+	JSONBuilderFree(&json);
+
+	if (!resp) return DISCORD_ERR_API_ERROR;
+
+	I64 status = resp->status_code;
+	HTTPResponseFree(resp);
+
+	return (status == 200 || status == 204) ? DISCORD_OK : DISCORD_ERR_API_ERROR;
+}
+
+// Edit original interaction response
+I64 DiscordInteractionEdit(CDiscordClient *client, CDiscordInteraction *interaction,
+                           U8 *content, CDiscordEmbed *embed)
+{
+	U8 endpoint[192];
+	CJSONBuilder json;
+	CHTTPResponse *resp;
+
+	StrPrint(endpoint, "/webhooks/%llu/%s/messages/@original",
+	         interaction->application_id, interaction->token);
+
+	JSONBuilderInit(&json, 2048);
+	JSONBeginObject(&json);
+	if (content) {
+		JSONKeyString(&json, "content", content);
+	}
+	if (embed) {
+		JSONKeyArray(&json, "embeds");
+		DiscordEmbedToJSON(embed, &json);
+		JSONEndArray(&json);
+	}
+	JSONEndObject(&json);
+
+	resp = DiscordAPIRequest(client, HTTP_METHOD_PATCH, endpoint, JSONBuilderGet(&json));
+	JSONBuilderFree(&json);
+
+	if (!resp) return DISCORD_ERR_API_ERROR;
+
+	I64 status = resp->status_code;
+	HTTPResponseFree(resp);
+
+	return (status == 200) ? DISCORD_OK : DISCORD_ERR_API_ERROR;
+}
+
+// Send followup message
+I64 DiscordInteractionFollowup(CDiscordClient *client, CDiscordInteraction *interaction,
+                               U8 *content, CDiscordEmbed *embed)
+{
+	U8 endpoint[192];
+	CJSONBuilder json;
+	CHTTPResponse *resp;
+
+	StrPrint(endpoint, "/webhooks/%llu/%s", interaction->application_id, interaction->token);
+
+	JSONBuilderInit(&json, 2048);
+	JSONBeginObject(&json);
+	if (content) {
+		JSONKeyString(&json, "content", content);
+	}
+	if (embed) {
+		JSONKeyArray(&json, "embeds");
+		DiscordEmbedToJSON(embed, &json);
+		JSONEndArray(&json);
+	}
+	JSONEndObject(&json);
+
+	resp = DiscordAPIRequest(client, HTTP_METHOD_POST, endpoint, JSONBuilderGet(&json));
+	JSONBuilderFree(&json);
+
+	if (!resp) return DISCORD_ERR_API_ERROR;
+
+	I64 status = resp->status_code;
+	HTTPResponseFree(resp);
+
+	return (status == 200) ? DISCORD_OK : DISCORD_ERR_API_ERROR;
+}
+
+// ============================================================================
+// INTERACTION OPTION HELPERS
+// ============================================================================
+
+// Get string option from interaction
+U8 *DiscordInteractionGetString(CDiscordInteraction *interaction, U8 *option_name)
+{
+	I64 i;
+	for (i = 0; i < interaction->data.option_count; i++) {
+		if (StrCmp(interaction->data.options[i].name, option_name) == 0) {
+			return interaction->data.options[i].string_val;
+		}
+	}
+	return NULL;
+}
+
+// Get integer option from interaction
+I64 DiscordInteractionGetInt(CDiscordInteraction *interaction, U8 *option_name)
+{
+	I64 i;
+	for (i = 0; i < interaction->data.option_count; i++) {
+		if (StrCmp(interaction->data.options[i].name, option_name) == 0) {
+			return interaction->data.options[i].int_val;
+		}
+	}
+	return 0;
+}
+
+// Get boolean option from interaction
+Bool DiscordInteractionGetBool(CDiscordInteraction *interaction, U8 *option_name)
+{
+	I64 i;
+	for (i = 0; i < interaction->data.option_count; i++) {
+		if (StrCmp(interaction->data.options[i].name, option_name) == 0) {
+			return interaction->data.options[i].int_val != 0;
+		}
+	}
+	return FALSE;
+}
+
+// Get user/channel/role ID from interaction
+CDiscordSnowflake DiscordInteractionGetSnowflake(CDiscordInteraction *interaction, U8 *option_name)
+{
+	I64 i;
+	for (i = 0; i < interaction->data.option_count; i++) {
+		if (StrCmp(interaction->data.options[i].name, option_name) == 0) {
+			return interaction->data.options[i].snowflake_val;
+		}
+	}
+	return 0;
+}
+
+// Check if option exists
+Bool DiscordInteractionHasOption(CDiscordInteraction *interaction, U8 *option_name)
+{
+	I64 i;
+	for (i = 0; i < interaction->data.option_count; i++) {
+		if (StrCmp(interaction->data.options[i].name, option_name) == 0) {
+			return TRUE;
+		}
+	}
+	return FALSE;
+}
+
+// Get the invoking user (from member or user field)
+CDiscordUser *DiscordInteractionGetUser(CDiscordInteraction *interaction)
+{
+	if (interaction->guild_id > 0) {
+		return &interaction->member.user;
+	}
+	return &interaction->user;
+}
+

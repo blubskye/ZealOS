@@ -1,0 +1,86 @@
+// sys/types.h - System data types for ZealOS libc
+
+#ifndef _SYS_TYPES_H
+#define _SYS_TYPES_H
+
+#include "stddef.h"
+#include "stdint.h"
+
+// Process and user IDs
+typedef I64 pid_t;
+typedef I64 uid_t;
+typedef I64 gid_t;
+
+// File-related types
+typedef I64 off_t;      // File offset
+typedef I64 off64_t;    // 64-bit file offset
+typedef U64 ino_t;      // Inode number
+typedef U64 ino64_t;    // 64-bit inode number
+typedef U64 dev_t;      // Device number
+typedef U32 mode_t;     // File mode/permissions
+typedef U64 nlink_t;    // Link count
+typedef I64 blksize_t;  // Block size
+typedef I64 blkcnt_t;   // Block count
+typedef I64 blkcnt64_t; // 64-bit block count
+
+// Time types
+typedef I64 time_t;     // Time in seconds
+typedef I64 suseconds_t;// Microseconds
+typedef I64 clock_t;    // Clock ticks
+typedef U32 useconds_t; // Microseconds (unsigned)
+
+// Socket types
+typedef U32 socklen_t;
+typedef I64 ssize_t;
+
+// Key types
+typedef I32 key_t;
+
+// ID types
+typedef I64 id_t;
+
+// File descriptor set for select()
+#define FD_SETSIZE 1024
+
+typedef struct {
+    U64 fds_bits[FD_SETSIZE / 64];
+} fd_set;
+
+#define FD_ZERO(set)    MemSet((set), 0, sizeof(fd_set))
+#define FD_SET(fd, set) ((set)->fds_bits[(fd) / 64] |= (1ULL << ((fd) % 64)))
+#define FD_CLR(fd, set) ((set)->fds_bits[(fd) / 64] &= ~(1ULL << ((fd) % 64)))
+#define FD_ISSET(fd, set) (((set)->fds_bits[(fd) / 64] & (1ULL << ((fd) % 64))) != 0)
+
+// Pthread types (stubs for compatibility)
+typedef U64 pthread_t;
+typedef U64 pthread_attr_t;
+typedef U64 pthread_mutex_t;
+typedef U64 pthread_mutexattr_t;
+typedef U64 pthread_cond_t;
+typedef U64 pthread_condattr_t;
+typedef U64 pthread_key_t;
+typedef U64 pthread_once_t;
+typedef U64 pthread_rwlock_t;
+typedef U64 pthread_rwlockattr_t;
+typedef U64 pthread_spinlock_t;
+typedef U64 pthread_barrier_t;
+typedef U64 pthread_barrierattr_t;
+
+// Register type for setjmp/longjmp
+typedef I64 jmp_buf[8];  // Save RBX, RBP, R12-R15, RSP, RIP
+
+// Signal types
+typedef U64 sigset_t;
+typedef I64 sig_atomic_t;
+
+// Locale type
+typedef U64 locale_t;
+
+// Wide character types
+typedef I32 wint_t;
+typedef I32 wctype_t;
+
+// Directory stream
+typedef struct _DIR DIR;
+
+#endif // _SYS_TYPES_H

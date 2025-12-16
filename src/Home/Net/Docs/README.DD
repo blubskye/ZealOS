@@ -1,0 +1,171 @@
+$WW,1$$FG,5$$TX+CX,"ZealOS Network Stack"$$FG$
+$FG,2$$TX+CX,"TLS 1.3, HTTPS, WebSocket, and Discord API"$$FG$
+
+$HD+CX,"Overview"$
+
+This network stack provides TLS 1.3 encrypted communication for ZealOS,
+enabling secure HTTPS requests, WebSocket connections, and Discord bot
+functionality.
+
+$HD+CX,"Architecture"$
+
+$FG,3$Crypto/$FG$      - Cryptographic primitives
+  SHA256.ZC     - SHA-256 hash function
+  SHA512.ZC     - SHA-384/SHA-512 hash functions
+  HMAC.ZC       - HMAC-SHA256/SHA384
+  HKDF.ZC       - HKDF key derivation
+  AES.ZC        - AES-128/256 block cipher
+  GCM.ZC        - Galois/Counter Mode AEAD
+  X25519.ZC     - Curve25519 ECDH
+  Random.ZC     - CSPRNG
+
+$FG,3$TLS/$FG$         - TLS 1.3 protocol
+  TLSRecord.ZC    - Record layer
+  TLSHandshake.ZC - Full handshake
+
+$FG,3$HTTP/$FG$        - HTTP/HTTPS client
+  HTTPClient.ZC   - HTTP/1.1 client
+
+$FG,3$WebSocket/$FG$   - WebSocket client
+  WebSocketClient.ZC - RFC 6455 WebSocket
+
+$FG,3$Discord/$FG$     - Discord API
+  DiscordJSON.ZC   - JSON builder/parser
+  DiscordClient.ZC - Gateway + REST API
+  ExampleBot.ZC    - Example bot
+
+$HD+CX,"Quick Start"$
+
+Load the network stack:
+  #include "C:/Home/Net/MakeNet"
+
+Run crypto tests:
+  SHA256Test();
+  AESTest();
+  GCMTest();
+  X25519Test();
+
+Make an HTTPS request:
+  CHTTPResponse *resp = HTTPGet("https://example.com");
+  if (resp) {
+    "%s\n", resp->body;
+    HTTPResponseFree(resp);
+  }
+
+Run a Discord bot:
+  ExampleBotRun("YOUR_BOT_TOKEN");
+
+$HD+CX,"Discord Bot Example"$
+
+  U0 MyOnReady(CDiscordClient *client, CDiscordUser *user)
+  {
+    "Connected as %s!\n", user->username;
+  }
+
+  U0 MyOnMessage(CDiscordClient *client, CDiscordMessage *msg)
+  {
+    if (msg->author.bot) return;
+
+    if (StrNCmp(msg->content, "!hello", 6) == 0) {
+      DiscordReplyMessage(client, msg, "Hello!");
+    }
+  }
+
+  U0 MyBot(U8 *token)
+  {
+    CDiscordClient *client = DiscordInit(token);
+    DiscordSetIntents(client, DISCORD_INTENTS_DEFAULT |
+                              DISCORD_INTENT_MESSAGE_CONTENT);
+    DiscordOnReady(client, &MyOnReady);
+    DiscordOnMessage(client, &MyOnMessage);
+    DiscordRun(client);
+    DiscordCleanup(client);
+  }
+
+$HD+CX,"Supported Features"$
+
+$FG,2$Crypto:$FG$
+- SHA-256, SHA-384, SHA-512
+- HMAC-SHA256, HMAC-SHA384
+- HKDF (RFC 5869)
+- AES-128-GCM, AES-256-GCM
+- X25519 ECDH
+- CSPRNG (SHA-256 based)
+
+$FG,2$TLS 1.3:$FG$
+- Full handshake
+- X25519 key exchange
+- AES-128-GCM cipher suite
+- SNI extension
+- Encrypted records
+
+$FG,2$HTTP:$FG$
+- HTTP/1.1 over TLS
+- GET, POST, PUT, DELETE
+- Chunked encoding
+- Keep-alive connections
+
+$FG,2$WebSocket:$FG$
+- RFC 6455 compliant
+- WSS (secure WebSocket)
+- Text and binary frames
+- Ping/pong handling
+- Fragmentation support
+
+$FG,2$Discord:$FG$
+- Gateway WebSocket connection
+- Heartbeat handling
+- Event dispatch (READY, MESSAGE_CREATE)
+- REST API for sending messages
+- Auto-reconnect
+
+$HD+CX,"Limitations"$
+
+- No certificate validation (trusts all servers)
+- Single cipher suite (AES-128-GCM-SHA256)
+- No client certificates
+- No session resumption (PSK)
+- Minimal Discord API coverage
+- Not thread-safe
+
+$HD+CX,"Files"$
+
+C:/Home/Net/
+  MakeNet.ZC           - Master loader
+  Docs/
+    TLSDesign.DD       - Design document
+    README.DD          - This file
+  Crypto/
+    Crypto.HH          - Definitions
+    MakeCrypto.ZC      - Loader
+    SHA256.ZC          - SHA-256
+    SHA512.ZC          - SHA-384/512
+    HMAC.ZC            - HMAC
+    HKDF.ZC            - HKDF
+    AES.ZC             - AES
+    GCM.ZC             - AES-GCM
+    X25519.ZC          - Curve25519
+    Random.ZC          - CSPRNG
+  TLS/
+    TLS.HH             - Definitions
+    MakeTLS.ZC         - Loader
+    TLSRecord.ZC       - Record layer
+    TLSHandshake.ZC    - Handshake
+  HTTP/
+    HTTP.HH            - Definitions
+    MakeHTTP.ZC        - Loader
+    HTTPClient.ZC      - Client
+  WebSocket/
+    WebSocket.HH       - Definitions
+    MakeWebSocket.ZC   - Loader
+    WebSocketClient.ZC - Client
+  Discord/
+    Discord.HH         - Definitions
+    MakeDiscord.ZC     - Loader
+    DiscordJSON.ZC     - JSON handling
+    DiscordClient.ZC   - Client
+    ExampleBot.ZC      - Example
+
+$HD+CX,"Author"$
+
+Created with Claude Code for ZealOS Discord integration.

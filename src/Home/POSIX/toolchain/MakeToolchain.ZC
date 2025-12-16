@@ -1,0 +1,100 @@
+// MakeToolchain.ZC - ZealOS C Toolchain Loader
+// Part of the POSIX compatibility layer
+//
+// This file loads and initializes the complete C toolchain for ZealOS.
+
+Cd(__DIR__);;
+
+// ============================================================================
+// DEPENDENCIES
+// ============================================================================
+
+// Make sure POSIX layer and libc are loaded
+Cd("..");;
+#include "MakePOSIX"
+Cd("libc");;
+#include "MakeLibc"
+Cd("../toolchain");;
+
+// ============================================================================
+// TOOLCHAIN COMPONENTS
+// ============================================================================
+
+// TCC headers and OS interface
+#include "TCC.HH"
+#include "TCC_OS.ZC"
+
+// ELF loader
+#include "ELF.HH"
+#include "ELFLoader.ZC"
+
+// Dynamic linker
+#include "DynLink.HH"
+#include "DynLink.ZC"
+#include "LibStubs.ZC"
+
+// TCC driver
+#include "tcc.ZC"
+
+// ============================================================================
+// COMMAND REGISTRATION
+// ============================================================================
+
+// Register commands with the shell
+U0 ToolchainRegisterCommands()
+{
+    extern U0 PosixRegisterCommand(U8 *name, I64 (*main_func)(I64, U8**));
+
+    // Compiler commands
+    PosixRegisterCommand("tcc", &tcc_main);
+    PosixRegisterCommand("cc", &cc_main);
+    PosixRegisterCommand("gcc", &gcc_main);
+
+    // Note: In a full implementation, we would also register:
+    // - ld (linker)
+    // - as (assembler)
+    // - ar (archiver)
+    // - nm (symbol table viewer)
+    // - objdump (object file dumper)
+    // - strip (symbol stripper)
+}
+
+// ============================================================================
+// TOOLCHAIN INITIALIZATION
+// ============================================================================
+
+U0 ToolchainInit()
+{
+    // Create necessary directories
+    mkdir("/Home/POSIX/toolchain/tcc/include", 0755);
+    mkdir("/Home/POSIX/toolchain/tcc/lib", 0755);
+    mkdir("/Home/POSIX/lib", 0755);
+    mkdir("/Home/POSIX/include", 0755);
+
+    // Register commands
+    ToolchainRegisterCommands();
+
+    "\n";
+    "============================================================\n";
+    "ZealOS C Toolchain Loaded\n";
+    "============================================================\n";
+    "\n";
+    "Available commands:\n";
+    "  tcc [options] file.c      - Compile C source file\n";
+    "  tcc -run file.c [args]    - Compile and run C program\n";
+    "  cc, gcc                   - Aliases for tcc\n";
+    "\n";
+    "ELF Binary Support:\n";
+    "  ELFRun(\"program\", argc, argv) - Run static ELF binary\n";
+    "  DynRun(\"program\", argc, argv) - Run dynamic ELF binary\n";
+    "\n";
+    "Dynamic Linking API:\n";
+    "  dlopen(\"lib.so\", flags)   - Load shared library\n";
+    "  dlsym(handle, \"symbol\")   - Get symbol address\n";
+    "  dlclose(handle)           - Unload library\n";
+    "  dlerror()                 - Get error message\n";
+    "\n";
+}
+
+// Call initialization
+ToolchainInit();

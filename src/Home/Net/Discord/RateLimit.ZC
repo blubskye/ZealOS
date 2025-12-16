@@ -1,0 +1,489 @@
+// RateLimit.ZC - Discord Rate Limiting Implementation for ZealOS
+// Part of ZealOS Discord implementation
+// Implements per-route rate limit tracking with automatic retry
+
+// ============================================================================
+// RATE LIMITER INITIALIZATION
+// ============================================================================
+
+// Initialize a rate limiter
+U0 RateLimiterInit(CRateLimiter *rl)
+{
+	MemSet(rl, 0, sizeof(CRateLimiter));
+}
+
+// Free rate limiter resources
+U0 RateLimiterFree(CRateLimiter *rl)
+{
+	// Nothing to free currently - all inline storage
+	MemSet(rl, 0, sizeof(CRateLimiter));
+}
+
+// ============================================================================
+// CURRENT TIME HELPER
+// ============================================================================
+
+// Get current time in milliseconds
+U64 RateLimitNowMs()
+{
+	// tS is seconds since boot in ZealOS
+	return tS * 1000;
+}
+
+// ============================================================================
+// ROUTE PATTERN GENERATION
+// ============================================================================
+
+// Generate route pattern from endpoint
+// This normalizes endpoints to match Discord's rate limit buckets
+// e.g., "/channels/123456789/messages" -> "/channels/{channel_id}/messages"
+U0 RateLimitMakePattern(U8 *endpoint, U8 *pattern_out)
+{
+	U8 *src = endpoint;
+	U8 *dst = pattern_out;
+	I64 segment_start = 0;
+	Bool in_number = FALSE;
+
+	while (*src) {
+		if (*src == '/') {
+			// End of segment
+			if (in_number) {
+				// Replace number segment with placeholder
+				// Check what type of ID this is based on previous segment
+				// Back up to find previous /
+				U8 *check = dst - 1;
+				while (check > pattern_out && *check != '/') check--;
+				if (check > pattern_out) check++;
+
+				if (StrNCmp(check, "channels", 8) == 0) {
+					StrCpy(dst, "{channel_id}");
+					dst += 12;
+				} else if (StrNCmp(check, "guilds", 6) == 0) {
+					StrCpy(dst, "{guild_id}");
+					dst += 10;
+				} else if (StrNCmp(check, "webhooks", 8) == 0) {
+					StrCpy(dst, "{webhook_id}");
+					dst += 12;
+				} else if (StrNCmp(check, "messages", 8) == 0) {
+					StrCpy(dst, "{message_id}");
+					dst += 12;
+				} else if (StrNCmp(check, "users", 5) == 0) {
+					StrCpy(dst, "{user_id}");
+					dst += 9;
+				} else if (StrNCmp(check, "roles", 5) == 0) {
+					StrCpy(dst, "{role_id}");
+					dst += 9;
+				} else {
+					// Generic ID
+					StrCpy(dst, "{id}");
+					dst += 4;
+				}
+				in_number = FALSE;
+			}
+			*dst++ = *src++;
+		} else if (*src >= '0' && *src <= '9') {
+			// Start or continue number segment
+			if (!in_number) {
+				in_number = TRUE;
+				// Mark where pattern should go
+			}
+			src++;  // Skip digit
+		} else {
+			// Regular character
+			in_number = FALSE;
+			*dst++ = *src++;
+		}
+	}
+
+	// Handle trailing number segment
+	if (in_number) {
+		StrCpy(dst, "{id}");
+		dst += 4;
+	}
+
+	*dst = 0;
+}
+
+// Generate route key for bucket lookup (includes method)
+U0 RateLimitMakeKey(U8 *method, U8 *endpoint, U8 *key_out)
+{
+	U8 pattern[RATELIMIT_MAX_ROUTE_LEN];
+	RateLimitMakePattern(endpoint, pattern);
+	StrPrint(key_out, "%s:%s", method, pattern);
+}
+
+// ============================================================================
+// BUCKET MANAGEMENT
+// ============================================================================
+
+// Find bucket by route pattern
+CRateLimitBucket *RateLimitFindBucket(CRateLimiter *rl, U8 *route_key)
+{
+	I64 i;
+	for (i = 0; i < rl->bucket_count; i++) {
+		if (rl->buckets[i].active &&
+		    StrCmp(rl->buckets[i].route, route_key) == 0) {
+			return &rl->buckets[i];
+		}
+	}
+	return NULL;
+}
+
+// Find bucket by Discord bucket hash
+CRateLimitBucket *RateLimitFindBucketByHash(CRateLimiter *rl, U8 *hash)
+{
+	I64 i;
+	for (i = 0; i < rl->bucket_count; i++) {
+		if (rl->buckets[i].active &&
+		    StrCmp(rl->buckets[i].hash, hash) == 0) {
+			return &rl->buckets[i];
+		}
+	}
+	return NULL;
+}
+
+// Create or get bucket for a route
+CRateLimitBucket *RateLimitGetBucket(CRateLimiter *rl, U8 *route_key)
+{
+	CRateLimitBucket *bucket = RateLimitFindBucket(rl, route_key);
+
+	if (bucket) return bucket;
+
+	// Find empty slot
+	I64 i;
+	for (i = 0; i < RATELIMIT_MAX_BUCKETS; i++) {
+		if (!rl->buckets[i].active) {
+			bucket = &rl->buckets[i];
+			MemSet(bucket, 0, sizeof(CRateLimitBucket));
+			bucket->active = TRUE;
+			StrNCpy(bucket->route, route_key, RATELIMIT_MAX_ROUTE_LEN - 1);
+			bucket->remaining = -1;  // Unknown
+			rl->bucket_count++;
+			return bucket;
+		}
+	}
+
+	// No space - reuse oldest bucket (LRU would be better)
+	bucket = &rl->buckets[0];
+	MemSet(bucket, 0, sizeof(CRateLimitBucket));
+	bucket->active = TRUE;
+	StrNCpy(bucket->route, route_key, RATELIMIT_MAX_ROUTE_LEN - 1);
+	bucket->remaining = -1;
+	return bucket;
+}
+
+// ============================================================================
+// RATE LIMIT CHECKING
+// ============================================================================
+
+// Check if request should wait before proceeding
+// Returns milliseconds to wait (0 if can proceed immediately)
+I64 RateLimitCheck(CRateLimiter *rl, U8 *method, U8 *endpoint)
+{
+	U8 route_key[RATELIMIT_MAX_ROUTE_LEN];
+	U64 now = RateLimitNowMs();
+
+	// Check global rate limit first
+	if (rl->global_limited) {
+		if (now < rl->global_reset) {
+			return rl->global_reset - now;
+		}
+		rl->global_limited = FALSE;
+	}
+
+	// Generate route key
+	RateLimitMakeKey(method, endpoint, route_key);
+
+	// Find bucket
+	CRateLimitBucket *bucket = RateLimitFindBucket(rl, route_key);
+
+	if (!bucket) {
+		// No bucket = no known limit, proceed
+		return 0;
+	}
+
+	// Check if bucket reset time has passed
+	if (bucket->reset_at > 0 && now >= bucket->reset_at) {
+		// Bucket has reset
+		bucket->remaining = bucket->limit;
+		return 0;
+	}
+
+	// Check remaining
+	if (bucket->remaining == 0) {
+		// No remaining requests, must wait
+		if (bucket->reset_at > now) {
+			return bucket->reset_at - now;
+		}
+		// Reset time passed or unknown
+		bucket->remaining = -1;  // Unknown
+		return 0;
+	}
+
+	// Have remaining requests or unknown
+	return 0;
+}
+
+// Wait for rate limit to allow request
+U0 RateLimitWait(CRateLimiter *rl, U8 *method, U8 *endpoint)
+{
+	I64 wait_ms = RateLimitCheck(rl, method, endpoint);
+
+	if (wait_ms > 0) {
+		// Add small buffer to avoid edge cases
+		wait_ms += 50;
+		Sleep(wait_ms);
+	}
+}
+
+// ============================================================================
+// HTTP HEADER PARSING
+// ============================================================================
+
+// Parse rate limit headers from HTTP response
+// Headers:
+//   X-RateLimit-Limit: total requests allowed
+//   X-RateLimit-Remaining: remaining requests
+//   X-RateLimit-Reset: absolute reset time (unix timestamp)
+//   X-RateLimit-Reset-After: seconds until reset
+//   X-RateLimit-Bucket: bucket identifier hash
+//   X-RateLimit-Global: true if global rate limit
+//   Retry-After: seconds to wait (on 429)
+U0 RateLimitUpdate(CRateLimiter *rl, U8 *method, U8 *endpoint, CHTTPResponse *resp)
+{
+	U8 route_key[RATELIMIT_MAX_ROUTE_LEN];
+	U8 *header_val;
+	CRateLimitBucket *bucket;
+	U64 now = RateLimitNowMs();
+
+	if (!resp) return;
+
+	// Check for global rate limit
+	header_val = HTTPResponseGetHeader(resp, "X-RateLimit-Global");
+	if (header_val && StrCmp(header_val, "true") == 0) {
+		rl->global_limited = TRUE;
+
+		// Get retry time
+		header_val = HTTPResponseGetHeader(resp, "Retry-After");
+		if (header_val) {
+			I64 retry_after = Str2I64(header_val);
+			rl->global_reset = now + (retry_after * 1000);
+		} else {
+			rl->global_reset = now + RATELIMIT_GLOBAL_WAIT_MS;
+		}
+		return;
+	}
+
+	// Generate route key
+	RateLimitMakeKey(method, endpoint, route_key);
+
+	// Get or create bucket
+	bucket = RateLimitGetBucket(rl, route_key);
+
+	// Update bucket hash if provided
+	header_val = HTTPResponseGetHeader(resp, "X-RateLimit-Bucket");
+	if (header_val) {
+		StrNCpy(bucket->hash, header_val, RATELIMIT_BUCKET_HASH_LEN - 1);
+	}
+
+	// Update limit
+	header_val = HTTPResponseGetHeader(resp, "X-RateLimit-Limit");
+	if (header_val) {
+		bucket->limit = Str2I64(header_val);
+	}
+
+	// Update remaining
+	header_val = HTTPResponseGetHeader(resp, "X-RateLimit-Remaining");
+	if (header_val) {
+		bucket->remaining = Str2I64(header_val);
+	}
+
+	// Update reset time
+	header_val = HTTPResponseGetHeader(resp, "X-RateLimit-Reset-After");
+	if (header_val) {
+		// Reset-After is in seconds with decimal
+		// Parse integer part and add 1 second buffer for safety
+		I64 reset_seconds = Str2I64(header_val);
+		bucket->reset_after = (reset_seconds + 1) * 1000;
+		bucket->reset_at = now + bucket->reset_after;
+	} else {
+		header_val = HTTPResponseGetHeader(resp, "X-RateLimit-Reset");
+		if (header_val) {
+			// Unix timestamp in seconds
+			U64 reset_unix = Str2I64(header_val);
+			// Convert to our time base (this is approximate)
+			// Note: ZealOS tS is seconds since boot, not epoch
+			// We need relative timing so use reset-after if available
+			bucket->reset_at = now + 1000;  // Default 1 second
+		}
+	}
+
+	// Handle 429 response specifically
+	if (resp->status_code == 429) {
+		header_val = HTTPResponseGetHeader(resp, "Retry-After");
+		if (header_val) {
+			I64 retry_after = Str2I64(header_val);
+			bucket->reset_at = now + (retry_after * 1000);
+			bucket->remaining = 0;
+		}
+	}
+}
+
+// ============================================================================
+// PRE-REQUEST DECREMENT
+// ============================================================================
+
+// Decrement remaining count before making a request
+U0 RateLimitPreRequest(CRateLimiter *rl, U8 *method, U8 *endpoint)
+{
+	U8 route_key[RATELIMIT_MAX_ROUTE_LEN];
+
+	RateLimitMakeKey(method, endpoint, route_key);
+	CRateLimitBucket *bucket = RateLimitFindBucket(rl, route_key);
+
+	if (bucket && bucket->remaining > 0) {
+		bucket->remaining--;
+	}
+
+	rl->last_request = RateLimitNowMs();
+}
+
+// ============================================================================
+// RATE LIMITED REQUEST WRAPPER
+// ============================================================================
+
+// Make a request with automatic rate limit handling
+// Returns response, handles 429 with automatic retry
+CHTTPResponse *RateLimitRequest(
+	CRateLimiter *rl,
+	CHTTPClient *http,
+	I64 method,
+	U8 *url,
+	U8 *auth_header,
+	U8 *body)
+{
+	CHTTPRequest *req;
+	CHTTPResponse *resp = NULL;
+	I64 retries = 0;
+	U8 method_str[8];
+	U8 *endpoint;
+
+	// Get method string for rate limit key
+	switch (method) {
+		case HTTP_METHOD_GET:     StrCpy(method_str, "GET"); break;
+		case HTTP_METHOD_POST:    StrCpy(method_str, "POST"); break;
+		case HTTP_METHOD_PUT:     StrCpy(method_str, "PUT"); break;
+		case HTTP_METHOD_DELETE:  StrCpy(method_str, "DELETE"); break;
+		case HTTP_METHOD_PATCH:   StrCpy(method_str, "PATCH"); break;
+		default:                  StrCpy(method_str, "GET"); break;
+	}
+
+	// Extract endpoint from URL (after discord.com/api/v10)
+	endpoint = StrStr(url, "/api/v");
+	if (endpoint) {
+		// Skip /api/vXX
+		endpoint = StrStr(endpoint + 6, "/");
+		if (!endpoint) endpoint = url;
+	} else {
+		endpoint = url;
+	}
+
+	while (retries < RATELIMIT_MAX_RETRIES) {
+		// Wait for rate limit
+		RateLimitWait(rl, method_str, endpoint);
+
+		// Decrement remaining
+		RateLimitPreRequest(rl, method_str, endpoint);
+
+		// Create request
+		req = HTTPRequestNew(method, url);
+		if (!req) return NULL;
+
+		// Add headers
+		if (auth_header) {
+			HTTPRequestAddHeader(req, "Authorization", auth_header);
+		}
+		HTTPRequestAddHeader(req, "Content-Type", "application/json");
+		HTTPRequestAddHeader(req, "User-Agent", "DiscordBot (ZealOS, 1.0)");
+
+		if (body) {
+			HTTPRequestSetBody(req, body, StrLen(body));
+		}
+
+		// Make request
+		resp = HTTPRequest(http, req);
+		HTTPRequestFree(req);
+
+		if (!resp) return NULL;
+
+		// Update rate limit info from response headers
+		RateLimitUpdate(rl, method_str, endpoint, resp);
+
+		// Check for 429
+		if (resp->status_code == 429) {
+			// Rate limited - free response and retry
+			HTTPResponseFree(resp);
+			resp = NULL;
+			retries++;
+
+			// Wait will happen at top of loop
+			continue;
+		}
+
+		// Success or other error
+		break;
+	}
+
+	return resp;
+}
+
+// ============================================================================
+// DEBUG / STATUS
+// ============================================================================
+
+// Print rate limiter status
+U0 RateLimiterPrint(CRateLimiter *rl)
+{
+	I64 i;
+	U64 now = RateLimitNowMs();
+
+	"=== Rate Limiter Status ===\n";
+	"Global limited: %s\n", rl->global_limited ? "YES" : "no";
+	if (rl->global_limited && rl->global_reset > now) {
+		"  Reset in: %d ms\n", rl->global_reset - now;
+	}
+
+	"Buckets: %d\n", rl->bucket_count;
+
+	for (i = 0; i < RATELIMIT_MAX_BUCKETS; i++) {
+		if (rl->buckets[i].active) {
+			CRateLimitBucket *b = &rl->buckets[i];
+			"  [%d] %s\n", i, b->route;
+			"       hash: %s\n", b->hash[0] ? b->hash : "(none)";
+			"       limit: %d, remaining: %d\n", b->limit, b->remaining;
+			if (b->reset_at > now) {
+				"       reset in: %d ms\n", b->reset_at - now;
+			}
+		}
+	}
+	"\n";
+}
+
+// Check if currently rate limited (either global or specific route)
+Bool RateLimitIsLimited(CRateLimiter *rl, U8 *method, U8 *endpoint)
+{
+	return RateLimitCheck(rl, method, endpoint) > 0;
+}
+
+// Get remaining requests for a route (-1 if unknown)
+I64 RateLimitGetRemaining(CRateLimiter *rl, U8 *method, U8 *endpoint)
+{
+	U8 route_key[RATELIMIT_MAX_ROUTE_LEN];
+	RateLimitMakeKey(method, endpoint, route_key);
+
+	CRateLimitBucket *bucket = RateLimitFindBucket(rl, route_key);
+	if (!bucket) return -1;
+
+	return bucket->remaining;
+}
+

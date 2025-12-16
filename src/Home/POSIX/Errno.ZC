@@ -1,0 +1,106 @@
+// Errno.ZC - POSIX Error Handling for ZealOS
+// Part of ZealOS POSIX compatibility layer
+
+// ============================================================================
+// GLOBAL ERRNO
+// ============================================================================
+
+// Per-task errno storage
+// In a full implementation, this would use task-local storage
+I64 posix_errno = 0;
+
+// ============================================================================
+// ERROR STRING TABLE
+// ============================================================================
+
+U8 *posix_error_strings[128] = {
+	"Success",                          // 0
+	"Operation not permitted",          // EPERM
+	"No such file or directory",        // ENOENT
+	"No such process",                  // ESRCH
+	"Interrupted system call",          // EINTR
+	"I/O error",                        // EIO
+	"No such device or address",        // ENXIO
+	"Argument list too long",           // E2BIG
+	"Exec format error",                // ENOEXEC
+	"Bad file descriptor",              // EBADF
+	"No child processes",               // ECHILD
+	"Try again",                        // EAGAIN
+	"Out of memory",                    // ENOMEM
+	"Permission denied",                // EACCES
+	"Bad address",                      // EFAULT
+	"Block device required",            // ENOTBLK
+	"Device or resource busy",          // EBUSY
+	"File exists",                      // EEXIST
+	"Cross-device link",                // EXDEV
+	"No such device",                   // ENODEV
+	"Not a directory",                  // ENOTDIR
+	"Is a directory",                   // EISDIR
+	"Invalid argument",                 // EINVAL
+	"File table overflow",              // ENFILE
+	"Too many open files",              // EMFILE
+	"Not a typewriter",                 // ENOTTY
+	"Text file busy",                   // ETXTBSY
+	"File too large",                   // EFBIG
+	"No space left on device",          // ENOSPC
+	"Illegal seek",                     // ESPIPE
+	"Read-only file system",            // EROFS
+	"Too many links",                   // EMLINK
+	"Broken pipe",                      // EPIPE
+	"Math argument out of domain",      // EDOM
+	"Math result not representable",    // ERANGE
+	"Resource deadlock would occur",    // EDEADLK
+	"File name too long",               // ENAMETOOLONG
+	"No record locks available",        // ENOLCK
+	"Function not implemented",         // ENOSYS
+	"Directory not empty",              // ENOTEMPTY
+	"Too many symbolic links",          // ELOOP
+	NULL,                               // 41
+	"No message of desired type",       // ENOMSG
+	"Identifier removed",               // EIDRM
+};
+
+// ============================================================================
+// ERROR FUNCTIONS
+// ============================================================================
+
+// Set errno and return -1
+I64 PosixSetErrno(I64 err)
+{
+	posix_errno = err;
+	return -1;
+}
+
+// Get error string
+U8 *PosixStrerror(I64 errnum)
+{
+	if (errnum < 0 || errnum >= 128)
+		return "Unknown error";
+
+	if (posix_error_strings[errnum])
+		return posix_error_strings[errnum];
+
+	// Handle high errno values
+	switch (errnum) {
+		case ENOTSOCK:      return "Socket operation on non-socket";
+		case ECONNRESET:    return "Connection reset by peer";
+		case ENOBUFS:       return "No buffer space available";
+		case EISCONN:       return "Transport endpoint is connected";
+		case ENOTCONN:      return "Transport endpoint is not connected";
+		case ETIMEDOUT:     return "Connection timed out";
+		case ECONNREFUSED:  return "Connection refused";
+		case EINPROGRESS:   return "Operation now in progress";
+		default:            return "Unknown error";
+	}
+}
+
+// Print error message
+U0 PosixPerror(U8 *s)
+{
+	if (s && *s) {
+		"%s: %s\n", s, PosixStrerror(posix_errno);
+	} else {
+		"%s\n", PosixStrerror(posix_errno);
+	}
+}
+

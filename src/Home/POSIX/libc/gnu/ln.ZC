@@ -1,0 +1,227 @@
+// ln.ZC - GNU coreutils 'ln' implementation
+// Make links between files
+
+// C-style main function
+I64 ln_main(I64 argc, U8 **argv)
+{
+    Bool symbolic = FALSE;      // -s
+    Bool force = FALSE;         // -f
+    Bool interactive = FALSE;   // -i
+    Bool verbose = FALSE;       // -v
+    Bool no_dereference = FALSE; // -n
+    Bool relative = FALSE;      // -r
+    I64 start = 1;
+
+    // Parse options
+    while (start < argc && argv[start][0] == '-' && argv[start][1]) {
+        U8 *arg = argv[start];
+
+        if (strcmp(arg, "--help") == 0) {
+            printf("Usage: ln [OPTION]... TARGET... LINK_NAME\n");
+            printf("  or:  ln [OPTION]... TARGET\n");
+            printf("  or:  ln [OPTION]... TARGET... DIRECTORY\n");
+            printf("Create links to TARGET.\n\n");
+            printf("  -s, --symbolic          make symbolic links instead of hard links\n");
+            printf("  -f, --force             remove existing destination files\n");
+            printf("  -i, --interactive       prompt whether to remove destinations\n");
+            printf("  -n, --no-dereference    treat LINK_NAME as a normal file if\n");
+            printf("                          it is a symbolic link to a directory\n");
+            printf("  -r, --relative          create symbolic links relative to link location\n");
+            printf("  -v, --verbose           print name of each linked file\n");
+            printf("      --help              display this help and exit\n");
+            printf("      --version           output version information and exit\n");
+            return 0;
+        }
+
+        if (strcmp(arg, "--version") == 0) {
+            printf("ln (ZealOS coreutils) 1.0\n");
+            return 0;
+        }
+
+        if (strcmp(arg, "-s") == 0 || strcmp(arg, "--symbolic") == 0) {
+            symbolic = TRUE;
+            start++;
+            continue;
+        }
+
+        if (strcmp(arg, "-f") == 0 || strcmp(arg, "--force") == 0) {
+            force = TRUE;
+            interactive = FALSE;
+            start++;
+            continue;
+        }
+
+        if (strcmp(arg, "-i") == 0 || strcmp(arg, "--interactive") == 0) {
+            interactive = TRUE;
+            force = FALSE;
+            start++;
+            continue;
+        }
+
+        if (strcmp(arg, "-n") == 0 || strcmp(arg, "--no-dereference") == 0) {
+            no_dereference = TRUE;
+            start++;
+            continue;
+        }
+
+        if (strcmp(arg, "-r") == 0 || strcmp(arg, "--relative") == 0) {
+            relative = TRUE;
+            start++;
+            continue;
+        }
+
+        if (strcmp(arg, "-v") == 0 || strcmp(arg, "--verbose") == 0) {
+            verbose = TRUE;
+            start++;
+            continue;
+        }
+
+        // Combined short options
+        if (arg[0] == '-' && arg[1] != '-') {
+            for (I64 i = 1; arg[i]; i++) {
+                switch (arg[i]) {
+                    case 's': symbolic = TRUE; break;
+                    case 'f': force = TRUE; interactive = FALSE; break;
+                    case 'i': interactive = TRUE; force = FALSE; break;
+                    case 'n': no_dereference = TRUE; break;
+                    case 'r': relative = TRUE; break;
+                    case 'v': verbose = TRUE; break;
+                    default:
+                        fprintf(stderr, "ln: invalid option -- '%c'\n", arg[i]);
+                        return 1;
+                }
+            }
+            start++;
+            continue;
+        }
+
+        if (strcmp(arg, "--") == 0) {
+            start++;
+            break;
+        }
+
+        break;
+    }
+
+    I64 num_args = argc - start;
+    if (num_args < 1) {
+        fprintf(stderr, "ln: missing file operand\n");
+        return 1;
+    }
+
+    I64 exit_status = 0;
+
+    // Helper to create a single link
+    auto make_link = [](U8 *target, U8 *link_name, Bool symbolic, Bool force,
+                        Bool interactive, Bool verbose) -> I64 {
+        CPosixStat st;
+
+        // Check if link_name exists
+        if (PosixLstat(link_name, &st) == 0) {
+            if (interactive && !force) {
+                printf("ln: replace '%s'? ", link_name);
+                I64 c = getchar();
+                I64 response = c;
+                while (c != '\n' && c != EOF)
+                    c = getchar();
+                if (response != 'y' && response != 'Y')
+                    return 0;
+            }
+            if (force || interactive) {
+                if (PosixUnlink(link_name) < 0) {
+                    fprintf(stderr, "ln: cannot remove '%s': %s\n",
+                            link_name, strerror(errno));
+                    return -1;
+                }
+            } else {
+                fprintf(stderr, "ln: failed to create %s link '%s': File exists\n",
+                        symbolic ? "symbolic" : "hard", link_name);
+                return -1;
+            }
+        }
+
+        // Create the link
+        I64 result;
+        if (symbolic) {
+            result = PosixSymlink(target, link_name);
+        } else {
+            result = PosixLink(target, link_name);
+        }
+
+        if (result < 0) {
+            fprintf(stderr, "ln: failed to create %s link '%s' -> '%s': %s\n",
+                    symbolic ? "symbolic" : "hard", link_name, target,
+                    strerror(errno));
+            return -1;
+        }
+
+        if (verbose) {
+            printf("'%s' -> '%s'\n", link_name, target);
+        }
+
+        return 0;
+    };
+
+    if (num_args == 1) {
+        // ln TARGET - create link in current directory
+        U8 *target = argv[start];
+        U8 *base = strrchr(target, '/');
+        base = base ? base + 1 : target;
+
+        if (make_link(target, base, symbolic, force, interactive, verbose) < 0)
+            exit_status = 1;
+    } else if (num_args == 2) {
+        // ln TARGET LINK_NAME or ln TARGET DIRECTORY
+        U8 *target = argv[start];
+        U8 *dest = argv[start + 1];
+        CPosixStat dest_stat;
+        Bool dest_is_dir = FALSE;
+
+        if (!no_dereference) {
+            dest_is_dir = (PosixStat(dest, &dest_stat) == 0 &&
+                          S_ISDIR(dest_stat.st_mode));
+        } else {
+            dest_is_dir = (PosixLstat(dest, &dest_stat) == 0 &&
+                          S_ISDIR(dest_stat.st_mode));
+        }
+
+        if (dest_is_dir) {
+            U8 link_path[PATH_MAX];
+            U8 *base = strrchr(target, '/');
+            base = base ? base + 1 : target;
+            snprintf(link_path, PATH_MAX, "%s/%s", dest, base);
+            if (make_link(target, link_path, symbolic, force, interactive, verbose) < 0)
+                exit_status = 1;
+        } else {
+            if (make_link(target, dest, symbolic, force, interactive, verbose) < 0)
+                exit_status = 1;
+        }
+    } else {
+        // Multiple targets - last arg must be directory
+        U8 *dest = argv[argc - 1];
+        CPosixStat dest_stat;
+
+        if (PosixStat(dest, &dest_stat) < 0 || !S_ISDIR(dest_stat.st_mode)) {
+            fprintf(stderr, "ln: target '%s' is not a directory\n", dest);
+            return 1;
+        }
+
+        for (I64 i = start; i < argc - 1; i++) {
+            U8 *target = argv[i];
+            U8 link_path[PATH_MAX];
+            U8 *base = strrchr(target, '/');
+            base = base ? base + 1 : target;
+            snprintf(link_path, PATH_MAX, "%s/%s", dest, base);
+
+            if (make_link(target, link_path, symbolic, force, interactive, verbose) < 0)
+                exit_status = 1;
+        }
+    }
+
+    return exit_status;
+}
+
+U0 GnuLnRegister()
+{
+    "GNU 'ln' utility loaded.\n";
+}

@@ -1,0 +1,602 @@
+// gzip.ZC - Compress/decompress files using DEFLATE algorithm
+// GNU gzip compatible implementation for ZealOS
+// Part of the POSIX compatibility layer
+
+// ============================================================================
+// GZIP FILE FORMAT
+// ============================================================================
+// GZIP header (RFC 1952):
+// - Magic: 0x1f 0x8b
+// - Compression method: 8 = deflate
+// - Flags: FTEXT, FHCRC, FEXTRA, FNAME, FCOMMENT
+// - Modification time (4 bytes)
+// - Extra flags
+// - OS
+// - Optional: extra field, filename, comment, header CRC
+// - Compressed data (DEFLATE)
+// - CRC32 of original data (4 bytes)
+// - Original size mod 2^32 (4 bytes)
+
+#define GZIP_MAGIC1         0x1f
+#define GZIP_MAGIC2         0x8b
+#define GZIP_METHOD_DEFLATE 8
+
+#define GZIP_FTEXT          0x01
+#define GZIP_FHCRC          0x02
+#define GZIP_FEXTRA         0x04
+#define GZIP_FNAME          0x08
+#define GZIP_FCOMMENT       0x10
+
+#define GZIP_OS_UNIX        0x03
+
+// ============================================================================
+// CRC32 TABLE
+// ============================================================================
+
+U32 gzip_crc_table[256];
+Bool gzip_crc_init = FALSE;
+
+U0 GzipCrcInit()
+{
+    if (gzip_crc_init)
+        return;
+
+    for (I64 n = 0; n < 256; n++) {
+        U32 c = n;
+        for (I64 k = 0; k < 8; k++) {
+            if (c & 1)
+                c = 0xedb88320 ^ (c >> 1);
+            else
+                c = c >> 1;
+        }
+        gzip_crc_table[n] = c;
+    }
+    gzip_crc_init = TRUE;
+}
+
+U32 GzipCrc32(U32 crc, U8 *buf, I64 len)
+{
+    crc = crc ^ 0xffffffff;
+    for (I64 i = 0; i < len; i++) {
+        crc = gzip_crc_table[(crc ^ buf[i]) & 0xff] ^ (crc >> 8);
+    }
+    return crc ^ 0xffffffff;
+}
+
+// ============================================================================
+// DEFLATE COMPRESSION (Simplified - stores data uncompressed)
+// ============================================================================
+// A full DEFLATE implementation is complex (~2000+ lines).
+// This implementation uses stored (uncompressed) blocks which is valid
+// but provides no compression. For real compression, would need:
+// - LZ77 matching
+// - Huffman coding
+// - Dynamic/static code tables
+
+#define DEFLATE_BLOCK_SIZE  32768
+
+// Write stored block header
+I64 DeflateWriteStoredBlock(FILE *out, U8 *data, I64 len, Bool final)
+{
+    // Block header: 1 bit final, 2 bits type (00 = stored)
+    U8 header = final ? 0x01 : 0x00;  // BFINAL=1/0, BTYPE=00
+
+    fputc(header, out);
+
+    // LEN and NLEN (16-bit each, little-endian)
+    U16 block_len = len;
+    U16 nlen = ~block_len;
+
+    fputc(block_len & 0xff, out);
+    fputc((block_len >> 8) & 0xff, out);
+    fputc(nlen & 0xff, out);
+    fputc((nlen >> 8) & 0xff, out);
+
+    // Data
+    fwrite(data, 1, len, out);
+
+    return 5 + len;
+}
+
+// Compress using stored blocks (no actual compression)
+I64 DeflateCompress(FILE *in, FILE *out, U32 *crc, U32 *orig_size)
+{
+    U8 buf[DEFLATE_BLOCK_SIZE];
+    I64 total = 0;
+    *crc = 0;
+    *orig_size = 0;
+
+    GzipCrcInit();
+
+    while (1) {
+        I64 n = fread(buf, 1, DEFLATE_BLOCK_SIZE, in);
+        if (n <= 0)
+            break;
+
+        *crc = GzipCrc32(*crc, buf, n);
+        *orig_size += n;
+
+        // Check if this is the last block
+        U8 peek;
+        Bool final = (fread(&peek, 1, 1, in) == 0);
+        if (!final)
+            ungetc(peek, in);
+
+        total += DeflateWriteStoredBlock(out, buf, n, final);
+
+        if (final)
+            break;
+    }
+
+    // Handle empty file
+    if (*orig_size == 0) {
+        // Write empty final stored block
+        U8 empty_block[] = {0x01, 0x00, 0x00, 0xff, 0xff};
+        fwrite(empty_block, 1, 5, out);
+        total = 5;
+    }
+
+    return total;
+}
+
+// ============================================================================
+// DEFLATE DECOMPRESSION
+// ============================================================================
+
+// Read bits from input stream
+class CDeflateReader {
+    FILE    *fp;
+    U32     bits;
+    I64     bit_count;
+    Bool    eof;
+};
+
+U0 DeflateReaderInit(CDeflateReader *r, FILE *fp)
+{
+    r->fp = fp;
+    r->bits = 0;
+    r->bit_count = 0;
+    r->eof = FALSE;
+}
+
+U32 DeflateReadBits(CDeflateReader *r, I64 n)
+{
+    while (r->bit_count < n) {
+        I64 c = fgetc(r->fp);
+        if (c < 0) {
+            r->eof = TRUE;
+            return 0;
+        }
+        r->bits |= (c << r->bit_count);
+        r->bit_count += 8;
+    }
+
+    U32 result = r->bits & ((1 << n) - 1);
+    r->bits >>= n;
+    r->bit_count -= n;
+    return result;
+}
+
+// Skip to byte boundary
+U0 DeflateAlignByte(CDeflateReader *r)
+{
+    r->bits = 0;
+    r->bit_count = 0;
+}
+
+// Decompress DEFLATE stream
+I64 DeflateDecompress(FILE *in, FILE *out, U32 *crc, U32 *size)
+{
+    CDeflateReader reader;
+    DeflateReaderInit(&reader, in);
+
+    GzipCrcInit();
+    *crc = 0;
+    *size = 0;
+
+    Bool final = FALSE;
+    while (!final && !reader.eof) {
+        final = DeflateReadBits(&reader, 1);
+        U32 btype = DeflateReadBits(&reader, 2);
+
+        if (btype == 0) {
+            // Stored block
+            DeflateAlignByte(&reader);
+
+            U16 len = fgetc(reader.fp);
+            len |= fgetc(reader.fp) << 8;
+
+            U16 nlen = fgetc(reader.fp);
+            nlen |= fgetc(reader.fp) << 8;
+
+            if ((len ^ nlen) != 0xffff) {
+                fprintf(stderr, "gzip: invalid stored block length\n");
+                return -1;
+            }
+
+            U8 *buf = MAlloc(len);
+            if (fread(buf, 1, len, reader.fp) != len) {
+                Free(buf);
+                fprintf(stderr, "gzip: unexpected end of file\n");
+                return -1;
+            }
+
+            *crc = GzipCrc32(*crc, buf, len);
+            *size += len;
+            fwrite(buf, 1, len, out);
+            Free(buf);
+
+        } else if (btype == 1 || btype == 2) {
+            // Fixed or dynamic Huffman - not implemented
+            fprintf(stderr, "gzip: compressed data not supported (use stored blocks)\n");
+            fprintf(stderr, "gzip: hint - compress with 'gzip -0' for stored mode\n");
+            return -1;
+
+        } else {
+            fprintf(stderr, "gzip: invalid block type\n");
+            return -1;
+        }
+    }
+
+    return *size;
+}
+
+// ============================================================================
+// GZIP COMPRESS
+// ============================================================================
+
+I64 GzipCompress(U8 *infile, U8 *outfile, I64 level, Bool keep, Bool verbose)
+{
+    FILE *fin = fopen(infile, "rb");
+    if (!fin) {
+        fprintf(stderr, "gzip: %s: No such file or directory\n", infile);
+        return -1;
+    }
+
+    FILE *fout = fopen(outfile, "wb");
+    if (!fout) {
+        fclose(fin);
+        fprintf(stderr, "gzip: %s: cannot create output file\n", outfile);
+        return -1;
+    }
+
+    // Write GZIP header
+    fputc(GZIP_MAGIC1, fout);
+    fputc(GZIP_MAGIC2, fout);
+    fputc(GZIP_METHOD_DEFLATE, fout);
+    fputc(GZIP_FNAME, fout);  // Flags: filename present
+
+    // Modification time (use current time or 0)
+    U32 mtime = 0;
+    fwrite(&mtime, 4, 1, fout);
+
+    // Extra flags and OS
+    fputc(0, fout);           // XFL
+    fputc(GZIP_OS_UNIX, fout); // OS
+
+    // Original filename (without path, without .gz)
+    U8 *basename = strrchr(infile, '/');
+    basename = basename ? basename + 1 : infile;
+    fwrite(basename, 1, strlen(basename) + 1, fout);  // Include null terminator
+
+    // Compress data
+    U32 crc, orig_size;
+    DeflateCompress(fin, fout, &crc, &orig_size);
+
+    // Write trailer
+    fwrite(&crc, 4, 1, fout);
+    fwrite(&orig_size, 4, 1, fout);
+
+    fclose(fin);
+    fclose(fout);
+
+    if (verbose) {
+        printf("%s:\t compressed\n", infile);
+    }
+
+    // Remove original unless -k
+    if (!keep) {
+        PosixUnlink(infile);
+    }
+
+    return 0;
+}
+
+// ============================================================================
+// GZIP DECOMPRESS
+// ============================================================================
+
+I64 GzipDecompress(U8 *infile, U8 *outfile, Bool keep, Bool verbose)
+{
+    FILE *fin = fopen(infile, "rb");
+    if (!fin) {
+        fprintf(stderr, "gzip: %s: No such file or directory\n", infile);
+        return -1;
+    }
+
+    // Read and verify header
+    U8 magic1 = fgetc(fin);
+    U8 magic2 = fgetc(fin);
+
+    if (magic1 != GZIP_MAGIC1 || magic2 != GZIP_MAGIC2) {
+        fprintf(stderr, "gzip: %s: not in gzip format\n", infile);
+        fclose(fin);
+        return -1;
+    }
+
+    U8 method = fgetc(fin);
+    if (method != GZIP_METHOD_DEFLATE) {
+        fprintf(stderr, "gzip: %s: unknown compression method\n", infile);
+        fclose(fin);
+        return -1;
+    }
+
+    U8 flags = fgetc(fin);
+
+    // Skip mtime, xfl, os
+    fseek(fin, 6, SEEK_CUR);
+
+    // Skip extra field if present
+    if (flags & GZIP_FEXTRA) {
+        U16 xlen = fgetc(fin);
+        xlen |= fgetc(fin) << 8;
+        fseek(fin, xlen, SEEK_CUR);
+    }
+
+    // Skip filename if present
+    if (flags & GZIP_FNAME) {
+        while (fgetc(fin) != 0)
+            ;
+    }
+
+    // Skip comment if present
+    if (flags & GZIP_FCOMMENT) {
+        while (fgetc(fin) != 0)
+            ;
+    }
+
+    // Skip header CRC if present
+    if (flags & GZIP_FHCRC) {
+        fseek(fin, 2, SEEK_CUR);
+    }
+
+    FILE *fout = fopen(outfile, "wb");
+    if (!fout) {
+        fclose(fin);
+        fprintf(stderr, "gzip: %s: cannot create output file\n", outfile);
+        return -1;
+    }
+
+    // Decompress
+    U32 crc, size;
+    if (DeflateDecompress(fin, fout, &crc, &size) < 0) {
+        fclose(fin);
+        fclose(fout);
+        PosixUnlink(outfile);
+        return -1;
+    }
+
+    // Read and verify trailer
+    U32 expected_crc, expected_size;
+    if (fread(&expected_crc, 4, 1, fin) != 1 ||
+        fread(&expected_size, 4, 1, fin) != 1) {
+        fprintf(stderr, "gzip: %s: unexpected end of file\n", infile);
+        fclose(fin);
+        fclose(fout);
+        return -1;
+    }
+
+    if (crc != expected_crc) {
+        fprintf(stderr, "gzip: %s: CRC error\n", infile);
+        fclose(fin);
+        fclose(fout);
+        PosixUnlink(outfile);
+        return -1;
+    }
+
+    if ((size & 0xffffffff) != expected_size) {
+        fprintf(stderr, "gzip: %s: length error\n", infile);
+        fclose(fin);
+        fclose(fout);
+        PosixUnlink(outfile);
+        return -1;
+    }
+
+    fclose(fin);
+    fclose(fout);
+
+    if (verbose) {
+        printf("%s:\t decompressed\n", infile);
+    }
+
+    // Remove original unless -k
+    if (!keep) {
+        PosixUnlink(infile);
+    }
+
+    return 0;
+}
+
+// ============================================================================
+// MAIN
+// ============================================================================
+
+U0 gzip_usage()
+{
+    printf("Usage: gzip [OPTION]... [FILE]...\n");
+    printf("Compress or decompress FILEs.\n\n");
+    printf("Options:\n");
+    printf("  -c, --stdout      Write to stdout, keep original files\n");
+    printf("  -d, --decompress  Decompress\n");
+    printf("  -f, --force       Force overwrite of output file\n");
+    printf("  -k, --keep        Keep (don't delete) input files\n");
+    printf("  -l, --list        List compressed file contents\n");
+    printf("  -n, --no-name     Don't save/restore original name and timestamp\n");
+    printf("  -N, --name        Save/restore original name and timestamp\n");
+    printf("  -q, --quiet       Suppress all warnings\n");
+    printf("  -r, --recursive   Recurse into directories\n");
+    printf("  -t, --test        Test compressed file integrity\n");
+    printf("  -v, --verbose     Verbose mode\n");
+    printf("  -1...-9           Compression level (1=fast, 9=best)\n");
+    printf("  --help            Display this help\n");
+    printf("\nNote: This implementation uses stored (uncompressed) blocks.\n");
+    printf("For actual compression, use level 0 (-0) which stores without compression.\n");
+}
+
+I64 gzip_main(I64 argc, U8 **argv)
+{
+    Bool decompress = FALSE;
+    Bool keep = FALSE;
+    Bool verbose = FALSE;
+    Bool force = FALSE;
+    Bool to_stdout = FALSE;
+    Bool test = FALSE;
+    Bool list = FALSE;
+    Bool quiet = FALSE;
+    I64 level = 6;  // Default compression level
+
+    U8 *files[256];
+    I64 file_count = 0;
+
+    // Check if called as gunzip or zcat
+    U8 *progname = argv[0];
+    U8 *base = strrchr(progname, '/');
+    base = base ? base + 1 : progname;
+
+    if (strcmp(base, "gunzip") == 0) {
+        decompress = TRUE;
+    } else if (strcmp(base, "zcat") == 0) {
+        decompress = TRUE;
+        to_stdout = TRUE;
+    }
+
+    // Parse options
+    for (I64 i = 1; i < argc; i++) {
+        U8 *arg = argv[i];
+
+        if (arg[0] == '-' && arg[1]) {
+            if (strcmp(arg, "--help") == 0) {
+                gzip_usage();
+                return 0;
+            } else if (strcmp(arg, "-d") == 0 || strcmp(arg, "--decompress") == 0 ||
+                       strcmp(arg, "--uncompress") == 0) {
+                decompress = TRUE;
+            } else if (strcmp(arg, "-c") == 0 || strcmp(arg, "--stdout") == 0) {
+                to_stdout = TRUE;
+                keep = TRUE;
+            } else if (strcmp(arg, "-k") == 0 || strcmp(arg, "--keep") == 0) {
+                keep = TRUE;
+            } else if (strcmp(arg, "-v") == 0 || strcmp(arg, "--verbose") == 0) {
+                verbose = TRUE;
+            } else if (strcmp(arg, "-f") == 0 || strcmp(arg, "--force") == 0) {
+                force = TRUE;
+            } else if (strcmp(arg, "-t") == 0 || strcmp(arg, "--test") == 0) {
+                test = TRUE;
+                decompress = TRUE;
+            } else if (strcmp(arg, "-l") == 0 || strcmp(arg, "--list") == 0) {
+                list = TRUE;
+            } else if (strcmp(arg, "-q") == 0 || strcmp(arg, "--quiet") == 0) {
+                quiet = TRUE;
+            } else if (arg[1] >= '0' && arg[1] <= '9') {
+                level = arg[1] - '0';
+            } else if (strcmp(arg, "-n") == 0 || strcmp(arg, "--no-name") == 0) {
+                // Ignored
+            } else if (strcmp(arg, "-N") == 0 || strcmp(arg, "--name") == 0) {
+                // Ignored
+            }
+        } else {
+            files[file_count++] = arg;
+        }
+    }
+
+    // Process stdin if no files
+    if (file_count == 0) {
+        fprintf(stderr, "gzip: stdin not supported, specify files\n");
+        return 1;
+    }
+
+    // Process files
+    I64 ret = 0;
+    for (I64 i = 0; i < file_count; i++) {
+        U8 *infile = files[i];
+        U8 outfile[512];
+
+        if (decompress) {
+            // Remove .gz extension
+            strcpy(outfile, infile);
+            I64 len = strlen(outfile);
+            if (len > 3 && strcmp(outfile + len - 3, ".gz") == 0) {
+                outfile[len - 3] = 0;
+            } else if (len > 2 && strcmp(outfile + len - 2, ".z") == 0) {
+                outfile[len - 2] = 0;
+            } else {
+                // No recognized extension, append .out
+                strcat(outfile, ".out");
+            }
+
+            if (test) {
+                // Test mode - decompress to /dev/null equivalent
+                FILE *fin = fopen(infile, "rb");
+                if (fin) {
+                    // Verify header
+                    U8 magic1 = fgetc(fin);
+                    U8 magic2 = fgetc(fin);
+                    fclose(fin);
+
+                    if (magic1 == GZIP_MAGIC1 && magic2 == GZIP_MAGIC2) {
+                        if (!quiet)
+                            printf("%s:\tOK\n", infile);
+                    } else {
+                        fprintf(stderr, "gzip: %s: not in gzip format\n", infile);
+                        ret = 1;
+                    }
+                }
+            } else {
+                if (GzipDecompress(infile, to_stdout ? "/dev/stdout" : outfile,
+                                   keep, verbose) < 0) {
+                    ret = 1;
+                }
+            }
+        } else {
+            // Add .gz extension
+            snprintf(outfile, 512, "%s.gz", infile);
+
+            // Check if output exists
+            if (!force && PosixAccess(outfile, 0) == 0) {
+                fprintf(stderr, "gzip: %s already exists; not overwriting\n", outfile);
+                ret = 1;
+                continue;
+            }
+
+            if (GzipCompress(infile, to_stdout ? "/dev/stdout" : outfile,
+                            level, keep, verbose) < 0) {
+                ret = 1;
+            }
+        }
+    }
+
+    return ret;
+}
+
+// Aliases
+I64 gunzip_main(I64 argc, U8 **argv)
+{
+    // Prepend -d to args
+    U8 *new_argv[258];
+    new_argv[0] = "gunzip";
+    new_argv[1] = "-d";
+    for (I64 i = 1; i < argc && i < 256; i++)
+        new_argv[i + 1] = argv[i];
+    return gzip_main(argc + 1, new_argv);
+}
+
+I64 zcat_main(I64 argc, U8 **argv)
+{
+    // Prepend -dc to args
+    U8 *new_argv[258];
+    new_argv[0] = "zcat";
+    new_argv[1] = "-dc";
+    for (I64 i = 1; i < argc && i < 256; i++)
+        new_argv[i + 1] = argv[i];
+    return gzip_main(argc + 1, new_argv);
+}

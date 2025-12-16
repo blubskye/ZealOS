@@ -1,0 +1,221 @@
+// MakeGo.ZC - Go Language Support Loader for ZealOS
+// Part of the POSIX compatibility layer
+//
+// This file loads and initializes Go language support for ZealOS.
+
+Cd(__DIR__);;
+
+// ============================================================================
+// DEPENDENCIES
+// ============================================================================
+
+// Make sure POSIX layer and libc are loaded
+Cd("..");;
+#include "MakePOSIX"
+Cd("libc");;
+#include "MakeLibc"
+Cd("../go");;
+
+// ============================================================================
+// GO RUNTIME COMPONENTS
+// ============================================================================
+
+// Go header definitions
+#include "Go.HH"
+
+// Futex implementation (required for synchronization)
+#include "Futex.ZC"
+
+// Go runtime
+#include "runtime/GoRuntime.ZC"
+
+// Go syscall interface
+#include "runtime/GoSyscall.ZC"
+
+// ============================================================================
+// GO ENVIRONMENT SETUP
+// ============================================================================
+
+U0 GoSetupEnvironment()
+{
+    // Set Go environment variables
+    setenv("GOOS", "zealos", 1);
+    setenv("GOARCH", "amd64", 1);
+    setenv("GOROOT", "/Home/POSIX/go", 1);
+    setenv("GOPATH", "/Home/POSIX/go/packages", 1);
+    setenv("GOMAXPROCS", "1", 1);
+
+    // Create necessary directories
+    mkdir("/Home/POSIX/go/packages", 0755);
+    mkdir("/Home/POSIX/go/packages/src", 0755);
+    mkdir("/Home/POSIX/go/packages/bin", 0755);
+    mkdir("/Home/POSIX/go/packages/pkg", 0755);
+    mkdir("/Home/POSIX/go/bin", 0755);
+}
+
+// ============================================================================
+// GO BINARY LOADER
+// ============================================================================
+
+// Load and run a Go binary (cross-compiled for ZealOS)
+I64 GoRunBinary(U8 *filename, I64 argc, U8 **argv)
+{
+    // Use ELF loader
+    CELFImage *img = ELFLoad(filename);
+    if (!img) {
+        fprintf(stderr, "go: failed to load %s\n", filename);
+        return -1;
+    }
+
+    if (!img->valid) {
+        fprintf(stderr, "go: %s - %s\n", filename, img->error);
+        ELFFree(img);
+        return -1;
+    }
+
+    // Initialize Go runtime if not already done
+    GoRuntimeInit();
+
+    // Get environment
+    CPosixProcess *proc = PosixGetCurrent();
+    U8 **envp = proc ? proc->environ : NULL;
+
+    // Execute
+    I64 result = ELFExecute(img, argc, argv, envp);
+
+    ELFFree(img);
+    return result;
+}
+
+// ============================================================================
+// GO COMMAND INTERFACE
+// ============================================================================
+
+// Print Go help
+U0 go_print_help()
+{
+    printf("Go language support for ZealOS\n\n");
+    printf("Usage: go <command> [arguments]\n\n");
+    printf("Commands:\n");
+    printf("  run       run a Go binary\n");
+    printf("  env       print Go environment\n");
+    printf("  version   print Go version\n");
+    printf("  help      print this help\n");
+    printf("\n");
+    printf("Cross-compilation:\n");
+    printf("  On a Linux/macOS/Windows host, compile Go programs with:\n");
+    printf("    GOOS=linux GOARCH=amd64 go build -o program program.go\n");
+    printf("  Then copy the binary to ZealOS and run with:\n");
+    printf("    go run program\n");
+    printf("\n");
+    printf("Note: Native Go compilation is not yet supported.\n");
+    printf("      Use cross-compilation from a host system.\n");
+}
+
+// Print Go environment
+U0 go_print_env()
+{
+    printf("GOOS=\"%s\"\n", getenv("GOOS") ? getenv("GOOS") : "zealos");
+    printf("GOARCH=\"%s\"\n", getenv("GOARCH") ? getenv("GOARCH") : "amd64");
+    printf("GOROOT=\"%s\"\n", getenv("GOROOT") ? getenv("GOROOT") : "/Home/POSIX/go");
+    printf("GOPATH=\"%s\"\n", getenv("GOPATH") ? getenv("GOPATH") : "/Home/POSIX/go/packages");
+    printf("GOMAXPROCS=\"%s\"\n", getenv("GOMAXPROCS") ? getenv("GOMAXPROCS") : "1");
+    printf("CGO_ENABLED=\"0\"\n");
+}
+
+// Main go command
+I64 go_main(I64 argc, U8 **argv)
+{
+    if (argc < 2) {
+        go_print_help();
+        return 0;
+    }
+
+    U8 *cmd = argv[1];
+
+    if (strcmp(cmd, "help") == 0 || strcmp(cmd, "--help") == 0 || strcmp(cmd, "-h") == 0) {
+        go_print_help();
+        return 0;
+    }
+
+    if (strcmp(cmd, "version") == 0) {
+        printf("go version go1.21-zealos amd64/zealos\n");
+        return 0;
+    }
+
+    if (strcmp(cmd, "env") == 0) {
+        go_print_env();
+        return 0;
+    }
+
+    if (strcmp(cmd, "run") == 0) {
+        if (argc < 3) {
+            fprintf(stderr, "go run: no binary specified\n");
+            return 1;
+        }
+        return GoRunBinary(argv[2], argc - 2, &argv[2]);
+    }
+
+    if (strcmp(cmd, "build") == 0 || strcmp(cmd, "install") == 0 ||
+        strcmp(cmd, "get") == 0 || strcmp(cmd, "mod") == 0) {
+        fprintf(stderr, "go %s: native compilation not supported\n", cmd);
+        fprintf(stderr, "Please cross-compile on a host system:\n");
+        fprintf(stderr, "  GOOS=linux GOARCH=amd64 go build -o program program.go\n");
+        return 1;
+    }
+
+    fprintf(stderr, "go: unknown command \"%s\"\n", cmd);
+    fprintf(stderr, "Run 'go help' for usage.\n");
+    return 1;
+}
+
+// ============================================================================
+// COMMAND REGISTRATION
+// ============================================================================
+
+U0 GoRegisterCommands()
+{
+    extern U0 PosixRegisterCommand(U8 *name, I64 (*main_func)(I64, U8**));
+
+    PosixRegisterCommand("go", &go_main);
+}
+
+// ============================================================================
+// INITIALIZATION
+// ============================================================================
+
+U0 GoInit()
+{
+    // Set up environment
+    GoSetupEnvironment();
+
+    // Initialize runtime
+    GoRuntimeInit();
+
+    // Register commands
+    GoRegisterCommands();
+
+    "\n";
+    "============================================================\n";
+    "Go Language Support Loaded\n";
+    "============================================================\n";
+    "\n";
+    "Available commands:\n";
+    "  go run <binary>    - Run a Go binary (cross-compiled)\n";
+    "  go env             - Print Go environment\n";
+    "  go version         - Print Go version\n";
+    "  go help            - Print help\n";
+    "\n";
+    "Cross-compilation from host:\n";
+    "  GOOS=linux GOARCH=amd64 go build -o program program.go\n";
+    "\n";
+    "Runtime features:\n";
+    "  - M-P-G scheduler for goroutines\n";
+    "  - Futex-based synchronization\n";
+    "  - Full syscall emulation\n";
+    "  - ELF binary loader\n";
+    "\n";
+}
+
+// Call initialization
+GoInit();

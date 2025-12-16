@@ -1,0 +1,102 @@
+// sleep.ZC - GNU coreutils 'sleep' implementation
+// Delay for a specified time
+
+// C-style main function
+I64 sleep_main(I64 argc, U8 **argv)
+{
+    I64 start = 1;
+
+    // Parse options
+    while (start < argc && argv[start][0] == '-') {
+        U8 *arg = argv[start];
+
+        if (strcmp(arg, "--help") == 0) {
+            printf("Usage: sleep NUMBER[SUFFIX]...\n");
+            printf("  or:  sleep OPTION\n");
+            printf("Pause for NUMBER seconds.  SUFFIX may be:\n");
+            printf("  s   seconds (default)\n");
+            printf("  m   minutes\n");
+            printf("  h   hours\n");
+            printf("  d   days\n");
+            printf("\nMultiple arguments cause sleep to pause for their sum.\n\n");
+            printf("      --help     display this help and exit\n");
+            printf("      --version  output version information and exit\n");
+            return 0;
+        }
+
+        if (strcmp(arg, "--version") == 0) {
+            printf("sleep (ZealOS coreutils) 1.0\n");
+            return 0;
+        }
+
+        if (strcmp(arg, "--") == 0) {
+            start++;
+            break;
+        }
+
+        fprintf(stderr, "sleep: invalid option '%s'\n", arg);
+        return 1;
+    }
+
+    if (start >= argc) {
+        fprintf(stderr, "sleep: missing operand\n");
+        return 1;
+    }
+
+    // Parse time arguments
+    F64 total_seconds = 0;
+
+    for (I64 i = start; i < argc; i++) {
+        U8 *arg = argv[i];
+        U8 *end;
+        F64 value = strtod(arg, &end);
+
+        if (end == arg) {
+            fprintf(stderr, "sleep: invalid time interval '%s'\n", arg);
+            return 1;
+        }
+
+        if (value < 0) {
+            fprintf(stderr, "sleep: invalid time interval '%s'\n", arg);
+            return 1;
+        }
+
+        // Check for suffix
+        F64 multiplier = 1.0;
+        if (*end) {
+            switch (*end) {
+                case 's': multiplier = 1.0; break;
+                case 'm': multiplier = 60.0; break;
+                case 'h': multiplier = 3600.0; break;
+                case 'd': multiplier = 86400.0; break;
+                default:
+                    fprintf(stderr, "sleep: invalid time interval '%s'\n", arg);
+                    return 1;
+            }
+        }
+
+        total_seconds += value * multiplier;
+    }
+
+    // Sleep
+    if (total_seconds > 0) {
+        // Convert to microseconds for nanosleep/usleep equivalent
+        I64 seconds = (I64)total_seconds;
+        I64 microseconds = (I64)((total_seconds - seconds) * 1000000);
+
+        // Use ZealOS sleep function
+        // Sleep takes milliseconds
+        I64 total_ms = seconds * 1000 + microseconds / 1000;
+
+        if (total_ms > 0) {
+            Sleep(total_ms);
+        }
+    }
+
+    return 0;
+}
+
+U0 GnuSleepRegister()
+{
+    "GNU 'sleep' utility loaded.\n";
+}

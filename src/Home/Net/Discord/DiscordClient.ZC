@@ -1,0 +1,625 @@
+// DiscordClient.ZC - Discord Client Implementation for ZealOS
+// Minimal Discord bot implementation using Gateway WebSocket
+
+// ============================================================================
+// CLIENT CREATION/DESTRUCTION
+// ============================================================================
+
+// Create a new Discord client
+CDiscordClient *DiscordInit(U8 *token)
+{
+	CDiscordClient *client = MAlloc(sizeof(CDiscordClient));
+	MemSet(client, 0, sizeof(CDiscordClient));
+
+	// Store token with "Bot " prefix if not present
+	if (StrNCmp(token, "Bot ", 4) == 0) {
+		client->token = StrNew(token);
+	} else {
+		client->token = MAlloc(StrLen(token) + 5);
+		StrPrint(client->token, "Bot %s", token);
+	}
+
+	client->intents = DISCORD_INTENTS_DEFAULT;
+	client->state = DISCORD_STATE_DISCONNECTED;
+	client->heartbeat_acked = TRUE;
+
+	// Create HTTP client for REST API
+	client->http = HTTPClientNew();
+
+	// Initialize rate limiter
+	client->rate_limiter = MAlloc(sizeof(CRateLimiter));
+	RateLimiterInit(client->rate_limiter);
+
+	return client;
+}
+
+// Free Discord client
+U0 DiscordCleanup(CDiscordClient *client)
+{
+	if (!client) return;
+
+	// Close gateway connection
+	if (client->gateway) {
+		WSClose(client->gateway);
+		WSFree(client->gateway);
+	}
+
+	// Free HTTP client
+	if (client->http) {
+		HTTPClientFree(client->http);
+	}
+
+	// Free rate limiter
+	if (client->rate_limiter) {
+		RateLimiterFree(client->rate_limiter);
+		Free(client->rate_limiter);
+	}
+
+	// Free strings
+	if (client->token) Free(client->token);
+	if (client->session_id) Free(client->session_id);
+	if (client->resume_gateway_url) Free(client->resume_gateway_url);
+	if (client->self.username) Free(client->self.username);
+	if (client->self.discriminator) Free(client->self.discriminator);
+	if (client->self.avatar) Free(client->self.avatar);
+
+	Free(client);
+}
+
+// ============================================================================
+// EVENT REGISTRATION
+// ============================================================================
+
+U0 DiscordOnReady(CDiscordClient *client, DiscordOnReady callback)
+{
+	client->on_ready = callback;
+}
+
+U0 DiscordOnMessage(CDiscordClient *client, DiscordOnMessage callback)
+{
+	client->on_message = callback;
+}
+
+U0 DiscordOnError(CDiscordClient *client, DiscordOnError callback)
+{
+	client->on_error = callback;
+}
+
+// Set intents
+U0 DiscordSetIntents(CDiscordClient *client, I64 intents)
+{
+	client->intents = intents;
+}
+
+// Set user data
+U0 DiscordSetData(CDiscordClient *client, U0 *data)
+{
+	client->user_data = data;
+}
+
+// Get user data
+U0 *DiscordGetData(CDiscordClient *client)
+{
+	return client->user_data;
+}
+
+// ============================================================================
+// GATEWAY PAYLOADS
+// ============================================================================
+
+// Build Identify payload
+U8 *DiscordBuildIdentify(CDiscordClient *client)
+{
+	CJSONBuilder json;
+	JSONBuilderInit(&json, 512);
+
+	JSONBeginObject(&json);
+	JSONKeyInt(&json, "op", DISCORD_OP_IDENTIFY);
+
+	JSONKeyObject(&json, "d");
+
+	// Token (without "Bot " prefix for gateway)
+	U8 *token = client->token;
+	if (StrNCmp(token, "Bot ", 4) == 0) {
+		token += 4;
+	}
+	JSONKeyString(&json, "token", token);
+
+	// Intents
+	JSONKeyInt(&json, "intents", client->intents);
+
+	// Properties
+	JSONKeyObject(&json, "properties");
+	JSONKeyString(&json, "os", "ZealOS");
+	JSONKeyString(&json, "browser", "ZealOS-Discord");
+	JSONKeyString(&json, "device", "ZealOS-Discord");
+	JSONEndObject(&json);  // properties
+
+	JSONEndObject(&json);  // d
+	JSONEndObject(&json);  // root
+
+	U8 *result = StrNew(JSONBuilderGet(&json));
+	JSONBuilderFree(&json);
+	return result;
+}
+
+// Build Heartbeat payload
+U8 *DiscordBuildHeartbeat(CDiscordClient *client)
+{
+	CJSONBuilder json;
+	JSONBuilderInit(&json, 64);
+
+	JSONBeginObject(&json);
+	JSONKeyInt(&json, "op", DISCORD_OP_HEARTBEAT);
+
+	if (client->sequence > 0) {
+		JSONKeyInt(&json, "d", client->sequence);
+	} else {
+		JSONKeyNull(&json, "d");
+	}
+
+	JSONEndObject(&json);
+
+	U8 *result = StrNew(JSONBuilderGet(&json));
+	JSONBuilderFree(&json);
+	return result;
+}
+
+// Build Resume payload
+U8 *DiscordBuildResume(CDiscordClient *client)
+{
+	CJSONBuilder json;
+	JSONBuilderInit(&json, 256);
+
+	JSONBeginObject(&json);
+	JSONKeyInt(&json, "op", DISCORD_OP_RESUME);
+
+	JSONKeyObject(&json, "d");
+
+	U8 *token = client->token;
+	if (StrNCmp(token, "Bot ", 4) == 0) {
+		token += 4;
+	}
+	JSONKeyString(&json, "token", token);
+	JSONKeyString(&json, "session_id", client->session_id);
+	JSONKeyInt(&json, "seq", client->sequence);
+
+	JSONEndObject(&json);  // d
+	JSONEndObject(&json);  // root
+
+	U8 *result = StrNew(JSONBuilderGet(&json));
+	JSONBuilderFree(&json);
+	return result;
+}
+
+// ============================================================================
+// EVENT HANDLING
+// ============================================================================
+
+// NOTE: DiscordHandleReady, DiscordHandleMessage, and extended event handlers
+// are now in DiscordEvents.ZC
+
+// Handle gateway dispatch event
+U0 DiscordHandleDispatch(CDiscordClient *client, U8 *event_name, CJSONValue *data)
+{
+	// Connection events
+	if (StrCmp(event_name, "READY") == 0) {
+		DiscordHandleReady(client, data);
+	} else if (StrCmp(event_name, "RESUMED") == 0) {
+		client->state = DISCORD_STATE_CONNECTED;
+	}
+	// Message events
+	else if (StrCmp(event_name, "MESSAGE_CREATE") == 0) {
+		DiscordHandleMessage(client, data);
+	} else if (StrCmp(event_name, "MESSAGE_UPDATE") == 0) {
+		DiscordHandleMessageUpdate(client, data);
+	} else if (StrCmp(event_name, "MESSAGE_DELETE") == 0) {
+		DiscordHandleMessageDelete(client, data);
+	}
+	// Guild events
+	else if (StrCmp(event_name, "GUILD_CREATE") == 0) {
+		DiscordHandleGuildCreate(client, data);
+	} else if (StrCmp(event_name, "GUILD_UPDATE") == 0) {
+		DiscordHandleGuildUpdate(client, data);
+	} else if (StrCmp(event_name, "GUILD_DELETE") == 0) {
+		DiscordHandleGuildDelete(client, data);
+	}
+	// Member events
+	else if (StrCmp(event_name, "GUILD_MEMBER_ADD") == 0) {
+		DiscordHandleMemberAdd(client, data);
+	} else if (StrCmp(event_name, "GUILD_MEMBER_REMOVE") == 0) {
+		DiscordHandleMemberRemove(client, data);
+	} else if (StrCmp(event_name, "GUILD_MEMBER_UPDATE") == 0) {
+		DiscordHandleMemberUpdate(client, data);
+	}
+	// Reaction events
+	else if (StrCmp(event_name, "MESSAGE_REACTION_ADD") == 0) {
+		DiscordHandleReactionAdd(client, data);
+	} else if (StrCmp(event_name, "MESSAGE_REACTION_REMOVE") == 0) {
+		DiscordHandleReactionRemove(client, data);
+	} else if (StrCmp(event_name, "MESSAGE_REACTION_REMOVE_ALL") == 0) {
+		DiscordHandleReactionRemoveAll(client, data);
+	}
+	// Typing events
+	else if (StrCmp(event_name, "TYPING_START") == 0) {
+		DiscordHandleTypingStart(client, data);
+	}
+	// Presence events
+	else if (StrCmp(event_name, "PRESENCE_UPDATE") == 0) {
+		DiscordHandlePresenceUpdate(client, data);
+	}
+	// Interaction events
+	else if (StrCmp(event_name, "INTERACTION_CREATE") == 0) {
+		DiscordHandleInteractionCreate(client, data);
+	}
+}
+
+// ============================================================================
+// GATEWAY PROCESSING
+// ============================================================================
+
+// Process a gateway message
+I64 DiscordProcessGatewayMessage(CDiscordClient *client, U8 *message)
+{
+	CJSONValue *root = JSONParse(message);
+	if (!root) {
+		return DISCORD_ERR_API_ERROR;
+	}
+
+	I64 op = JSONAsInt(JSONObjectGet(root, "op"));
+	I64 seq = JSONAsInt(JSONObjectGet(root, "s"));
+	I64 result = DISCORD_OK;
+
+	// Update sequence number
+	if (seq > 0) {
+		client->sequence = seq;
+	}
+
+	switch (op) {
+		case DISCORD_OP_DISPATCH:
+			{
+				U8 *event_name = JSONAsString(JSONObjectGet(root, "t"));
+				CJSONValue *data = JSONObjectGet(root, "d");
+				if (event_name && data) {
+					DiscordHandleDispatch(client, event_name, data);
+				}
+			}
+			break;
+
+		case DISCORD_OP_HEARTBEAT:
+			// Server requested heartbeat
+			{
+				U8 *hb = DiscordBuildHeartbeat(client);
+				WSSendText(client->gateway, hb);
+				Free(hb);
+			}
+			break;
+
+		case DISCORD_OP_RECONNECT:
+			// Server wants us to reconnect
+			result = DISCORD_OP_RECONNECT;
+			break;
+
+		case DISCORD_OP_INVALID_SESSION:
+			// Session invalid
+			{
+				CJSONValue *d_val = JSONObjectGet(root, "d");
+				Bool resumable = d_val ? JSONAsBool(d_val) : FALSE;
+				if (resumable) {
+					// Wait and resume
+					Sleep(1000 + RandomRange(4000));
+					client->state = DISCORD_STATE_RESUMING;
+				} else {
+					// Start fresh
+					if (client->session_id) {
+						Free(client->session_id);
+						client->session_id = NULL;
+					}
+					client->sequence = 0;
+					client->state = DISCORD_STATE_IDENTIFYING;
+				}
+			}
+			break;
+
+		case DISCORD_OP_HELLO:
+			// Received Hello, start heartbeating
+			{
+				CJSONValue *d_obj = JSONObjectGet(root, "d");
+				if (d_obj) {
+					client->heartbeat_interval = JSONAsInt(JSONObjectGet(d_obj, "heartbeat_interval"));
+				}
+
+				// Send Identify or Resume
+				if (client->session_id && client->state == DISCORD_STATE_RESUMING) {
+					U8 *resume = DiscordBuildResume(client);
+					WSSendText(client->gateway, resume);
+					Free(resume);
+				} else {
+					U8 *identify = DiscordBuildIdentify(client);
+					WSSendText(client->gateway, identify);
+					Free(identify);
+					client->state = DISCORD_STATE_IDENTIFYING;
+				}
+			}
+			break;
+
+		case DISCORD_OP_HEARTBEAT_ACK:
+			client->heartbeat_acked = TRUE;
+			client->last_heartbeat_ack = tS * 1000;
+			break;
+	}
+
+	JSONValueFree(root);
+	return result;
+}
+
+// ============================================================================
+// GATEWAY CONNECTION
+// ============================================================================
+
+// Connect to Discord Gateway
+I64 DiscordConnectGateway(CDiscordClient *client)
+{
+	I64 result;
+
+	// Use resume URL if available, otherwise default
+	U8 *url = client->resume_gateway_url ?
+	          client->resume_gateway_url : DISCORD_GATEWAY_URL;
+
+	// Create WebSocket connection
+	client->gateway = WSNew();
+	result = WSConnect(client->gateway, url);
+
+	if (result != WS_OK) {
+		WSFree(client->gateway);
+		client->gateway = NULL;
+		return DISCORD_ERR_CONNECTION_FAILED;
+	}
+
+	client->state = DISCORD_STATE_CONNECTING;
+	return DISCORD_OK;
+}
+
+// ============================================================================
+// MAIN RUN LOOP
+// ============================================================================
+
+// Run the Discord client (blocking)
+I64 DiscordRun(CDiscordClient *client)
+{
+	I64 result;
+	CWSMessage msg;
+	I64 now;
+
+	// Connect to gateway
+	result = DiscordConnectGateway(client);
+	if (result != DISCORD_OK) {
+		return result;
+	}
+
+	client->running = TRUE;
+	client->last_heartbeat = 0;
+	client->heartbeat_acked = TRUE;
+
+	while (client->running) {
+		// Check if we need to send heartbeat
+		if (client->heartbeat_interval > 0) {
+			now = tS * 1000;
+
+			if (now - client->last_heartbeat >= client->heartbeat_interval) {
+				// Check if last heartbeat was ACKed
+				if (!client->heartbeat_acked) {
+					// Connection dead, reconnect
+					WSClose(client->gateway);
+					client->state = DISCORD_STATE_RECONNECTING;
+
+					// Wait and reconnect
+					Sleep(1000);
+					result = DiscordConnectGateway(client);
+					if (result != DISCORD_OK) {
+						client->running = FALSE;
+						return result;
+					}
+					client->heartbeat_acked = TRUE;
+					continue;
+				}
+
+				// Send heartbeat
+				U8 *hb = DiscordBuildHeartbeat(client);
+				WSSendText(client->gateway, hb);
+				Free(hb);
+
+				client->last_heartbeat = now;
+				client->heartbeat_acked = FALSE;
+			}
+		}
+
+		// Receive message (with timeout)
+		result = WSRecvMessage(client->gateway, &msg);
+
+		if (result == WS_ERR_CLOSED) {
+			// Connection closed
+			if (client->running) {
+				// Attempt reconnect
+				Sleep(1000);
+				client->state = DISCORD_STATE_RECONNECTING;
+				result = DiscordConnectGateway(client);
+				if (result != DISCORD_OK) {
+					return result;
+				}
+			}
+			continue;
+		}
+
+		if (result < 0) {
+			// Other error
+			if (client->on_error) {
+				client->on_error(client, result, WSErrorString(result));
+			}
+			continue;
+		}
+
+		// Process the message
+		if (msg.data) {
+			result = DiscordProcessGatewayMessage(client, msg.data);
+
+			if (result == DISCORD_OP_RECONNECT) {
+				// Server requested reconnect
+				WSMessageFree(&msg);
+				WSClose(client->gateway);
+				Sleep(1000);
+				client->state = DISCORD_STATE_RESUMING;
+				result = DiscordConnectGateway(client);
+				if (result != DISCORD_OK) {
+					return result;
+				}
+				continue;
+			}
+
+			WSMessageFree(&msg);
+		}
+
+		// Small yield
+		Yield;
+	}
+
+	return DISCORD_OK;
+}
+
+// Shutdown the client
+U0 DiscordShutdown(CDiscordClient *client)
+{
+	client->running = FALSE;
+}
+
+// ============================================================================
+// REST API HELPERS
+// ============================================================================
+
+// Make an authenticated API request (with rate limiting)
+CHTTPResponse *DiscordAPIRequest(CDiscordClient *client, I64 method, U8 *endpoint, U8 *body)
+{
+	U8 url[512];
+
+	StrPrint(url, "%s%s", DISCORD_API_BASE, endpoint);
+
+	// Use rate limit wrapper if rate limiter is available
+	if (client->rate_limiter) {
+		return RateLimitRequest(
+			client->rate_limiter,
+			client->http,
+			method,
+			url,
+			client->token,
+			body
+		);
+	}
+
+	// Fallback to direct request (no rate limiting)
+	CHTTPRequest *req = HTTPRequestNew(method, url);
+	if (!req) return NULL;
+
+	HTTPRequestAddHeader(req, "Authorization", client->token);
+	HTTPRequestAddHeader(req, "Content-Type", "application/json");
+	HTTPRequestAddHeader(req, "User-Agent", "DiscordBot (ZealOS, 1.0)");
+
+	if (body) {
+		HTTPRequestSetBody(req, body, StrLen(body));
+	}
+
+	CHTTPResponse *resp = HTTPRequest(client->http, req);
+	HTTPRequestFree(req);
+
+	return resp;
+}
+
+// ============================================================================
+// MESSAGE SENDING
+// ============================================================================
+
+// Send a message to a channel
+I64 DiscordSendMessage(CDiscordClient *client, CDiscordSnowflake channel_id, U8 *content)
+{
+	U8 endpoint[64];
+	CJSONBuilder json;
+	CHTTPResponse *resp;
+
+	StrPrint(endpoint, "/channels/%llu/messages", channel_id);
+
+	JSONBuilderInit(&json, 256);
+	JSONBeginObject(&json);
+	JSONKeyString(&json, "content", content);
+	JSONEndObject(&json);
+
+	resp = DiscordAPIRequest(client, HTTP_METHOD_POST, endpoint, JSONBuilderGet(&json));
+	JSONBuilderFree(&json);
+
+	if (!resp) {
+		return DISCORD_ERR_API_ERROR;
+	}
+
+	I64 status = resp->status_code;
+	HTTPResponseFree(resp);
+
+	if (status == 200 || status == 201) {
+		return DISCORD_OK;
+	} else if (status == 429) {
+		return DISCORD_ERR_RATE_LIMITED;
+	} else {
+		return DISCORD_ERR_API_ERROR;
+	}
+}
+
+// Reply to a message
+I64 DiscordReplyMessage(CDiscordClient *client, CDiscordMessage *original, U8 *content)
+{
+	U8 endpoint[64];
+	CJSONBuilder json;
+	CHTTPResponse *resp;
+
+	StrPrint(endpoint, "/channels/%llu/messages", original->channel_id);
+
+	JSONBuilderInit(&json, 512);
+	JSONBeginObject(&json);
+	JSONKeyString(&json, "content", content);
+
+	// Message reference for reply
+	JSONKeyObject(&json, "message_reference");
+	U8 msg_id_str[32];
+	StrPrint(msg_id_str, "%llu", original->id);
+	JSONKeyString(&json, "message_id", msg_id_str);
+	JSONEndObject(&json);
+
+	JSONEndObject(&json);
+
+	resp = DiscordAPIRequest(client, HTTP_METHOD_POST, endpoint, JSONBuilderGet(&json));
+	JSONBuilderFree(&json);
+
+	if (!resp) {
+		return DISCORD_ERR_API_ERROR;
+	}
+
+	I64 status = resp->status_code;
+	HTTPResponseFree(resp);
+
+	return (status == 200 || status == 201) ? DISCORD_OK : DISCORD_ERR_API_ERROR;
+}
+
+// ============================================================================
+// UTILITY FUNCTIONS
+// ============================================================================
+
+// Get the bot's user object
+CDiscordUser *DiscordGetSelf(CDiscordClient *client)
+{
+	return &client->self;
+}
+
+// Get ping (time since last heartbeat ACK)
+I64 DiscordGetPing(CDiscordClient *client)
+{
+	if (client->last_heartbeat_ack == 0 || client->last_heartbeat == 0) {
+		return -1;
+	}
+	return client->last_heartbeat_ack - client->last_heartbeat;
+}

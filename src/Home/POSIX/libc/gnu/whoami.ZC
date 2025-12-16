@@ -1,0 +1,54 @@
+// whoami.ZC - GNU coreutils 'whoami' implementation
+// Print effective user name
+
+// C-style main function
+I64 whoami_main(I64 argc, U8 **argv)
+{
+    I64 start = 1;
+
+    // Parse options
+    while (start < argc && argv[start][0] == '-') {
+        U8 *arg = argv[start];
+
+        if (strcmp(arg, "--help") == 0) {
+            printf("Usage: whoami [OPTION]...\n");
+            printf("Print the user name associated with the current effective user ID.\n");
+            printf("Same as id -un.\n\n");
+            printf("      --help     display this help and exit\n");
+            printf("      --version  output version information and exit\n");
+            return 0;
+        }
+
+        if (strcmp(arg, "--version") == 0) {
+            printf("whoami (ZealOS coreutils) 1.0\n");
+            return 0;
+        }
+
+        fprintf(stderr, "whoami: invalid option '%s'\n", arg);
+        return 1;
+    }
+
+    if (start < argc) {
+        fprintf(stderr, "whoami: extra operand '%s'\n", argv[start]);
+        return 1;
+    }
+
+    // Get effective user ID
+    I64 uid = PosixGetEuid();
+
+    // In ZealOS, we don't have a proper passwd database
+    // So we'll just print a default username or the UID
+    if (uid == 0) {
+        printf("root\n");
+    } else {
+        // For non-root, print "user" or could look up in /etc/passwd
+        printf("user\n");
+    }
+
+    return 0;
+}
+
+U0 GnuWhoamiRegister()
+{
+    "GNU 'whoami' utility loaded.\n";
+}

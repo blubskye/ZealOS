@@ -1,0 +1,15 @@
+// MakeHTTP.ZC - HTTP module loader for ZealOS
+// Include this file to load HTTP/HTTPS functionality
+
+Cd(__DIR__);;
+
+// Load TLS first (includes crypto)
+#include "../TLS/MakeTLS"
+
+// HTTP definitions
+#include "HTTP.HH"
+
+// HTTP implementation
+#include "HTTPClient"
+
+NetLog("HTTP module loaded.");

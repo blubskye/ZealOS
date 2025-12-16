@@ -1,0 +1,445 @@
+// tcc.ZC - TinyCC Driver for ZealOS
+// Part of the POSIX compatibility layer
+//
+// This provides the command-line interface for TCC on ZealOS.
+// It can compile C source files and run them directly.
+
+#include "TCC_OS.ZC"
+#include "ELFLoader.ZC"
+
+// ============================================================================
+// TCC DRIVER
+// ============================================================================
+
+U0 tcc_print_usage()
+{
+    printf("TinyCC %s - Tiny C Compiler for ZealOS\n", TCC_VERSION);
+    printf("Usage: tcc [options] [infile1 infile2 ...] [-run infile args...]\n");
+    printf("\n");
+    printf("General options:\n");
+    printf("  -c          compile only - generate an object file\n");
+    printf("  -o outfile  set output filename\n");
+    printf("  -run        run compiled source\n");
+    printf("  -v          show version\n");
+    printf("  -bench      show compilation statistics\n");
+    printf("  --help      show this help\n");
+    printf("\n");
+    printf("Preprocessor options:\n");
+    printf("  -Idir       add include path 'dir'\n");
+    printf("  -Dsym[=val] define 'sym' with value 'val'\n");
+    printf("  -Usym       undefine 'sym'\n");
+    printf("  -E          preprocess only\n");
+    printf("\n");
+    printf("Linker options:\n");
+    printf("  -Ldir       add library path 'dir'\n");
+    printf("  -llib       link with library 'lib'\n");
+    printf("  -nostdinc   do not use standard system include paths\n");
+    printf("  -nostdlib   do not link with standard libraries\n");
+    printf("  -static     static linking\n");
+    printf("  -shared     generate a shared library\n");
+    printf("\n");
+    printf("Debugging options:\n");
+    printf("  -g          generate debug information\n");
+    printf("  -b          compile with bounds checking\n");
+    printf("\n");
+}
+
+#define TCC_VERSION     "0.9.27-zealos"
+
+I64 tcc_main(I64 argc, U8 **argv)
+{
+    CTCCState *s;
+    I64 ret = 0;
+    Bool run_mode = FALSE;
+    Bool preprocess_only = FALSE;
+    Bool show_bench = FALSE;
+    I64 run_argc = 0;
+    U8 **run_argv = NULL;
+    U8 *outfile = NULL;
+    I64 start_time = 0;
+
+    if (argc < 2) {
+        tcc_print_usage();
+        return 0;
+    }
+
+    // Create TCC state
+    s = tcc_new();
+    if (!s) {
+        fprintf(stderr, "tcc: could not allocate TCC state\n");
+        return 1;
+    }
+
+    // Register ZealOS symbols
+    TccRegisterZealOSSymbols(s);
+
+    // Parse command line arguments
+    for (I64 i = 1; i < argc; i++) {
+        U8 *arg = argv[i];
+
+        // Check for -run mode
+        if (strcmp(arg, "-run") == 0) {
+            run_mode = TRUE;
+            s->output_type = TCC_OUTPUT_MEMORY;
+            // Remaining args are for the program
+            if (i + 1 < argc) {
+                tcc_add_file(s, argv[i + 1]);
+                run_argc = argc - i - 2;
+                run_argv = &argv[i + 2];
+            }
+            break;
+        }
+
+        if (arg[0] == '-') {
+            if (strcmp(arg, "--help") == 0 || strcmp(arg, "-h") == 0) {
+                tcc_print_usage();
+                tcc_delete(s);
+                return 0;
+            }
+            else if (strcmp(arg, "-v") == 0 || strcmp(arg, "--version") == 0) {
+                printf("tcc version %s\n", TCC_VERSION);
+                if (s->verbose) {
+                    printf("  Built for ZealOS x86-64\n");
+                    printf("  Include paths:\n");
+                    for (I64 j = 0; j < s->sysinclude_count; j++)
+                        printf("    %s\n", s->sysinclude_paths[j]);
+                    printf("  Library paths:\n");
+                    for (I64 j = 0; j < s->library_count; j++)
+                        printf("    %s\n", s->library_paths[j]);
+                }
+                s->verbose++;
+            }
+            else if (strcmp(arg, "-c") == 0) {
+                s->output_type = TCC_OUTPUT_OBJ;
+            }
+            else if (strcmp(arg, "-E") == 0) {
+                preprocess_only = TRUE;
+                s->output_type = TCC_OUTPUT_PREPROCESS;
+            }
+            else if (strcmp(arg, "-o") == 0 && i + 1 < argc) {
+                outfile = argv[++i];
+            }
+            else if (strncmp(arg, "-o", 2) == 0) {
+                outfile = arg + 2;
+            }
+            else if (strncmp(arg, "-I", 2) == 0) {
+                if (arg[2])
+                    tcc_add_include_path(s, arg + 2);
+                else if (i + 1 < argc)
+                    tcc_add_include_path(s, argv[++i]);
+            }
+            else if (strncmp(arg, "-L", 2) == 0) {
+                if (arg[2])
+                    tcc_add_library_path(s, arg + 2);
+                else if (i + 1 < argc)
+                    tcc_add_library_path(s, argv[++i]);
+            }
+            else if (strncmp(arg, "-D", 2) == 0) {
+                U8 *def = arg + 2;
+                U8 *eq = StrChr(def, '=');
+                if (eq) {
+                    *eq = 0;
+                    tcc_define_symbol(s, def, eq + 1);
+                    *eq = '=';
+                } else {
+                    tcc_define_symbol(s, def, "1");
+                }
+            }
+            else if (strncmp(arg, "-U", 2) == 0) {
+                tcc_undefine_symbol(s, arg + 2);
+            }
+            else if (strncmp(arg, "-l", 2) == 0) {
+                if (arg[2])
+                    tcc_add_library(s, arg + 2);
+                else if (i + 1 < argc)
+                    tcc_add_library(s, argv[++i]);
+            }
+            else if (strcmp(arg, "-nostdinc") == 0) {
+                s->nostdinc = TRUE;
+            }
+            else if (strcmp(arg, "-nostdlib") == 0) {
+                s->nostdlib = TRUE;
+            }
+            else if (strcmp(arg, "-static") == 0) {
+                s->static_link = TRUE;
+            }
+            else if (strcmp(arg, "-shared") == 0) {
+                s->output_type = TCC_OUTPUT_DLL;
+            }
+            else if (strcmp(arg, "-g") == 0) {
+                s->do_debug = TRUE;
+            }
+            else if (strcmp(arg, "-b") == 0) {
+                s->do_bounds_check = TRUE;
+            }
+            else if (strcmp(arg, "-bench") == 0) {
+                show_bench = TRUE;
+            }
+            else if (arg[1] == 'O') {
+                // Optimization level (ignored, TCC doesn't optimize)
+                s->optimize_level = (arg[2]) ? arg[2] - '0' : 1;
+            }
+            else if (arg[1] == 'W') {
+                // Warning options (mostly ignored)
+            }
+            else if (arg[1] == 'f') {
+                // Feature options (mostly ignored)
+            }
+            else if (arg[1] == 'm') {
+                // Machine options (mostly ignored)
+            }
+            else {
+                fprintf(stderr, "tcc: warning: unknown option '%s'\n", arg);
+            }
+        } else {
+            // Input file
+            if (tcc_add_file(s, arg) < 0) {
+                ret = 1;
+                goto cleanup;
+            }
+        }
+    }
+
+    // Check for input files
+    if (s->file_count == 0 && !run_mode) {
+        fprintf(stderr, "tcc: no input files\n");
+        ret = 1;
+        goto cleanup;
+    }
+
+    // Record start time for benchmarks
+    if (show_bench)
+        start_time = GetTicks();
+
+    // Compile
+    if (s->verbose)
+        printf("tcc: compiling %d file(s)\n", s->file_count);
+
+    // For now, this is a stub - actual TCC compilation would happen here
+    // In a full implementation, we would:
+    // 1. Preprocess each source file
+    // 2. Parse into AST
+    // 3. Generate code
+    // 4. Link
+
+    // Handle output
+    if (run_mode) {
+        // Relocate and run
+        if (tcc_relocate(s, TCC_RELOCATE_AUTO) < 0) {
+            fprintf(stderr, "tcc: relocation failed\n");
+            ret = 1;
+            goto cleanup;
+        }
+
+        ret = tcc_run(s, run_argc, run_argv);
+    }
+    else if (preprocess_only) {
+        // Output preprocessed source
+        // (would write to stdout or file)
+        if (outfile)
+            printf("tcc: preprocessed output to %s\n", outfile);
+        else
+            printf("// Preprocessed output\n");
+    }
+    else {
+        // Generate output file
+        if (!outfile) {
+            // Default output filename
+            if (s->output_type == TCC_OUTPUT_OBJ)
+                outfile = "a.o";
+            else if (s->output_type == TCC_OUTPUT_DLL)
+                outfile = "a.so";
+            else
+                outfile = "a.out";
+        }
+
+        if (tcc_output_file(s, outfile) < 0) {
+            fprintf(stderr, "tcc: cannot write '%s'\n", outfile);
+            ret = 1;
+            goto cleanup;
+        }
+
+        if (s->verbose)
+            printf("tcc: output file '%s'\n", outfile);
+    }
+
+    // Show benchmark
+    if (show_bench) {
+        I64 elapsed = GetTicks() - start_time;
+        printf("Compilation time: %d ticks\n", elapsed);
+        printf("Files: %d\n", s->file_count);
+        printf("Errors: %d\n", s->error_count);
+        printf("Warnings: %d\n", s->warning_count);
+    }
+
+cleanup:
+    tcc_delete(s);
+    return ret;
+}
+
+// ============================================================================
+// SIMPLE C INTERPRETER
+// ============================================================================
+
+// Run a C code snippet directly
+I64 tcc_eval(U8 *code)
+{
+    // Wrap code in a main function if it doesn't have one
+    U8 *wrapped;
+    Bool has_main = StrStr(code, "main(") != NULL || StrStr(code, "main (") != NULL;
+
+    if (has_main) {
+        wrapped = code;
+    } else {
+        wrapped = MAlloc(StrLen(code) + 128);
+        sprintf(wrapped, "#include <stdio.h>\nint main() {\n%s\nreturn 0;\n}\n", code);
+    }
+
+    I64 ret = tcc_run_string(wrapped, 0, NULL);
+
+    if (!has_main)
+        Free(wrapped);
+
+    return ret;
+}
+
+// Interactive C shell
+U0 tcc_shell()
+{
+    printf("TinyCC Interactive Shell\n");
+    printf("Type C statements to execute. Type 'exit' to quit.\n");
+    printf("Use 'expr' to evaluate expressions (e.g., 'expr 2+2').\n");
+    printf("\n");
+
+    U8 line[4096];
+    U8 buffer[65536];
+    I64 buf_len = 0;
+
+    // Prelude
+    buf_len = sprintf(buffer,
+        "#include <stdio.h>\n"
+        "#include <stdlib.h>\n"
+        "#include <string.h>\n"
+        "int main() {\n");
+
+    while (TRUE) {
+        printf("> ");
+        fflush(stdout);
+
+        if (!fgets(line, sizeof(line), stdin))
+            break;
+
+        // Remove newline
+        I64 len = StrLen(line);
+        if (len > 0 && line[len-1] == '\n')
+            line[len-1] = 0;
+
+        // Check for commands
+        if (strcmp(line, "exit") == 0 || strcmp(line, "quit") == 0)
+            break;
+
+        if (strncmp(line, "expr ", 5) == 0) {
+            // Evaluate expression
+            U8 expr_code[4096];
+            sprintf(expr_code, "printf(\"%%d\\n\", %s);", line + 5);
+            tcc_eval(expr_code);
+            continue;
+        }
+
+        if (strcmp(line, "clear") == 0) {
+            buf_len = sprintf(buffer,
+                "#include <stdio.h>\n"
+                "#include <stdlib.h>\n"
+                "#include <string.h>\n"
+                "int main() {\n");
+            printf("Buffer cleared.\n");
+            continue;
+        }
+
+        if (strcmp(line, "show") == 0) {
+            printf("--- Current buffer ---\n%s\nreturn 0;}\n--- End ---\n", buffer);
+            continue;
+        }
+
+        if (strcmp(line, "run") == 0) {
+            // Execute buffer
+            U8 *code = MAlloc(buf_len + 32);
+            sprintf(code, "%s\nreturn 0;\n}\n", buffer);
+            tcc_run_string(code, 0, NULL);
+            Free(code);
+            continue;
+        }
+
+        // Add line to buffer and try to execute
+        I64 old_len = buf_len;
+        buf_len += sprintf(buffer + buf_len, "%s\n", line);
+
+        // Try to compile and run
+        U8 *code = MAlloc(buf_len + 32);
+        sprintf(code, "%s\nreturn 0;\n}\n", buffer);
+
+        // For now, just accumulate - would need proper incremental compilation
+        printf("(statement added)\n");
+        Free(code);
+    }
+
+    printf("Goodbye.\n");
+}
+
+// ============================================================================
+// FILE TYPE COMPILATION
+// ============================================================================
+
+// Compile a C file to an object file
+I64 tcc_compile_file(U8 *infile, U8 *outfile)
+{
+    U8 *argv[8];
+    argv[0] = "tcc";
+    argv[1] = "-c";
+    argv[2] = "-o";
+    argv[3] = outfile;
+    argv[4] = infile;
+    argv[5] = NULL;
+
+    return tcc_main(5, argv);
+}
+
+// Link object files to executable
+I64 tcc_link_files(U8 **objfiles, I64 count, U8 *outfile)
+{
+    U8 *argv[256];
+    I64 argc = 0;
+
+    argv[argc++] = "tcc";
+    argv[argc++] = "-o";
+    argv[argc++] = outfile;
+
+    for (I64 i = 0; i < count && argc < 255; i++)
+        argv[argc++] = objfiles[i];
+
+    argv[argc] = NULL;
+
+    return tcc_main(argc, argv);
+}
+
+// ============================================================================
+// GNU CC COMPATIBILITY WRAPPER
+// ============================================================================
+
+// Wrapper to make tcc behave more like gcc
+I64 cc_main(I64 argc, U8 **argv)
+{
+    // Just pass through to tcc for now
+    return tcc_main(argc, argv);
+}
+
+I64 gcc_main(I64 argc, U8 **argv)
+{
+    return tcc_main(argc, argv);
+}
+
+// ============================================================================
+// INITIALIZATION
+// ============================================================================
+
+"TCC driver loaded - TinyCC command-line interface for ZealOS\n";

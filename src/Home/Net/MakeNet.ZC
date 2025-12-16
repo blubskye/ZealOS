@@ -1,0 +1,47 @@
+// MakeNet.ZC - Master network module loader for ZealOS
+// Loads all networking components including Discord support
+
+Cd(__DIR__);;
+
+// Load Discord module (includes WebSocket, HTTP, TLS, Crypto)
+#include "Discord/MakeDiscord"
+
+// Optionally include the example bot
+#include "Discord/ExampleBot"
+
+NetLog("ZealOS Network Stack loaded - TLS/HTTP/WebSocket/Discord ready!");
+
+// Show available functionality
+U0 NetHelp()
+{
+	"\n";
+	"========================================\n";
+	"    ZealOS Network Stack v1.0\n";
+	"========================================\n";
+	"\n";
+	"Crypto Functions:\n";
+	"  SHA256Test()      - Test SHA-256\n";
+	"  SHA384Test()      - Test SHA-384\n";
+	"  SHA512Test()      - Test SHA-512\n";
+	"  HMACTest()        - Test HMAC\n";
+	"  HKDFTest()        - Test HKDF\n";
+	"  AESTest()         - Test AES\n";
+	"  GCMTest()         - Test AES-GCM\n";
+	"  X25519Test()      - Test X25519\n";
+	"  RandomTest()      - Test Random\n";
+	"\n";
+	"HTTP/TLS:\n";
+	"  HTTPTest()        - Test HTTPS client\n";
+	"  HTTPGet(url)      - Simple GET request\n";
+	"\n";
+	"WebSocket:\n";
+	"  WSTest()          - Test WebSocket client\n";
+	"\n";
+	"Discord:\n";
+	"  DiscordTest()     - Show Discord bot usage\n";
+	"  ExampleBotRun(token) - Run example bot\n";
+	"\n";
+	"To run a Discord bot:\n";
+	"  ExampleBotRun(\"YOUR_BOT_TOKEN\");\n";
+	"\n";
+}

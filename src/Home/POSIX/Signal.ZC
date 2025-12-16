@@ -1,0 +1,579 @@
+// Signal.ZC - POSIX Signal Emulation for ZealOS
+// Part of ZealOS POSIX compatibility layer
+//
+// Maps POSIX signals to ZealOS message system where possible
+
+// ============================================================================
+// SIGNAL SET OPERATIONS
+// ============================================================================
+
+// Initialize empty signal set
+U0 PosixSigemptyset(CPosixSigSet *set)
+{
+	if (set)
+		set->bits = 0;
+}
+
+// Initialize full signal set
+U0 PosixSigfillset(CPosixSigSet *set)
+{
+	if (set)
+		set->bits = 0xFFFFFFFFFFFFFFFF;
+}
+
+// Add signal to set
+U0 PosixSigaddset(CPosixSigSet *set, I64 signum)
+{
+	if (set && signum > 0 && signum < 64)
+		set->bits |= (1 << signum);
+}
+
+// Remove signal from set
+U0 PosixSigdelset(CPosixSigSet *set, I64 signum)
+{
+	if (set && signum > 0 && signum < 64)
+		set->bits &= ~(1 << signum);
+}
+
+// Check if signal is in set
+I64 PosixSigismember(CPosixSigSet *set, I64 signum)
+{
+	if (!set || signum <= 0 || signum >= 64)
+		return 0;
+	return (set->bits & (1 << signum)) ? 1 : 0;
+}
+
+// ============================================================================
+// DEFAULT SIGNAL ACTIONS
+// ============================================================================
+
+#define SIG_ACTION_TERM     1   // Terminate process
+#define SIG_ACTION_CORE     2   // Terminate with core dump
+#define SIG_ACTION_STOP     3   // Stop process
+#define SIG_ACTION_CONT     4   // Continue if stopped
+#define SIG_ACTION_IGN      5   // Ignore
+
+// Get default action for a signal
+I64 PosixSigDefaultAction(I64 signum)
+{
+	switch (signum) {
+		case SIGHUP:
+		case SIGINT:
+		case SIGKILL:
+		case SIGPIPE:
+		case SIGALRM:
+		case SIGTERM:
+		case SIGUSR1:
+		case SIGUSR2:
+			return SIG_ACTION_TERM;
+
+		case SIGQUIT:
+		case SIGILL:
+		case SIGABRT:
+		case SIGFPE:
+		case SIGSEGV:
+		case SIGBUS:
+		case SIGSYS:
+		case SIGTRAP:
+		case SIGXCPU:
+		case SIGXFSZ:
+			return SIG_ACTION_CORE;
+
+		case SIGSTOP:
+		case SIGTSTP:
+		case SIGTTIN:
+		case SIGTTOU:
+			return SIG_ACTION_STOP;
+
+		case SIGCONT:
+			return SIG_ACTION_CONT;
+
+		case SIGCHLD:
+		case SIGURG:
+		case SIGWINCH:
+			return SIG_ACTION_IGN;
+
+		default:
+			return SIG_ACTION_TERM;
+	}
+}
+
+// ============================================================================
+// SIGNAL HANDLING
+// ============================================================================
+
+// Install signal handler (simple interface)
+I64 PosixSignal(I64 signum, I64 handler)
+{
+	CPosixProcess *proc = PosixGetCurrent();
+	I64 old_handler;
+
+	if (!proc)
+		return SIG_ERR;
+
+	if (signum <= 0 || signum >= NSIG)
+		return SIG_ERR;
+
+	// Cannot catch or ignore SIGKILL or SIGSTOP
+	if (signum == SIGKILL || signum == SIGSTOP)
+		return SIG_ERR;
+
+	old_handler = proc->sigactions[signum].sa_handler;
+	proc->sigactions[signum].sa_handler = handler;
+	proc->sigactions[signum].sa_flags = 0;
+	PosixSigemptyset(&proc->sigactions[signum].sa_mask);
+
+	return old_handler;
+}
+
+// Install signal handler (full interface)
+I64 PosixSigaction(I64 signum, CPosixSigAction *act, CPosixSigAction *oldact)
+{
+	CPosixProcess *proc = PosixGetCurrent();
+
+	if (!proc)
+		return PosixSetErrno(EINVAL);
+
+	if (signum <= 0 || signum >= NSIG)
+		return PosixSetErrno(EINVAL);
+
+	// Cannot change SIGKILL or SIGSTOP
+	if (signum == SIGKILL || signum == SIGSTOP)
+		return PosixSetErrno(EINVAL);
+
+	// Return old action
+	if (oldact) {
+		MemCpy(oldact, &proc->sigactions[signum], sizeof(CPosixSigAction));
+	}
+
+	// Set new action
+	if (act) {
+		MemCpy(&proc->sigactions[signum], act, sizeof(CPosixSigAction));
+	}
+
+	return 0;
+}
+
+// Block/unblock signals
+I64 PosixSigprocmask(I64 how, CPosixSigSet *set, CPosixSigSet *oldset)
+{
+	CPosixProcess *proc = PosixGetCurrent();
+
+	if (!proc)
+		return PosixSetErrno(EINVAL);
+
+	// Return old mask
+	if (oldset) {
+		MemCpy(oldset, &proc->sigmask, sizeof(CPosixSigSet));
+	}
+
+	if (!set)
+		return 0;
+
+	switch (how) {
+		case 0:  // SIG_BLOCK
+			proc->sigmask.bits |= set->bits;
+			break;
+		case 1:  // SIG_UNBLOCK
+			proc->sigmask.bits &= ~set->bits;
+			break;
+		case 2:  // SIG_SETMASK
+			proc->sigmask.bits = set->bits;
+			break;
+		default:
+			return PosixSetErrno(EINVAL);
+	}
+
+	// Cannot block SIGKILL or SIGSTOP
+	proc->sigmask.bits &= ~((1 << SIGKILL) | (1 << SIGSTOP));
+
+	// Check for pending unblocked signals
+	PosixDeliverPendingSignals(proc);
+
+	return 0;
+}
+
+// ============================================================================
+// SIGNAL DELIVERY
+// ============================================================================
+
+// Send signal to process
+I64 PosixKill(I64 pid, I64 sig)
+{
+	CPosixProcess *target;
+
+	if (sig < 0 || sig >= NSIG)
+		return PosixSetErrno(EINVAL);
+
+	// Signal 0 is used to check if process exists
+	if (sig == 0) {
+		target = PosixFindProcess(pid);
+		return target ? 0 : PosixSetErrno(ESRCH);
+	}
+
+	// Find target process
+	if (pid > 0) {
+		target = PosixFindProcess(pid);
+		if (!target)
+			return PosixSetErrno(ESRCH);
+		return PosixDeliverSignal(target, sig);
+	}
+
+	if (pid == 0) {
+		// Send to all processes in same process group
+		// For simplicity, just send to current process
+		CPosixProcess *proc = PosixGetCurrent();
+		if (proc)
+			return PosixDeliverSignal(proc, sig);
+		return PosixSetErrno(ESRCH);
+	}
+
+	if (pid == -1) {
+		// Send to all processes (except init)
+		// Not fully implemented
+		return PosixSetErrno(EPERM);
+	}
+
+	// pid < -1: send to process group |pid|
+	// Not fully implemented
+	return PosixSetErrno(ESRCH);
+}
+
+// Send signal to self
+I64 PosixRaise(I64 sig)
+{
+	CPosixProcess *proc = PosixGetCurrent();
+
+	if (!proc)
+		return PosixSetErrno(EINVAL);
+
+	return PosixDeliverSignal(proc, sig);
+}
+
+// Deliver signal to a process
+I64 PosixDeliverSignal(CPosixProcess *proc, I64 sig)
+{
+	CPosixSigAction *sa;
+	I64 action;
+
+	if (!proc || sig <= 0 || sig >= NSIG)
+		return PosixSetErrno(EINVAL);
+
+	sa = &proc->sigactions[sig];
+
+	// Check if signal is blocked
+	if (PosixSigismember(&proc->sigmask, sig)) {
+		// Add to pending signals
+		PosixSigaddset(&proc->sigpending, sig);
+		return 0;
+	}
+
+	// Handle special signals
+	if (sig == SIGKILL) {
+		// Cannot be caught or ignored
+		proc->signaled = TRUE;
+		proc->term_signal = SIGKILL;
+		proc->exited = TRUE;
+		if (proc->task)
+			Kill(proc->task);
+		return 0;
+	}
+
+	if (sig == SIGSTOP) {
+		// Cannot be caught or ignored
+		if (proc->task)
+			Suspend(proc->task);
+		return 0;
+	}
+
+	if (sig == SIGCONT) {
+		// Continue stopped process
+		if (proc->task)
+			Suspend(proc->task, FALSE);
+		// If handler is default or ignore, just continue
+		if (sa->sa_handler == SIG_DFL || sa->sa_handler == SIG_IGN)
+			return 0;
+	}
+
+	// Check handler
+	if (sa->sa_handler == SIG_IGN) {
+		// Ignore signal
+		return 0;
+	}
+
+	if (sa->sa_handler == SIG_DFL) {
+		// Default action
+		action = PosixSigDefaultAction(sig);
+
+		switch (action) {
+			case SIG_ACTION_TERM:
+			case SIG_ACTION_CORE:
+				proc->signaled = TRUE;
+				proc->term_signal = sig;
+				proc->exited = TRUE;
+				if (proc->task)
+					Kill(proc->task);
+				break;
+
+			case SIG_ACTION_STOP:
+				if (proc->task)
+					Suspend(proc->task);
+				break;
+
+			case SIG_ACTION_CONT:
+				if (proc->task)
+					Suspend(proc->task, FALSE);
+				break;
+
+			case SIG_ACTION_IGN:
+				// Do nothing
+				break;
+		}
+
+		return 0;
+	}
+
+	// Call user handler
+	// In a real implementation, this would set up the stack and
+	// return to the handler. For ZealOS, we just call it directly.
+	// This is simplified - real signal handling is much more complex.
+
+	// Block signals during handler
+	CPosixSigSet old_mask;
+	MemCpy(&old_mask, &proc->sigmask, sizeof(CPosixSigSet));
+	proc->sigmask.bits |= sa->sa_mask.bits;
+	if (!(sa->sa_flags & SA_NODEFER))
+		PosixSigaddset(&proc->sigmask, sig);
+
+	// Call handler
+	// Handler prototype: void handler(int sig)
+	// We can't easily call a function pointer in ZealC like in C
+	// This is a limitation - would need to use assembly or indirect call
+
+	// Restore mask
+	MemCpy(&proc->sigmask, &old_mask, sizeof(CPosixSigSet));
+
+	// Reset handler if SA_RESETHAND
+	if (sa->sa_flags & SA_RESETHAND) {
+		sa->sa_handler = SIG_DFL;
+	}
+
+	return 0;
+}
+
+// Check and deliver pending signals
+U0 PosixDeliverPendingSignals(CPosixProcess *proc)
+{
+	I64 sig;
+	U64 pending;
+
+	if (!proc)
+		return;
+
+	// Find signals that are pending and not blocked
+	pending = proc->sigpending.bits & ~proc->sigmask.bits;
+
+	for (sig = 1; sig < NSIG && pending; sig++) {
+		if (pending & (1 << sig)) {
+			PosixSigdelset(&proc->sigpending, sig);
+			PosixDeliverSignal(proc, sig);
+			pending &= ~(1 << sig);
+		}
+	}
+}
+
+// ============================================================================
+// SIGNAL WAITING
+// ============================================================================
+
+// Wait for signal
+I64 PosixPause()
+{
+	CPosixProcess *proc = PosixGetCurrent();
+
+	if (!proc)
+		return PosixSetErrno(EINVAL);
+
+	// Wait for any signal
+	// In real implementation, we'd block here
+	// For now, just yield and check for signals
+
+	while (proc->sigpending.bits == 0) {
+		Yield;
+		// Check for termination
+		if (proc->exited)
+			break;
+	}
+
+	PosixDeliverPendingSignals(proc);
+
+	return PosixSetErrno(EINTR);
+}
+
+// Wait with custom mask
+I64 PosixSigsuspend(CPosixSigSet *mask)
+{
+	CPosixProcess *proc = PosixGetCurrent();
+	CPosixSigSet old_mask;
+
+	if (!proc)
+		return PosixSetErrno(EINVAL);
+
+	// Save old mask and set temporary mask
+	MemCpy(&old_mask, &proc->sigmask, sizeof(CPosixSigSet));
+	if (mask)
+		MemCpy(&proc->sigmask, mask, sizeof(CPosixSigSet));
+
+	// Wait for signal
+	while ((proc->sigpending.bits & ~proc->sigmask.bits) == 0) {
+		Yield;
+		if (proc->exited)
+			break;
+	}
+
+	// Deliver signals
+	PosixDeliverPendingSignals(proc);
+
+	// Restore old mask
+	MemCpy(&proc->sigmask, &old_mask, sizeof(CPosixSigSet));
+
+	return PosixSetErrno(EINTR);
+}
+
+// ============================================================================
+// ALARM
+// ============================================================================
+
+// Pending alarm data (per-process in real implementation)
+U64 posix_alarm_time = 0;
+I64 posix_alarm_pid = 0;
+
+// Set alarm timer
+I64 PosixAlarm(I64 seconds)
+{
+	CPosixProcess *proc = PosixGetCurrent();
+	I64 remaining = 0;
+	U64 now;
+
+	if (!proc)
+		return 0;
+
+	now = tS;
+
+	// Calculate remaining time from previous alarm
+	if (posix_alarm_time > 0 && posix_alarm_pid == proc->pid) {
+		if (posix_alarm_time > now)
+			remaining = posix_alarm_time - now;
+	}
+
+	// Set new alarm
+	if (seconds > 0) {
+		posix_alarm_time = now + seconds;
+		posix_alarm_pid = proc->pid;
+	} else {
+		// Cancel alarm
+		posix_alarm_time = 0;
+		posix_alarm_pid = 0;
+	}
+
+	return remaining;
+}
+
+// Check for alarm expiration (called periodically)
+U0 PosixCheckAlarm()
+{
+	CPosixProcess *proc;
+	U64 now;
+
+	if (posix_alarm_time == 0)
+		return;
+
+	now = tS;
+
+	if (now >= posix_alarm_time) {
+		proc = PosixFindProcess(posix_alarm_pid);
+		if (proc) {
+			PosixDeliverSignal(proc, SIGALRM);
+		}
+		posix_alarm_time = 0;
+		posix_alarm_pid = 0;
+	}
+}
+
+// ============================================================================
+// SIGNAL NAME UTILITIES
+// ============================================================================
+
+U8 *posix_signal_names[NSIG] = {
+	"0",        // 0
+	"SIGHUP",   // 1
+	"SIGINT",   // 2
+	"SIGQUIT",  // 3
+	"SIGILL",   // 4
+	"SIGTRAP",  // 5
+	"SIGABRT",  // 6
+	"SIGBUS",   // 7
+	"SIGFPE",   // 8
+	"SIGKILL",  // 9
+	"SIGUSR1",  // 10
+	"SIGSEGV",  // 11
+	"SIGUSR2",  // 12
+	"SIGPIPE",  // 13
+	"SIGALRM",  // 14
+	"SIGTERM",  // 15
+	"SIGSTKFLT",// 16
+	"SIGCHLD",  // 17
+	"SIGCONT",  // 18
+	"SIGSTOP",  // 19
+	"SIGTSTP",  // 20
+	"SIGTTIN",  // 21
+	"SIGTTOU",  // 22
+	"SIGURG",   // 23
+	"SIGXCPU",  // 24
+	"SIGXFSZ",  // 25
+	"SIGVTALRM",// 26
+	"SIGPROF",  // 27
+	"SIGWINCH", // 28
+	"SIGIO",    // 29
+	"SIGPWR",   // 30
+	"SIGSYS"    // 31
+};
+
+// Get signal name
+U8 *PosixSignalName(I64 sig)
+{
+	if (sig >= 0 && sig < NSIG)
+		return posix_signal_names[sig];
+	return "UNKNOWN";
+}
+
+// Parse signal name or number
+I64 PosixParseSignal(U8 *str)
+{
+	I64 i, num;
+
+	if (!str)
+		return -1;
+
+	// Try parsing as number
+	if (*str >= '0' && *str <= '9') {
+		num = Str2I64(str);
+		if (num >= 0 && num < NSIG)
+			return num;
+		return -1;
+	}
+
+	// Remove "SIG" prefix if present
+	if (StrNCmp(str, "SIG", 3) == 0)
+		str += 3;
+
+	// Search signal names
+	for (i = 1; i < NSIG; i++) {
+		// Compare without "SIG" prefix
+		if (StrICmp(str, posix_signal_names[i] + 3) == 0)
+			return i;
+	}
+
+	return -1;
+}
+

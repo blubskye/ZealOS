@@ -1,0 +1,241 @@
+// paste.ZC - GNU coreutils 'paste' implementation
+// Merge lines of files
+
+#define PASTE_LINE_SIZE 4096
+#define PASTE_MAX_FILES 64
+
+// C-style main function
+I64 paste_main(I64 argc, U8 **argv)
+{
+    Bool serial = FALSE;         // -s
+    U8 *delimiters = "\t";       // -d
+    Bool zero_terminated = FALSE; // -z
+    I64 start = 1;
+
+    // Parse options
+    while (start < argc && argv[start][0] == '-' && argv[start][1]) {
+        U8 *arg = argv[start];
+
+        if (strcmp(arg, "--help") == 0) {
+            printf("Usage: paste [OPTION]... [FILE]...\n");
+            printf("Write lines consisting of the sequentially corresponding lines from\n");
+            printf("each FILE, separated by TABs, to standard output.\n\n");
+            printf("  -d, --delimiters=LIST   reuse characters from LIST instead of TABs\n");
+            printf("  -s, --serial            paste one file at a time instead of in parallel\n");
+            printf("  -z, --zero-terminated   line delimiter is NUL, not newline\n");
+            printf("      --help              display this help and exit\n");
+            printf("      --version           output version information and exit\n");
+            printf("\nWith no FILE, or when FILE is -, read standard input.\n");
+            return 0;
+        }
+
+        if (strcmp(arg, "--version") == 0) {
+            printf("paste (ZealOS coreutils) 1.0\n");
+            return 0;
+        }
+
+        if (strcmp(arg, "-s") == 0 || strcmp(arg, "--serial") == 0) {
+            serial = TRUE; start++; continue;
+        }
+
+        if (strcmp(arg, "-z") == 0 || strcmp(arg, "--zero-terminated") == 0) {
+            zero_terminated = TRUE; start++; continue;
+        }
+
+        if (strncmp(arg, "-d", 2) == 0) {
+            if (arg[2]) {
+                delimiters = &arg[2];
+            } else if (start + 1 < argc) {
+                start++;
+                delimiters = argv[start];
+            }
+            start++;
+            continue;
+        }
+
+        if (strncmp(arg, "--delimiters=", 13) == 0) {
+            delimiters = &arg[13];
+            start++;
+            continue;
+        }
+
+        if (strcmp(arg, "--") == 0) {
+            start++;
+            break;
+        }
+
+        if (arg[0] == '-' && arg[1] != 0) {
+            fprintf(stderr, "paste: invalid option '%s'\n", arg);
+            return 1;
+        }
+
+        break;
+    }
+
+    // Process escape sequences in delimiters
+    auto process_delims = [](U8 *src) -> U8* {
+        U8 *result = MAlloc(strlen(src) + 1);
+        I64 j = 0;
+        for (I64 i = 0; src[i]; i++) {
+            if (src[i] == '\\' && src[i+1]) {
+                i++;
+                switch (src[i]) {
+                    case 'n': result[j++] = '\n'; break;
+                    case 't': result[j++] = '\t'; break;
+                    case 'r': result[j++] = '\r'; break;
+                    case '\\': result[j++] = '\\'; break;
+                    case '0': result[j++] = 0; break;  // Empty string
+                    default: result[j++] = src[i];
+                }
+            } else {
+                result[j++] = src[i];
+            }
+        }
+        result[j] = 0;
+        return result;
+    };
+
+    U8 *delims = process_delims(delimiters);
+    I64 delim_count = strlen(delims);
+    if (delim_count == 0) {
+        delims = MAlloc(2);
+        delims[0] = '\t';
+        delims[1] = 0;
+        delim_count = 1;
+    }
+
+    U8 line_delim = zero_terminated ? 0 : '\n';
+
+    // Collect file names
+    I64 file_count = argc - start;
+    if (file_count == 0) {
+        file_count = 1;  // Default to stdin
+    }
+
+    if (serial) {
+        // Serial mode: paste all lines from each file horizontally
+        for (I64 f = start; f < argc || (f == start && start >= argc); f++) {
+            U8 *filename = (f < argc) ? argv[f] : "-";
+            FILE *fp;
+
+            if (strcmp(filename, "-") == 0) {
+                fp = stdin;
+            } else {
+                fp = fopen(filename, "r");
+                if (!fp) {
+                    fprintf(stderr, "paste: cannot open '%s': %s\n", filename, strerror(errno));
+                    Free(delims);
+                    return 1;
+                }
+            }
+
+            U8 *line = MAlloc(PASTE_LINE_SIZE);
+            Bool first = TRUE;
+            I64 delim_idx = 0;
+
+            while (fgets(line, PASTE_LINE_SIZE, fp)) {
+                // Remove trailing newline
+                I64 len = strlen(line);
+                if (len > 0 && (line[len-1] == '\n' || line[len-1] == 0))
+                    line[len-1] = 0;
+
+                if (!first) {
+                    U8 d = delims[delim_idx];
+                    if (d) putchar(d);
+                    delim_idx = (delim_idx + 1) % delim_count;
+                }
+                printf("%s", line);
+                first = FALSE;
+            }
+
+            Free(line);
+            if (fp != stdin) fclose(fp);
+
+            if (!first) {
+                if (zero_terminated) putchar(0);
+                else putchar('\n');
+            }
+
+            if (f == start && start >= argc) break;  // Only stdin
+        }
+    } else {
+        // Parallel mode: merge corresponding lines from all files
+        FILE *fps[PASTE_MAX_FILES];
+        I64 actual_files = 0;
+
+        // Open all files
+        for (I64 f = start; f < argc && actual_files < PASTE_MAX_FILES; f++) {
+            if (strcmp(argv[f], "-") == 0) {
+                fps[actual_files++] = stdin;
+            } else {
+                FILE *fp = fopen(argv[f], "r");
+                if (!fp) {
+                    fprintf(stderr, "paste: cannot open '%s': %s\n", argv[f], strerror(errno));
+                    // Close already opened files
+                    for (I64 i = 0; i < actual_files; i++) {
+                        if (fps[i] != stdin) fclose(fps[i]);
+                    }
+                    Free(delims);
+                    return 1;
+                }
+                fps[actual_files++] = fp;
+            }
+        }
+
+        // Default to stdin if no files
+        if (actual_files == 0) {
+            fps[actual_files++] = stdin;
+        }
+
+        U8 *line = MAlloc(PASTE_LINE_SIZE);
+        Bool any_data = TRUE;
+
+        while (any_data) {
+            any_data = FALSE;
+            I64 delim_idx = 0;
+
+            for (I64 f = 0; f < actual_files; f++) {
+                if (f > 0) {
+                    U8 d = delims[delim_idx];
+                    if (d) putchar(d);
+                    delim_idx = (delim_idx + 1) % delim_count;
+                }
+
+                if (fps[f] && fgets(line, PASTE_LINE_SIZE, fps[f])) {
+                    // Remove trailing newline
+                    I64 len = strlen(line);
+                    if (len > 0 && (line[len-1] == '\n' || line[len-1] == 0))
+                        line[len-1] = 0;
+                    printf("%s", line);
+                    any_data = TRUE;
+                } else {
+                    // EOF on this file
+                    if (fps[f] && fps[f] != stdin) {
+                        fclose(fps[f]);
+                        fps[f] = NULL;
+                    }
+                }
+            }
+
+            if (any_data) {
+                if (zero_terminated) putchar(0);
+                else putchar('\n');
+            }
+        }
+
+        Free(line);
+
+        // Close remaining files
+        for (I64 i = 0; i < actual_files; i++) {
+            if (fps[i] && fps[i] != stdin) fclose(fps[i]);
+        }
+    }
+
+    Free(delims);
+    return 0;
+}
+
+U0 GnuPasteRegister()
+{
+    "GNU 'paste' utility loaded.\n";
+}

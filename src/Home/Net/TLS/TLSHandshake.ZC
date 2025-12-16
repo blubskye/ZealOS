@@ -1,0 +1,1004 @@
+// TLSHandshake.ZC - TLS 1.3 Handshake Implementation
+// Part of ZealOS TLS implementation
+// See C:/Home/Net/Docs/TLSDesign.DD for design documentation
+
+// This implements the TLS 1.3 handshake:
+// Client                                           Server
+// ClientHello             -------->
+//                                             ServerHello
+//                                   {EncryptedExtensions}
+//                                           {Certificate*}
+//                                     {CertificateVerify*}
+//                         <--------           {Finished}
+// {Finished}              -------->
+// [Application Data]      <------->   [Application Data]
+
+// ============================================================================
+// HANDSHAKE MESSAGE BUILDING HELPERS
+// ============================================================================
+
+// Write 16-bit value big-endian
+U0 TLSWrite16(U8 *buf, U16 value)
+{
+	buf[0] = (U8)(value >> 8);
+	buf[1] = (U8)(value);
+}
+
+// Write 24-bit value big-endian
+U0 TLSWrite24(U8 *buf, U32 value)
+{
+	buf[0] = (U8)(value >> 16);
+	buf[1] = (U8)(value >> 8);
+	buf[2] = (U8)(value);
+}
+
+// Read 16-bit value big-endian
+U16 TLSRead16(U8 *buf)
+{
+	return ((U16)buf[0] << 8) | buf[1];
+}
+
+// Read 24-bit value big-endian
+U32 TLSRead24(U8 *buf)
+{
+	return ((U32)buf[0] << 16) | ((U32)buf[1] << 8) | buf[2];
+}
+
+// ============================================================================
+// EXTENSION BUILDING
+// ============================================================================
+
+// Build supported_versions extension (client)
+I64 TLSBuildExtSupportedVersions(U8 *buf)
+{
+	I64 pos = 0;
+
+	// Extension type
+	TLSWrite16(&buf[pos], TLS_EXT_SUPPORTED_VERSIONS); pos += 2;
+
+	// Extension length = 3 (1 byte version list length + 2 bytes version)
+	TLSWrite16(&buf[pos], 3); pos += 2;
+
+	// Versions list length
+	buf[pos++] = 2;  // 2 bytes for one version
+
+	// TLS 1.3 version
+	TLSWrite16(&buf[pos], TLS_VERSION_1_3); pos += 2;
+
+	return pos;
+}
+
+// Build supported_groups extension
+I64 TLSBuildExtSupportedGroups(U8 *buf)
+{
+	I64 pos = 0;
+
+	// Extension type
+	TLSWrite16(&buf[pos], TLS_EXT_SUPPORTED_GROUPS); pos += 2;
+
+	// Extension length = 4 (2 bytes list length + 2 bytes group)
+	TLSWrite16(&buf[pos], 4); pos += 2;
+
+	// Groups list length
+	TLSWrite16(&buf[pos], 2); pos += 2;  // One group
+
+	// X25519
+	TLSWrite16(&buf[pos], TLS_GROUP_X25519); pos += 2;
+
+	return pos;
+}
+
+// Build signature_algorithms extension
+I64 TLSBuildExtSignatureAlgorithms(U8 *buf)
+{
+	I64 pos = 0;
+
+	// Extension type
+	TLSWrite16(&buf[pos], TLS_EXT_SIGNATURE_ALGORITHMS); pos += 2;
+
+	// Extension length = 8 (2 bytes list length + 6 bytes for 3 algorithms)
+	TLSWrite16(&buf[pos], 8); pos += 2;
+
+	// Algorithms list length
+	TLSWrite16(&buf[pos], 6); pos += 2;
+
+	// RSA-PSS with SHA-256
+	TLSWrite16(&buf[pos], TLS_SIG_RSA_PSS_RSAE_SHA256); pos += 2;
+
+	// ECDSA with P-256
+	TLSWrite16(&buf[pos], TLS_SIG_ECDSA_SECP256R1_SHA256); pos += 2;
+
+	// RSA-PKCS1 with SHA-256 (legacy)
+	TLSWrite16(&buf[pos], TLS_SIG_RSA_PKCS1_SHA256); pos += 2;
+
+	return pos;
+}
+
+// Build key_share extension (client)
+I64 TLSBuildExtKeyShare(U8 *buf, U8 *public_key)
+{
+	I64 pos = 0;
+
+	// Extension type
+	TLSWrite16(&buf[pos], TLS_EXT_KEY_SHARE); pos += 2;
+
+	// Extension length = 36 (2 + 2 + 32)
+	TLSWrite16(&buf[pos], 36); pos += 2;
+
+	// Key share list length
+	TLSWrite16(&buf[pos], 34); pos += 2;  // 2 + 32
+
+	// Named group (X25519)
+	TLSWrite16(&buf[pos], TLS_GROUP_X25519); pos += 2;
+
+	// Key length
+	TLSWrite16(&buf[pos], 32); pos += 2;
+
+	// Public key
+	MemCpy(&buf[pos], public_key, 32); pos += 32;
+
+	return pos;
+}
+
+// Build server_name (SNI) extension
+I64 TLSBuildExtServerName(U8 *buf, U8 *hostname)
+{
+	I64 pos = 0;
+	I64 name_len = StrLen(hostname);
+
+	// Extension type
+	TLSWrite16(&buf[pos], TLS_EXT_SERVER_NAME); pos += 2;
+
+	// Extension length = name_len + 5
+	TLSWrite16(&buf[pos], name_len + 5); pos += 2;
+
+	// Server name list length = name_len + 3
+	TLSWrite16(&buf[pos], name_len + 3); pos += 2;
+
+	// Name type (0 = hostname)
+	buf[pos++] = 0;
+
+	// Name length
+	TLSWrite16(&buf[pos], name_len); pos += 2;
+
+	// Hostname
+	MemCpy(&buf[pos], hostname, name_len); pos += name_len;
+
+	return pos;
+}
+
+// ============================================================================
+// CLIENT HELLO
+// ============================================================================
+
+// Build and send ClientHello message
+I64 TLSSendClientHello(CTLSState *tls, CTCPSocket *sock)
+{
+	U8 *msg;
+	U8 *extensions;
+	I64 msg_size;
+	I64 ext_pos = 0;
+	I64 pos = 0;
+	I64 result;
+
+	// Allocate message buffer (max reasonable size)
+	msg = MAlloc(512);
+	extensions = MAlloc(256);
+
+	// Build extensions first to know total length
+	ext_pos = 0;
+
+	// supported_versions extension (REQUIRED for TLS 1.3)
+	ext_pos += TLSBuildExtSupportedVersions(&extensions[ext_pos]);
+
+	// supported_groups extension
+	ext_pos += TLSBuildExtSupportedGroups(&extensions[ext_pos]);
+
+	// signature_algorithms extension
+	ext_pos += TLSBuildExtSignatureAlgorithms(&extensions[ext_pos]);
+
+	// key_share extension
+	ext_pos += TLSBuildExtKeyShare(&extensions[ext_pos], tls->ecdh_public);
+
+	// server_name (SNI) extension if hostname is set
+	if (tls->server_name) {
+		ext_pos += TLSBuildExtServerName(&extensions[ext_pos], tls->server_name);
+	}
+
+	// Now build the ClientHello
+	pos = 0;
+
+	// Handshake type
+	msg[pos++] = TLS_HS_CLIENT_HELLO;
+
+	// Length placeholder (24-bit)
+	I64 length_pos = pos;
+	pos += 3;
+
+	// Client version (legacy: 0x0303 = TLS 1.2)
+	TLSWrite16(&msg[pos], TLS_LEGACY_VERSION); pos += 2;
+
+	// Client random
+	MemCpy(&msg[pos], tls->client_random, 32); pos += 32;
+
+	// Session ID (empty for TLS 1.3)
+	msg[pos++] = 0;  // Session ID length = 0
+
+	// Cipher suites (3 ciphers: AES-128-GCM, AES-256-GCM, ChaCha20-Poly1305)
+	TLSWrite16(&msg[pos], 6); pos += 2;  // 6 bytes for three ciphers
+	TLSWrite16(&msg[pos], TLS_AES_128_GCM_SHA256); pos += 2;
+	TLSWrite16(&msg[pos], TLS_AES_256_GCM_SHA384); pos += 2;
+	TLSWrite16(&msg[pos], TLS_CHACHA20_POLY1305_SHA256); pos += 2;
+
+	// Compression methods (null only)
+	msg[pos++] = 1;  // Length
+	msg[pos++] = 0;  // null compression
+
+	// Extensions length
+	TLSWrite16(&msg[pos], ext_pos); pos += 2;
+
+	// Extensions
+	MemCpy(&msg[pos], extensions, ext_pos); pos += ext_pos;
+
+	// Fill in handshake length
+	TLSWrite24(&msg[length_pos], pos - 4);
+
+	msg_size = pos;
+
+	// Update transcript hash
+	TLSUpdateTranscript(tls, msg, msg_size);
+
+	// Send as plaintext record
+	result = TLSWritePlaintextRecord(sock, TLS_CONTENT_HANDSHAKE, msg, msg_size);
+
+	Free(msg);
+	Free(extensions);
+
+	if (result < 0) {
+		return result;
+	}
+
+	tls->state = TLS_STATE_CLIENT_HELLO_SENT;
+	return TLS_OK;
+}
+
+// ============================================================================
+// SERVER HELLO PARSING
+// ============================================================================
+
+// Parse ServerHello message
+I64 TLSParseServerHello(CTLSState *tls, U8 *data, I64 length)
+{
+	I64 pos = 0;
+	U16 version;
+	U16 cipher_suite;
+	U8 session_id_len;
+	U8 compression;
+	U16 ext_len;
+	Bool found_version = FALSE;
+	Bool found_key_share = FALSE;
+
+	if (length < 38) {  // Minimum ServerHello size
+		return TLS_ERR_INVALID_MESSAGE;
+	}
+
+	// Legacy version
+	version = TLSRead16(&data[pos]); pos += 2;
+
+	// Server random
+	MemCpy(tls->server_random, &data[pos], 32); pos += 32;
+
+	// Check for HelloRetryRequest (server_random = SHA-256("HelloRetryRequest"))
+	// We don't support HRR in this implementation
+
+	// Session ID (echo back, should be empty)
+	session_id_len = data[pos++];
+	if (pos + session_id_len > length) {
+		return TLS_ERR_INVALID_MESSAGE;
+	}
+	pos += session_id_len;
+
+	// Cipher suite
+	cipher_suite = TLSRead16(&data[pos]); pos += 2;
+
+	// Validate cipher suite
+	if (cipher_suite != TLS_AES_128_GCM_SHA256 &&
+	    cipher_suite != TLS_AES_256_GCM_SHA384 &&
+	    cipher_suite != TLS_CHACHA20_POLY1305_SHA256) {
+		return TLS_ERR_UNSUPPORTED_CIPHER;
+	}
+
+	tls->cipher_suite = cipher_suite;
+	tls->hash_size = TLSCipherHashSize(cipher_suite);
+	tls->use_sha384 = (cipher_suite == TLS_AES_256_GCM_SHA384);
+
+	// Compression method (must be 0)
+	compression = data[pos++];
+	if (compression != 0) {
+		return TLS_ERR_INVALID_MESSAGE;
+	}
+
+	// Extensions
+	if (pos + 2 > length) {
+		return TLS_ERR_INVALID_MESSAGE;
+	}
+	ext_len = TLSRead16(&data[pos]); pos += 2;
+
+	if (pos + ext_len > length) {
+		return TLS_ERR_INVALID_MESSAGE;
+	}
+
+	// Parse extensions
+	I64 ext_end = pos + ext_len;
+	while (pos + 4 <= ext_end) {
+		U16 ext_type = TLSRead16(&data[pos]); pos += 2;
+		U16 ext_size = TLSRead16(&data[pos]); pos += 2;
+
+		if (pos + ext_size > ext_end) {
+			return TLS_ERR_INVALID_MESSAGE;
+		}
+
+		switch (ext_type) {
+			case TLS_EXT_SUPPORTED_VERSIONS:
+				if (ext_size >= 2) {
+					version = TLSRead16(&data[pos]);
+					if (version == TLS_VERSION_1_3) {
+						tls->version = TLS_VERSION_1_3;
+						found_version = TRUE;
+					}
+				}
+				break;
+
+			case TLS_EXT_KEY_SHARE:
+				if (ext_size >= 36) {
+					U16 group = TLSRead16(&data[pos]);
+					U16 key_len = TLSRead16(&data[pos + 2]);
+					if (group == TLS_GROUP_X25519 && key_len == 32) {
+						MemCpy(tls->server_public, &data[pos + 4], 32);
+						found_key_share = TRUE;
+					}
+				}
+				break;
+		}
+
+		pos += ext_size;
+	}
+
+	// Verify we got TLS 1.3
+	if (!found_version || tls->version != TLS_VERSION_1_3) {
+		return TLS_ERR_UNSUPPORTED_VERSION;
+	}
+
+	// Verify we got key share
+	if (!found_key_share) {
+		return TLS_ERR_MISSING_EXTENSION;
+	}
+
+	return TLS_OK;
+}
+
+// ============================================================================
+// KEY SCHEDULE
+// ============================================================================
+
+// Compute shared secret and derive handshake keys
+I64 TLSDeriveHandshakeKeys(CTLSState *tls)
+{
+	U8 shared_secret[32];
+	U8 zero_psk[48];  // Zero PSK for no resumption
+	U8 transcript_hash[48];
+	U8 derived_secret[48];
+	I64 hash_size = tls->hash_size;
+	I64 key_size = TLSCipherKeySize(tls->cipher_suite);
+	I64 result;
+
+	// Zero PSK (no pre-shared key)
+	MemSet(zero_psk, 0, hash_size);
+
+	// Compute X25519 shared secret
+	result = X25519SharedSecret(shared_secret, tls->ecdh_private, tls->server_public);
+	if (result != CRYPTO_OK) {
+		return TLS_ERR_INTERNAL;
+	}
+
+	// --- Early Secret ---
+	// early_secret = HKDF-Extract(salt=0, IKM=PSK)
+	MemSet(tls->early_secret, 0, hash_size);  // salt = 0
+	HKDFExtract(tls->early_secret, hash_size, zero_psk, hash_size,
+	            tls->early_secret, tls->use_sha384 ? HASH_SHA384 : HASH_SHA256);
+
+	// --- Handshake Secret ---
+	// Derive-Secret(early_secret, "derived", "")
+	// Empty hash for ""
+	U8 empty_hash[48];
+	if (tls->use_sha384) {
+		SHA384(NULL, 0, empty_hash);
+	} else {
+		SHA256(NULL, 0, empty_hash);
+	}
+
+	TLSDeriveSecret(tls->early_secret, hash_size,
+	                "derived", 7, empty_hash, derived_secret,
+	                tls->use_sha384 ? HASH_SHA384 : HASH_SHA256);
+
+	// handshake_secret = HKDF-Extract(derived_secret, shared_secret)
+	HKDFExtract(derived_secret, hash_size, shared_secret, 32,
+	            tls->handshake_secret, tls->use_sha384 ? HASH_SHA384 : HASH_SHA256);
+
+	// Get transcript hash up to this point (ClientHello + ServerHello)
+	TLSGetTranscriptHash(tls, transcript_hash);
+
+	// --- Client Handshake Traffic Secret ---
+	TLSDeriveSecret(tls->handshake_secret, hash_size,
+	                "c hs traffic", 12, transcript_hash,
+	                tls->client_handshake_traffic_secret,
+	                tls->use_sha384 ? HASH_SHA384 : HASH_SHA256);
+
+	// --- Server Handshake Traffic Secret ---
+	TLSDeriveSecret(tls->handshake_secret, hash_size,
+	                "s hs traffic", 12, transcript_hash,
+	                tls->server_handshake_traffic_secret,
+	                tls->use_sha384 ? HASH_SHA384 : HASH_SHA256);
+
+	// Derive server handshake write key and IV
+	HKDFExpandLabel(tls->server_handshake_traffic_secret, hash_size,
+	                "key", 3, NULL, 0, tls->server_write_key, key_size,
+	                tls->use_sha384 ? HASH_SHA384 : HASH_SHA256);
+
+	HKDFExpandLabel(tls->server_handshake_traffic_secret, hash_size,
+	                "iv", 2, NULL, 0, tls->server_write_iv, 12,
+	                tls->use_sha384 ? HASH_SHA384 : HASH_SHA256);
+
+	// Derive client handshake write key and IV
+	HKDFExpandLabel(tls->client_handshake_traffic_secret, hash_size,
+	                "key", 3, NULL, 0, tls->client_write_key, key_size,
+	                tls->use_sha384 ? HASH_SHA384 : HASH_SHA256);
+
+	HKDFExpandLabel(tls->client_handshake_traffic_secret, hash_size,
+	                "iv", 2, NULL, 0, tls->client_write_iv, 12,
+	                tls->use_sha384 ? HASH_SHA384 : HASH_SHA256);
+
+	// Initialize cipher contexts (only for AES-GCM, ChaCha20-Poly1305 uses keys directly)
+	if (tls->cipher_suite != TLS_CHACHA20_POLY1305_SHA256) {
+		GCMInit(&tls->server_gcm, tls->server_write_key, key_size);
+		GCMInit(&tls->client_gcm, tls->client_write_key, key_size);
+	}
+
+	// Reset sequence numbers
+	tls->client_seq = 0;
+	tls->server_seq = 0;
+
+	// Secure cleanup
+	CryptoSecureZero(shared_secret, 32);
+	CryptoSecureZero(derived_secret, 48);
+	CryptoSecureZero(empty_hash, 48);
+
+	return TLS_OK;
+}
+
+// Derive application traffic keys from master secret
+I64 TLSDeriveApplicationKeys(CTLSState *tls)
+{
+	U8 derived_secret[48];
+	U8 transcript_hash[48];
+	U8 empty_hash[48];
+	I64 hash_size = tls->hash_size;
+	I64 key_size = TLSCipherKeySize(tls->cipher_suite);
+
+	// Get empty hash
+	if (tls->use_sha384) {
+		SHA384(NULL, 0, empty_hash);
+	} else {
+		SHA256(NULL, 0, empty_hash);
+	}
+
+	// --- Master Secret ---
+	// derived_secret = Derive-Secret(handshake_secret, "derived", "")
+	TLSDeriveSecret(tls->handshake_secret, hash_size,
+	                "derived", 7, empty_hash, derived_secret,
+	                tls->use_sha384 ? HASH_SHA384 : HASH_SHA256);
+
+	// master_secret = HKDF-Extract(derived_secret, 0)
+	U8 zero_ikm[48];
+	MemSet(zero_ikm, 0, hash_size);
+	HKDFExtract(derived_secret, hash_size, zero_ikm, hash_size,
+	            tls->master_secret, tls->use_sha384 ? HASH_SHA384 : HASH_SHA256);
+
+	// Get transcript hash (up through server Finished)
+	TLSGetTranscriptHash(tls, transcript_hash);
+
+	// --- Client Application Traffic Secret ---
+	TLSDeriveSecret(tls->master_secret, hash_size,
+	                "c ap traffic", 12, transcript_hash,
+	                tls->client_application_traffic_secret,
+	                tls->use_sha384 ? HASH_SHA384 : HASH_SHA256);
+
+	// --- Server Application Traffic Secret ---
+	TLSDeriveSecret(tls->master_secret, hash_size,
+	                "s ap traffic", 12, transcript_hash,
+	                tls->server_application_traffic_secret,
+	                tls->use_sha384 ? HASH_SHA384 : HASH_SHA256);
+
+	// Derive new keys from application secrets
+	HKDFExpandLabel(tls->server_application_traffic_secret, hash_size,
+	                "key", 3, NULL, 0, tls->server_write_key, key_size,
+	                tls->use_sha384 ? HASH_SHA384 : HASH_SHA256);
+
+	HKDFExpandLabel(tls->server_application_traffic_secret, hash_size,
+	                "iv", 2, NULL, 0, tls->server_write_iv, 12,
+	                tls->use_sha384 ? HASH_SHA384 : HASH_SHA256);
+
+	HKDFExpandLabel(tls->client_application_traffic_secret, hash_size,
+	                "key", 3, NULL, 0, tls->client_write_key, key_size,
+	                tls->use_sha384 ? HASH_SHA384 : HASH_SHA256);
+
+	HKDFExpandLabel(tls->client_application_traffic_secret, hash_size,
+	                "iv", 2, NULL, 0, tls->client_write_iv, 12,
+	                tls->use_sha384 ? HASH_SHA384 : HASH_SHA256);
+
+	// Re-initialize cipher contexts with new keys (only for AES-GCM)
+	if (tls->cipher_suite != TLS_CHACHA20_POLY1305_SHA256) {
+		GCMInit(&tls->server_gcm, tls->server_write_key, key_size);
+		GCMInit(&tls->client_gcm, tls->client_write_key, key_size);
+	}
+
+	// Reset sequence numbers for application data
+	tls->client_seq = 0;
+	tls->server_seq = 0;
+
+	// Secure cleanup
+	CryptoSecureZero(derived_secret, 48);
+	CryptoSecureZero(empty_hash, 48);
+	CryptoSecureZero(zero_ikm, 48);
+
+	return TLS_OK;
+}
+
+// ============================================================================
+// FINISHED MESSAGE
+// ============================================================================
+
+// Compute Finished verify data
+U0 TLSComputeFinished(CTLSState *tls, U8 *traffic_secret, U8 *verify_data)
+{
+	U8 finished_key[48];
+	U8 transcript_hash[48];
+	I64 hash_size = tls->hash_size;
+
+	// finished_key = HKDF-Expand-Label(traffic_secret, "finished", "", hash_len)
+	HKDFExpandLabel(traffic_secret, hash_size,
+	                "finished", 8, NULL, 0, finished_key, hash_size,
+	                tls->use_sha384 ? HASH_SHA384 : HASH_SHA256);
+
+	// Get transcript hash
+	TLSGetTranscriptHash(tls, transcript_hash);
+
+	// verify_data = HMAC(finished_key, transcript_hash)
+	HMAC(finished_key, hash_size, transcript_hash, hash_size, verify_data,
+	     tls->use_sha384 ? HASH_SHA384 : HASH_SHA256);
+
+	CryptoSecureZero(finished_key, 48);
+}
+
+// Build and send client Finished message
+I64 TLSSendFinished(CTLSState *tls, CTCPSocket *sock)
+{
+	U8 msg[4 + 48];  // Handshake header + max verify data
+	U8 verify_data[48];
+	I64 hash_size = tls->hash_size;
+	I64 result;
+
+	// Compute verify data
+	TLSComputeFinished(tls, tls->client_handshake_traffic_secret, verify_data);
+
+	// Build Finished message
+	msg[0] = TLS_HS_FINISHED;
+	TLSWrite24(&msg[1], hash_size);
+	MemCpy(&msg[4], verify_data, hash_size);
+
+	// Update transcript BEFORE encrypting
+	TLSUpdateTranscript(tls, msg, 4 + hash_size);
+
+	// Send encrypted record
+	result = TLSWriteEncryptedRecord(tls, sock, TLS_CONTENT_HANDSHAKE, msg, 4 + hash_size);
+
+	CryptoSecureZero(verify_data, 48);
+	CryptoSecureZero(msg, sizeof(msg));
+
+	return result;
+}
+
+// Verify server Finished message
+I64 TLSVerifyServerFinished(CTLSState *tls, U8 *finished_data, I64 length)
+{
+	U8 expected[48];
+	I64 hash_size = tls->hash_size;
+
+	if (length != hash_size) {
+		return TLS_ERR_INVALID_MESSAGE;
+	}
+
+	// Compute expected verify data
+	TLSComputeFinished(tls, tls->server_handshake_traffic_secret, expected);
+
+	// Compare
+	if (CryptoConstantTimeCompare(finished_data, expected, hash_size) != 0) {
+		CryptoSecureZero(expected, 48);
+		return TLS_ERR_AUTH_FAILED;
+	}
+
+	CryptoSecureZero(expected, 48);
+	return TLS_OK;
+}
+
+// ============================================================================
+// HANDSHAKE MESSAGE PROCESSING
+// ============================================================================
+
+// Process an encrypted handshake message
+// Returns TLS_OK or error code
+I64 TLSProcessHandshakeMessage(CTLSState *tls, U8 *data, I64 length)
+{
+	U8 msg_type;
+	U32 msg_length;
+
+	if (length < 4) {
+		return TLS_ERR_INVALID_MESSAGE;
+	}
+
+	msg_type = data[0];
+	msg_length = TLSRead24(&data[1]);
+
+	if (msg_length + 4 > length) {
+		return TLS_ERR_INVALID_MESSAGE;
+	}
+
+	// Update transcript hash for this message
+	TLSUpdateTranscript(tls, data, msg_length + 4);
+
+	switch (msg_type) {
+		case TLS_HS_ENCRYPTED_EXTENSIONS:
+			// EncryptedExtensions - we accept any, don't need to process
+			tls->state = TLS_STATE_ENCRYPTED_EXTS;
+			break;
+
+		case TLS_HS_CERTIFICATE:
+			// Certificate - we're not validating in this minimal implementation
+			tls->state = TLS_STATE_CERTIFICATE;
+			break;
+
+		case TLS_HS_CERTIFICATE_VERIFY:
+			// CertificateVerify - signature verification would go here
+			// For now, we accept without verification (INSECURE for production)
+			tls->state = TLS_STATE_CERT_VERIFY;
+			break;
+
+		case TLS_HS_FINISHED:
+			{
+				I64 result = TLSVerifyServerFinished(tls, &data[4], msg_length);
+				if (result != TLS_OK) {
+					return result;
+				}
+				tls->state = TLS_STATE_FINISHED_RECV;
+			}
+			break;
+
+		case TLS_HS_NEW_SESSION_TICKET:
+			// Post-handshake session ticket - ignore
+			break;
+
+		case TLS_HS_KEY_UPDATE:
+			// Key update request - not implemented yet
+			break;
+
+		default:
+			// Unknown handshake message
+			break;
+	}
+
+	return TLS_OK;
+}
+
+// ============================================================================
+// RECEIVE HANDSHAKE FLIGHT
+// ============================================================================
+
+// Receive and process encrypted handshake messages until Finished
+I64 TLSReceiveServerHandshake(CTLSState *tls, CTCPSocket *sock, I64 timeout_ms)
+{
+	U8 record_header[TLS_RECORD_HEADER_SIZE];
+	U8 content_type;
+	U8 inner_type;
+	U8 *ciphertext;
+	U8 *plaintext;
+	I64 ciphertext_len;
+	I64 plaintext_len;
+	I64 result;
+	I64 pos;
+
+	// Read records until we get server Finished
+	while (tls->state < TLS_STATE_FINISHED_RECV) {
+		// Read a record
+		result = TLSReadRecord(tls, sock, &content_type, &ciphertext, &ciphertext_len, timeout_ms);
+		if (result != TLS_OK) {
+			return result;
+		}
+
+		// All handshake messages after ServerHello are encrypted as application_data
+		if (content_type != TLS_CONTENT_APPLICATION) {
+			// Could be plaintext alert
+			if (content_type == TLS_CONTENT_ALERT && ciphertext_len >= 2) {
+				tls->last_alert_level = ciphertext[0];
+				tls->last_alert_desc = ciphertext[1];
+				Free(ciphertext);
+				return TLS_ERR_ALERT_RECEIVED;
+			}
+			Free(ciphertext);
+			return TLS_ERR_UNEXPECTED_MESSAGE;
+		}
+
+		// Build record header for AAD
+		TLSWriteRecordHeader(record_header, content_type, TLS_LEGACY_VERSION, ciphertext_len);
+
+		// Allocate plaintext buffer
+		plaintext = MAlloc(ciphertext_len);
+
+		// Decrypt
+		plaintext_len = TLSDecryptRecord(tls, record_header,
+		                                 ciphertext, ciphertext_len,
+		                                 plaintext, &inner_type);
+
+		Free(ciphertext);
+
+		if (plaintext_len < 0) {
+			Free(plaintext);
+			return plaintext_len;
+		}
+
+		if (inner_type != TLS_CONTENT_HANDSHAKE) {
+			// Could be an alert
+			if (inner_type == TLS_CONTENT_ALERT && plaintext_len >= 2) {
+				tls->last_alert_level = plaintext[0];
+				tls->last_alert_desc = plaintext[1];
+				Free(plaintext);
+				return TLS_ERR_ALERT_RECEIVED;
+			}
+			Free(plaintext);
+			return TLS_ERR_UNEXPECTED_MESSAGE;
+		}
+
+		// Process handshake messages (may be multiple in one record)
+		pos = 0;
+		while (pos < plaintext_len) {
+			if (pos + 4 > plaintext_len) {
+				Free(plaintext);
+				return TLS_ERR_INVALID_MESSAGE;
+			}
+
+			U32 msg_len = TLSRead24(&plaintext[pos + 1]);
+			if (pos + 4 + msg_len > plaintext_len) {
+				Free(plaintext);
+				return TLS_ERR_INVALID_MESSAGE;
+			}
+
+			result = TLSProcessHandshakeMessage(tls, &plaintext[pos], 4 + msg_len);
+			if (result != TLS_OK) {
+				Free(plaintext);
+				return result;
+			}
+
+			pos += 4 + msg_len;
+		}
+
+		Free(plaintext);
+	}
+
+	return TLS_OK;
+}
+
+// ============================================================================
+// MAIN HANDSHAKE FUNCTION
+// ============================================================================
+
+// Perform TLS 1.3 handshake
+// Returns TLS_OK on success, error code on failure
+I64 TLSHandshake(CTLSState *tls, CTCPSocket *sock, U8 *hostname, I64 timeout_ms)
+{
+	U8 content_type;
+	U8 *data;
+	I64 length;
+	I64 result;
+
+	// Initialize state
+	TLSStateInit(tls);
+
+	// Set server name for SNI
+	if (hostname) {
+		TLSSetServerName(tls, hostname);
+	}
+
+	// --- Send ClientHello ---
+	result = TLSSendClientHello(tls, sock);
+	if (result != TLS_OK) {
+		return result;
+	}
+
+	// --- Receive ServerHello ---
+	result = TLSReadRecord(tls, sock, &content_type, &data, &length, timeout_ms);
+	if (result != TLS_OK) {
+		return result;
+	}
+
+	if (content_type != TLS_CONTENT_HANDSHAKE) {
+		// Could be an alert
+		if (content_type == TLS_CONTENT_ALERT && length >= 2) {
+			tls->last_alert_level = data[0];
+			tls->last_alert_desc = data[1];
+		}
+		Free(data);
+		return TLS_ERR_UNEXPECTED_MESSAGE;
+	}
+
+	// Parse handshake header
+	if (length < 4 || data[0] != TLS_HS_SERVER_HELLO) {
+		Free(data);
+		return TLS_ERR_UNEXPECTED_MESSAGE;
+	}
+
+	U32 sh_length = TLSRead24(&data[1]);
+	if (sh_length + 4 > length) {
+		Free(data);
+		return TLS_ERR_INVALID_MESSAGE;
+	}
+
+	// Update transcript with ServerHello
+	TLSUpdateTranscript(tls, data, sh_length + 4);
+
+	// Parse ServerHello
+	result = TLSParseServerHello(tls, &data[4], sh_length);
+	Free(data);
+
+	if (result != TLS_OK) {
+		return result;
+	}
+
+	tls->state = TLS_STATE_SERVER_HELLO_RECV;
+
+	// --- Derive handshake keys ---
+	result = TLSDeriveHandshakeKeys(tls);
+	if (result != TLS_OK) {
+		return result;
+	}
+
+	tls->state = TLS_STATE_HANDSHAKE_KEYS;
+
+	// --- Receive encrypted handshake (EncryptedExtensions, Certificate, CertificateVerify, Finished) ---
+	result = TLSReceiveServerHandshake(tls, sock, timeout_ms);
+	if (result != TLS_OK) {
+		return result;
+	}
+
+	// --- Derive application keys (needed before sending Finished) ---
+	result = TLSDeriveApplicationKeys(tls);
+	if (result != TLS_OK) {
+		return result;
+	}
+
+	// --- Send client Finished ---
+	// Note: We need to use handshake keys for this, then switch to application keys
+	// Actually, the client Finished is encrypted with handshake keys
+	// But we've already switched to application keys...
+
+	// We need to temporarily switch back to handshake keys
+	I64 key_size = TLSCipherKeySize(tls->cipher_suite);
+
+	// Re-derive client handshake key/IV for sending Finished
+	HKDFExpandLabel(tls->client_handshake_traffic_secret, tls->hash_size,
+	                "key", 3, NULL, 0, tls->client_write_key, key_size,
+	                tls->use_sha384 ? HASH_SHA384 : HASH_SHA256);
+
+	HKDFExpandLabel(tls->client_handshake_traffic_secret, tls->hash_size,
+	                "iv", 2, NULL, 0, tls->client_write_iv, 12,
+	                tls->use_sha384 ? HASH_SHA384 : HASH_SHA256);
+
+	if (tls->cipher_suite != TLS_CHACHA20_POLY1305_SHA256) {
+		GCMInit(&tls->client_gcm, tls->client_write_key, key_size);
+	}
+	tls->client_seq = 0;
+
+	result = TLSSendFinished(tls, sock);
+	if (result < 0) {
+		return result;
+	}
+
+	tls->state = TLS_STATE_FINISHED_SENT;
+
+	// Now switch client to application keys
+	HKDFExpandLabel(tls->client_application_traffic_secret, tls->hash_size,
+	                "key", 3, NULL, 0, tls->client_write_key, key_size,
+	                tls->use_sha384 ? HASH_SHA384 : HASH_SHA256);
+
+	HKDFExpandLabel(tls->client_application_traffic_secret, tls->hash_size,
+	                "iv", 2, NULL, 0, tls->client_write_iv, 12,
+	                tls->use_sha384 ? HASH_SHA384 : HASH_SHA256);
+
+	if (tls->cipher_suite != TLS_CHACHA20_POLY1305_SHA256) {
+		GCMInit(&tls->client_gcm, tls->client_write_key, key_size);
+	}
+	tls->client_seq = 0;
+
+	tls->state = TLS_STATE_CONNECTED;
+
+	return TLS_OK;
+}
+
+// ============================================================================
+// HIGH-LEVEL CONNECTION FUNCTION
+// ============================================================================
+
+// Connect to a TLS server
+// Returns TLS_OK on success, error code on failure
+I64 TLSConnect(CTLSSocket *tls_sock, U8 *hostname, U16 port, I64 timeout_ms)
+{
+	I64 result;
+
+	// Set default timeout
+	if (timeout_ms <= 0) {
+		timeout_ms = 30000;  // 30 seconds default
+	}
+	tls_sock->timeout = timeout_ms;
+
+	// Create TCP socket
+	tls_sock->tcp_socket = TCPSocket();
+	if (!tls_sock->tcp_socket) {
+		return TLS_ERR_INTERNAL;
+	}
+
+	// Connect to server
+	result = TCPSocketConnect(tls_sock->tcp_socket, hostname, port);
+	if (result < 0) {
+		TCPSocketClose(tls_sock->tcp_socket);
+		tls_sock->tcp_socket = NULL;
+		return TLS_ERR_CONNECTION_CLOSED;
+	}
+
+	// Perform TLS handshake
+	result = TLSHandshake(&tls_sock->tls, tls_sock->tcp_socket, hostname, timeout_ms);
+	if (result != TLS_OK) {
+		TCPSocketClose(tls_sock->tcp_socket);
+		tls_sock->tcp_socket = NULL;
+		return result;
+	}
+
+	return TLS_OK;
+}
+
+// Close TLS connection
+U0 TLSClose(CTLSSocket *tls_sock)
+{
+	if (tls_sock->tls.state == TLS_STATE_CONNECTED) {
+		// Send close_notify
+		TLSSendCloseNotify(&tls_sock->tls, tls_sock->tcp_socket);
+	}
+
+	// Cleanup TLS state
+	TLSStateCleanup(&tls_sock->tls);
+
+	// Close TCP socket
+	if (tls_sock->tcp_socket) {
+		TCPSocketClose(tls_sock->tcp_socket);
+		tls_sock->tcp_socket = NULL;
+	}
+}
+
+// Send data over TLS connection
+I64 TLSSocketSend(CTLSSocket *tls_sock, U8 *data, I64 length)
+{
+	return TLSSend(&tls_sock->tls, tls_sock->tcp_socket, data, length);
+}
+
+// Receive data over TLS connection
+I64 TLSSocketRecv(CTLSSocket *tls_sock, U8 *buffer, I64 length)
+{
+	return TLSRecv(&tls_sock->tls, tls_sock->tcp_socket, buffer, length, tls_sock->timeout);
+}

@@ -1,0 +1,504 @@
+// grep.ZC - GNU coreutils 'grep' implementation
+// Print lines matching a pattern
+
+#define GREP_LINE_SIZE 8192
+#define GREP_MAX_PATTERNS 64
+
+// Simple regex matching states
+#define RE_LITERAL  0
+#define RE_ANY      1   // .
+#define RE_START    2   // ^
+#define RE_END      3   // $
+#define RE_STAR     4   // *
+#define RE_PLUS     5   // +
+#define RE_QUEST    6   // ?
+#define RE_CLASS    7   // [...]
+#define RE_NCLASS   8   // [^...]
+#define RE_WORD_B   9   // \b
+#define RE_WORD_S   10  // \w
+#define RE_DIGIT    11  // \d
+
+class CRegexNode {
+    U8 type;
+    U8 ch;
+    U8 class_chars[256];  // For character classes
+    I64 class_len;
+};
+
+class CRegex {
+    CRegexNode nodes[256];
+    I64 node_count;
+    Bool valid;
+};
+
+// C-style main function
+I64 grep_main(I64 argc, U8 **argv)
+{
+    Bool ignore_case = FALSE;      // -i
+    Bool invert = FALSE;           // -v
+    Bool count_only = FALSE;       // -c
+    Bool files_with_matches = FALSE; // -l
+    Bool files_without_match = FALSE; // -L
+    Bool line_number = FALSE;      // -n
+    Bool quiet = FALSE;            // -q
+    Bool fixed_strings = FALSE;    // -F
+    Bool extended_regex = FALSE;   // -E
+    Bool whole_word = FALSE;       // -w
+    Bool whole_line = FALSE;       // -x
+    Bool recursive = FALSE;        // -r/-R
+    Bool show_filename = FALSE;    // -H
+    Bool no_filename = FALSE;      // -h
+    Bool only_matching = FALSE;    // -o
+    I64 context_before = 0;        // -B
+    I64 context_after = 0;         // -A
+    I64 context_both = 0;          // -C
+    U8 *patterns[GREP_MAX_PATTERNS];
+    I64 pattern_count = 0;
+    I64 start = 1;
+
+    // Parse options
+    while (start < argc && argv[start][0] == '-' && argv[start][1]) {
+        U8 *arg = argv[start];
+
+        if (strcmp(arg, "--help") == 0) {
+            printf("Usage: grep [OPTION]... PATTERN [FILE]...\n");
+            printf("Search for PATTERN in each FILE.\n\n");
+            printf("Pattern selection and interpretation:\n");
+            printf("  -E, --extended-regexp   PATTERN is an extended regular expression\n");
+            printf("  -F, --fixed-strings     PATTERN is a set of newline-separated strings\n");
+            printf("  -e, --regexp=PATTERN    use PATTERN for matching\n");
+            printf("  -i, --ignore-case       ignore case distinctions\n");
+            printf("  -w, --word-regexp       match only whole words\n");
+            printf("  -x, --line-regexp       match only whole lines\n");
+            printf("\nOutput control:\n");
+            printf("  -c, --count             print only a count of matching lines per FILE\n");
+            printf("  -L, --files-without-match print only names of FILEs without matches\n");
+            printf("  -l, --files-with-matches print only names of FILEs with matches\n");
+            printf("  -n, --line-number       print line number with output lines\n");
+            printf("  -o, --only-matching     show only the part of a line matching PATTERN\n");
+            printf("  -q, --quiet, --silent   suppress all normal output\n");
+            printf("  -H, --with-filename     print the file name for each match\n");
+            printf("  -h, --no-filename       suppress the file name prefix on output\n");
+            printf("  -r, -R, --recursive     like --directories=recurse\n");
+            printf("  -v, --invert-match      select non-matching lines\n");
+            printf("\nContext control:\n");
+            printf("  -A, --after-context=NUM  print NUM lines of trailing context\n");
+            printf("  -B, --before-context=NUM print NUM lines of leading context\n");
+            printf("  -C, --context=NUM        print NUM lines of output context\n");
+            printf("      --help               display this help and exit\n");
+            printf("      --version            output version information and exit\n");
+            return 0;
+        }
+
+        if (strcmp(arg, "--version") == 0) {
+            printf("grep (ZealOS coreutils) 1.0\n");
+            return 0;
+        }
+
+        if (strcmp(arg, "-i") == 0 || strcmp(arg, "--ignore-case") == 0) {
+            ignore_case = TRUE; start++; continue;
+        }
+        if (strcmp(arg, "-v") == 0 || strcmp(arg, "--invert-match") == 0) {
+            invert = TRUE; start++; continue;
+        }
+        if (strcmp(arg, "-c") == 0 || strcmp(arg, "--count") == 0) {
+            count_only = TRUE; start++; continue;
+        }
+        if (strcmp(arg, "-l") == 0 || strcmp(arg, "--files-with-matches") == 0) {
+            files_with_matches = TRUE; start++; continue;
+        }
+        if (strcmp(arg, "-L") == 0 || strcmp(arg, "--files-without-match") == 0) {
+            files_without_match = TRUE; start++; continue;
+        }
+        if (strcmp(arg, "-n") == 0 || strcmp(arg, "--line-number") == 0) {
+            line_number = TRUE; start++; continue;
+        }
+        if (strcmp(arg, "-q") == 0 || strcmp(arg, "--quiet") == 0 ||
+            strcmp(arg, "--silent") == 0) {
+            quiet = TRUE; start++; continue;
+        }
+        if (strcmp(arg, "-F") == 0 || strcmp(arg, "--fixed-strings") == 0) {
+            fixed_strings = TRUE; start++; continue;
+        }
+        if (strcmp(arg, "-E") == 0 || strcmp(arg, "--extended-regexp") == 0) {
+            extended_regex = TRUE; start++; continue;
+        }
+        if (strcmp(arg, "-w") == 0 || strcmp(arg, "--word-regexp") == 0) {
+            whole_word = TRUE; start++; continue;
+        }
+        if (strcmp(arg, "-x") == 0 || strcmp(arg, "--line-regexp") == 0) {
+            whole_line = TRUE; start++; continue;
+        }
+        if (strcmp(arg, "-r") == 0 || strcmp(arg, "-R") == 0 ||
+            strcmp(arg, "--recursive") == 0) {
+            recursive = TRUE; start++; continue;
+        }
+        if (strcmp(arg, "-H") == 0 || strcmp(arg, "--with-filename") == 0) {
+            show_filename = TRUE; start++; continue;
+        }
+        if (strcmp(arg, "-h") == 0 || strcmp(arg, "--no-filename") == 0) {
+            no_filename = TRUE; start++; continue;
+        }
+        if (strcmp(arg, "-o") == 0 || strcmp(arg, "--only-matching") == 0) {
+            only_matching = TRUE; start++; continue;
+        }
+
+        if (strncmp(arg, "-e", 2) == 0) {
+            U8 *pat;
+            if (arg[2]) pat = &arg[2];
+            else if (start + 1 < argc) { start++; pat = argv[start]; }
+            else { fprintf(stderr, "grep: option requires an argument -- 'e'\n"); return 2; }
+            if (pattern_count < GREP_MAX_PATTERNS)
+                patterns[pattern_count++] = pat;
+            start++;
+            continue;
+        }
+
+        if (strncmp(arg, "-A", 2) == 0) {
+            U8 *num;
+            if (arg[2]) num = &arg[2];
+            else if (start + 1 < argc) { start++; num = argv[start]; }
+            else { fprintf(stderr, "grep: option requires an argument -- 'A'\n"); return 2; }
+            context_after = atoi(num);
+            start++;
+            continue;
+        }
+
+        if (strncmp(arg, "-B", 2) == 0) {
+            U8 *num;
+            if (arg[2]) num = &arg[2];
+            else if (start + 1 < argc) { start++; num = argv[start]; }
+            else { fprintf(stderr, "grep: option requires an argument -- 'B'\n"); return 2; }
+            context_before = atoi(num);
+            start++;
+            continue;
+        }
+
+        if (strncmp(arg, "-C", 2) == 0) {
+            U8 *num;
+            if (arg[2]) num = &arg[2];
+            else if (start + 1 < argc) { start++; num = argv[start]; }
+            else { fprintf(stderr, "grep: option requires an argument -- 'C'\n"); return 2; }
+            context_both = atoi(num);
+            start++;
+            continue;
+        }
+
+        // Combined short options
+        if (arg[0] == '-' && arg[1] != '-') {
+            for (I64 i = 1; arg[i]; i++) {
+                switch (arg[i]) {
+                    case 'i': ignore_case = TRUE; break;
+                    case 'v': invert = TRUE; break;
+                    case 'c': count_only = TRUE; break;
+                    case 'l': files_with_matches = TRUE; break;
+                    case 'L': files_without_match = TRUE; break;
+                    case 'n': line_number = TRUE; break;
+                    case 'q': quiet = TRUE; break;
+                    case 'F': fixed_strings = TRUE; break;
+                    case 'E': extended_regex = TRUE; break;
+                    case 'w': whole_word = TRUE; break;
+                    case 'x': whole_line = TRUE; break;
+                    case 'r':
+                    case 'R': recursive = TRUE; break;
+                    case 'H': show_filename = TRUE; break;
+                    case 'h': no_filename = TRUE; break;
+                    case 'o': only_matching = TRUE; break;
+                    default:
+                        fprintf(stderr, "grep: invalid option -- '%c'\n", arg[i]);
+                        return 2;
+                }
+            }
+            start++;
+            continue;
+        }
+
+        if (strcmp(arg, "--") == 0) {
+            start++;
+            break;
+        }
+
+        break;
+    }
+
+    // Set context
+    if (context_both > 0) {
+        context_before = context_both;
+        context_after = context_both;
+    }
+
+    // Get pattern from args if not specified with -e
+    if (pattern_count == 0) {
+        if (start >= argc) {
+            fprintf(stderr, "grep: missing pattern\n");
+            return 2;
+        }
+        patterns[pattern_count++] = argv[start++];
+    }
+
+    // Simple fixed-string match
+    auto match_fixed = [](U8 *text, U8 *pattern, Bool ignore_case) -> U8* {
+        I64 tlen = strlen(text);
+        I64 plen = strlen(pattern);
+
+        for (I64 i = 0; i <= tlen - plen; i++) {
+            Bool match = TRUE;
+            for (I64 j = 0; j < plen; j++) {
+                U8 tc = text[i+j];
+                U8 pc = pattern[j];
+                if (ignore_case) {
+                    tc = toupper(tc);
+                    pc = toupper(pc);
+                }
+                if (tc != pc) {
+                    match = FALSE;
+                    break;
+                }
+            }
+            if (match) return &text[i];
+        }
+        return NULL;
+    };
+
+    // Simple regex match (basic patterns only)
+    auto match_regex = [](U8 *text, U8 *pattern, Bool ignore_case) -> Bool {
+        U8 *t = text;
+        U8 *p = pattern;
+        Bool anchored_start = FALSE;
+        Bool anchored_end = FALSE;
+
+        if (*p == '^') {
+            anchored_start = TRUE;
+            p++;
+        }
+
+        I64 plen = strlen(p);
+        if (plen > 0 && p[plen-1] == '$') {
+            anchored_end = TRUE;
+            plen--;
+        }
+
+        // Try to match at each position
+        I64 tlen = strlen(text);
+        I64 start_pos = 0;
+        I64 end_pos = anchored_start ? 0 : tlen;
+
+        for (I64 pos = start_pos; pos <= end_pos; pos++) {
+            U8 *tp = &text[pos];
+            U8 *pp = p;
+            Bool matched = TRUE;
+            I64 match_len = 0;
+
+            while (*pp && match_len < plen) {
+                if (*pp == '.') {
+                    // Match any char
+                    if (!*tp) { matched = FALSE; break; }
+                    tp++;
+                    pp++;
+                    match_len++;
+                } else if (*pp == '*' || *pp == '+' || *pp == '?') {
+                    // Skip for now - basic implementation
+                    pp++;
+                } else if (*pp == '\\' && *(pp+1)) {
+                    pp++;
+                    U8 tc = *tp;
+                    U8 pc = *pp;
+                    if (ignore_case) { tc = toupper(tc); pc = toupper(pc); }
+                    if (tc != pc) { matched = FALSE; break; }
+                    tp++;
+                    pp++;
+                    match_len++;
+                } else {
+                    U8 tc = *tp;
+                    U8 pc = *pp;
+                    if (ignore_case) { tc = toupper(tc); pc = toupper(pc); }
+                    if (tc != pc) { matched = FALSE; break; }
+                    tp++;
+                    pp++;
+                    match_len++;
+                }
+            }
+
+            if (matched && match_len >= plen) {
+                if (anchored_end && *tp != 0) continue;
+                return TRUE;
+            }
+
+            if (anchored_start) break;
+        }
+
+        return FALSE;
+    };
+
+    // Check if a line matches any pattern
+    auto line_matches = [&](U8 *line) -> Bool {
+        for (I64 p = 0; p < pattern_count; p++) {
+            Bool match;
+            if (fixed_strings) {
+                match = (match_fixed(line, patterns[p], ignore_case) != NULL);
+            } else {
+                match = match_regex(line, patterns[p], ignore_case);
+            }
+
+            if (whole_line && match) {
+                // Verify whole line match
+                I64 ll = strlen(line);
+                I64 pl = strlen(patterns[p]);
+                if (ll != pl) match = FALSE;
+            }
+
+            if (whole_word && match) {
+                // Verify word boundaries
+                U8 *pos = match_fixed(line, patterns[p], ignore_case);
+                if (pos) {
+                    if (pos > line && isalnum(*(pos-1))) match = FALSE;
+                    else {
+                        U8 *end = pos + strlen(patterns[p]);
+                        if (*end && isalnum(*end)) match = FALSE;
+                    }
+                }
+            }
+
+            if (match) return TRUE;
+        }
+        return FALSE;
+    };
+
+    // Process a single file
+    I64 grep_file(U8 *filename, Bool show_name);
+    grep_file = [&](U8 *filename, Bool show_name) -> I64 {
+        FILE *fp;
+        if (strcmp(filename, "-") == 0) {
+            fp = stdin;
+        } else {
+            CPosixStat st;
+            if (PosixStat(filename, &st) < 0) {
+                if (!quiet)
+                    fprintf(stderr, "grep: %s: %s\n", filename, strerror(errno));
+                return 2;
+            }
+            if (S_ISDIR(st.st_mode)) {
+                if (recursive) {
+                    // Recursively grep directory
+                    I64 dir_fd = PosixOpenDir(filename);
+                    if (dir_fd < 0) return 2;
+
+                    CPosixDirent *entry;
+                    I64 result = 1;
+
+                    while ((entry = PosixReadDir(dir_fd)) != NULL) {
+                        if (strcmp(entry->d_name, ".") == 0 ||
+                            strcmp(entry->d_name, "..") == 0)
+                            continue;
+
+                        U8 path[PATH_MAX];
+                        snprintf(path, PATH_MAX, "%s/%s", filename, entry->d_name);
+
+                        I64 r = grep_file(path, TRUE);
+                        if (r == 0) result = 0;
+                    }
+
+                    PosixCloseDir(dir_fd);
+                    return result;
+                } else {
+                    if (!quiet)
+                        fprintf(stderr, "grep: %s: Is a directory\n", filename);
+                    return 2;
+                }
+            }
+
+            fp = fopen(filename, "r");
+            if (!fp) {
+                if (!quiet)
+                    fprintf(stderr, "grep: %s: %s\n", filename, strerror(errno));
+                return 2;
+            }
+        }
+
+        U8 *line = MAlloc(GREP_LINE_SIZE);
+        I64 line_num = 0;
+        I64 match_count = 0;
+        Bool found_match = FALSE;
+
+        while (fgets(line, GREP_LINE_SIZE, fp)) {
+            line_num++;
+
+            // Remove trailing newline
+            I64 len = strlen(line);
+            if (len > 0 && line[len-1] == '\n')
+                line[len-1] = 0;
+
+            Bool match = line_matches(line);
+            if (invert) match = !match;
+
+            if (match) {
+                match_count++;
+                found_match = TRUE;
+
+                if (quiet) {
+                    Free(line);
+                    if (fp != stdin) fclose(fp);
+                    return 0;
+                }
+
+                if (files_with_matches) {
+                    printf("%s\n", filename);
+                    Free(line);
+                    if (fp != stdin) fclose(fp);
+                    return 0;
+                }
+
+                if (!count_only && !files_without_match) {
+                    if (show_name && !no_filename) {
+                        printf("%s:", filename);
+                    }
+                    if (line_number) {
+                        printf("%ld:", line_num);
+                    }
+                    printf("%s\n", line);
+                }
+            }
+        }
+
+        Free(line);
+        if (fp != stdin) fclose(fp);
+
+        if (count_only) {
+            if (show_name && !no_filename) {
+                printf("%s:", filename);
+            }
+            printf("%ld\n", match_count);
+        }
+
+        if (files_without_match && !found_match) {
+            printf("%s\n", filename);
+        }
+
+        return found_match ? 0 : 1;
+    };
+
+    // Process files
+    I64 exit_status = 1;  // 1 = no matches
+    I64 file_count = argc - start;
+    Bool multi_file = (file_count > 1) || recursive;
+
+    if (file_count == 0) {
+        // Read from stdin
+        if (grep_file("-", FALSE) == 0)
+            exit_status = 0;
+    } else {
+        for (I64 i = start; i < argc; i++) {
+            Bool show = show_filename || (multi_file && !no_filename);
+            I64 result = grep_file(argv[i], show);
+            if (result == 0) exit_status = 0;
+            else if (result == 2 && exit_status != 0) exit_status = 2;
+        }
+    }
+
+    return exit_status;
+}
+
+U0 GnuGrepRegister()
+{
+    "GNU 'grep' utility loaded.\n";
+}

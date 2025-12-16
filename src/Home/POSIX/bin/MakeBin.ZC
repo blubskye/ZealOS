@@ -1,0 +1,43 @@
+// MakeBin.ZC - POSIX Utilities Loader
+// Part of the ZealOS POSIX compatibility layer
+//
+// This file loads the native POSIX utility commands.
+
+Cd(__DIR__);;
+
+// ============================================================================
+// DEPENDENCIES
+// ============================================================================
+
+// Make sure POSIX layer and HTTP stack are loaded
+Cd("..");;
+#include "MakePOSIX"
+Cd("libc");;
+#include "MakeLibc"
+
+// Make sure HTTP client is available
+Cd("../../../Net/HTTP");;
+#include "MakeHTTP"
+Cd("../../POSIX/bin");;
+
+// ============================================================================
+// UTILITY COMMANDS
+// ============================================================================
+
+// wget - HTTP/HTTPS file retrieval
+#include "wget.ZC"
+
+// ============================================================================
+// INITIALIZATION
+// ============================================================================
+
+"\n";
+"============================================================\n";
+"POSIX Utilities Loaded\n";
+"============================================================\n";
+"\n";
+"Available commands:\n";
+"  wget [OPTIONS] URL     - Download files via HTTP/HTTPS\n";
+"\n";
+"For help on each command, use: <command> --help\n";
+"\n";

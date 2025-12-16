@@ -1,0 +1,32 @@
+// false.ZC - GNU coreutils 'false' implementation
+// Exit with status 1 (failure)
+//
+// This is a direct port of the GNU false utility
+
+// C-style main function
+I64 false_main(I64 argc, U8 **argv)
+{
+    // Handle --help and --version for GNU compatibility
+    if (argc > 1) {
+        if (strcmp(argv[1], "--help") == 0) {
+            printf("Usage: false [ignored command line arguments]\n");
+            printf("  or:  false OPTION\n");
+            printf("Exit with a status code indicating failure.\n\n");
+            printf("      --help     display this help and exit\n");
+            printf("      --version  output version information and exit\n");
+            return 1;  // Still return failure even for --help
+        }
+        if (strcmp(argv[1], "--version") == 0) {
+            printf("false (ZealOS coreutils) 1.0\n");
+            return 1;  // Still return failure
+        }
+    }
+
+    return 1;  // Always fail
+}
+
+// Register as a utility
+U0 GnuFalseRegister()
+{
+    "GNU 'false' utility loaded. Run: CRun(&false_main, \"false\");\n";
+}

@@ -1,0 +1,316 @@
+// new.ZC - C++ Memory Allocation Operators for ZealOS
+// Part of the POSIX compatibility layer
+//
+// Implements operator new, operator delete, and variants
+
+// ============================================================================
+// NEW HANDLER
+// ============================================================================
+
+// Type for new_handler
+typedef U0 (*new_handler_t)();
+
+static new_handler_t g_new_handler = NULL;
+
+// Set new handler - returns old handler
+new_handler_t std_set_new_handler(new_handler_t handler)
+{
+    new_handler_t old = g_new_handler;
+    g_new_handler = handler;
+    return old;
+}
+
+// Get current new handler
+new_handler_t std_get_new_handler()
+{
+    return g_new_handler;
+}
+
+// ============================================================================
+// OPERATOR NEW - THROWING VERSIONS
+// ============================================================================
+
+// operator new(size_t)
+// Throws std::bad_alloc on failure
+U8 *_Znwm(U64 size)
+{
+    if (size == 0) size = 1;  // Ensure non-zero allocation
+
+    while (TRUE) {
+        U8 *ptr = MAlloc(size);
+        if (ptr) {
+            return ptr;
+        }
+
+        // Allocation failed - call new_handler if set
+        if (g_new_handler) {
+            g_new_handler();
+            // Handler may free memory, throw, or terminate
+            // If it returns, we try again
+        } else {
+            // No handler - throw bad_alloc
+            fprintf(stderr, "operator new: allocation of %ld bytes failed\n", size);
+            abort();  // Should throw std::bad_alloc
+        }
+    }
+}
+
+// operator new[](size_t)
+// Array version - same as regular new
+U8 *_Znam(U64 size)
+{
+    return _Znwm(size);
+}
+
+// ============================================================================
+// OPERATOR NEW - NOTHROW VERSIONS
+// ============================================================================
+
+// Nothrow tag type (simplified)
+class std_nothrow_t {};
+static std_nothrow_t std_nothrow;
+
+// operator new(size_t, nothrow_t)
+// Returns NULL on failure instead of throwing
+U8 *_ZnwmRKSt9nothrow_t(U64 size, std_nothrow_t *nothrow)
+{
+    if (size == 0) size = 1;
+    return MAlloc(size);
+}
+
+// operator new[](size_t, nothrow_t)
+U8 *_ZnamRKSt9nothrow_t(U64 size, std_nothrow_t *nothrow)
+{
+    if (size == 0) size = 1;
+    return MAlloc(size);
+}
+
+// ============================================================================
+// OPERATOR DELETE - REGULAR VERSIONS
+// ============================================================================
+
+// operator delete(void*)
+U0 _ZdlPv(U8 *ptr)
+{
+    if (ptr) {
+        Free(ptr);
+    }
+}
+
+// operator delete[](void*)
+U0 _ZdaPv(U8 *ptr)
+{
+    if (ptr) {
+        Free(ptr);
+    }
+}
+
+// operator delete(void*, size_t) - C++14 sized deallocation
+U0 _ZdlPvm(U8 *ptr, U64 size)
+{
+    if (ptr) {
+        Free(ptr);
+    }
+}
+
+// operator delete[](void*, size_t) - C++14 sized deallocation
+U0 _ZdaPvm(U8 *ptr, U64 size)
+{
+    if (ptr) {
+        Free(ptr);
+    }
+}
+
+// ============================================================================
+// OPERATOR DELETE - NOTHROW VERSIONS
+// ============================================================================
+
+// operator delete(void*, nothrow_t)
+U0 _ZdlPvRKSt9nothrow_t(U8 *ptr, std_nothrow_t *nothrow)
+{
+    if (ptr) {
+        Free(ptr);
+    }
+}
+
+// operator delete[](void*, nothrow_t)
+U0 _ZdaPvRKSt9nothrow_t(U8 *ptr, std_nothrow_t *nothrow)
+{
+    if (ptr) {
+        Free(ptr);
+    }
+}
+
+// ============================================================================
+// ALIGNED NEW/DELETE (C++17)
+// ============================================================================
+
+// operator new(size_t, align_val_t)
+U8 *_ZnwmSt11align_val_t(U64 size, U64 alignment)
+{
+    if (size == 0) size = 1;
+
+    // ZealOS MAlloc is typically 16-byte aligned
+    // For larger alignments, we need to over-allocate
+    if (alignment <= 16) {
+        return _Znwm(size);
+    }
+
+    // Over-allocate to ensure alignment
+    U64 total = size + alignment + sizeof(U8*);
+    U8 *raw = MAlloc(total);
+    if (!raw) {
+        if (g_new_handler) {
+            g_new_handler();
+            raw = MAlloc(total);
+        }
+        if (!raw) {
+            abort();  // Should throw std::bad_alloc
+        }
+    }
+
+    // Align the pointer
+    U64 addr = (U64)(raw + sizeof(U8*));
+    U64 aligned_addr = (addr + alignment - 1) & ~(alignment - 1);
+    U8 *aligned = (U8*)aligned_addr;
+
+    // Store original pointer before the aligned block
+    ((U8**)aligned)[-1] = raw;
+
+    return aligned;
+}
+
+// operator new[](size_t, align_val_t)
+U8 *_ZnamSt11align_val_t(U64 size, U64 alignment)
+{
+    return _ZnwmSt11align_val_t(size, alignment);
+}
+
+// operator delete(void*, align_val_t)
+U0 _ZdlPvSt11align_val_t(U8 *ptr, U64 alignment)
+{
+    if (!ptr) return;
+
+    if (alignment <= 16) {
+        Free(ptr);
+    } else {
+        // Retrieve original pointer
+        U8 *raw = ((U8**)ptr)[-1];
+        Free(raw);
+    }
+}
+
+// operator delete[](void*, align_val_t)
+U0 _ZdaPvSt11align_val_t(U8 *ptr, U64 alignment)
+{
+    _ZdlPvSt11align_val_t(ptr, alignment);
+}
+
+// operator delete(void*, size_t, align_val_t)
+U0 _ZdlPvmSt11align_val_t(U8 *ptr, U64 size, U64 alignment)
+{
+    _ZdlPvSt11align_val_t(ptr, alignment);
+}
+
+// operator delete[](void*, size_t, align_val_t)
+U0 _ZdaPvmSt11align_val_t(U8 *ptr, U64 size, U64 alignment)
+{
+    _ZdlPvSt11align_val_t(ptr, alignment);
+}
+
+// ============================================================================
+// PLACEMENT NEW (header-only in real C++, but we provide symbols)
+// ============================================================================
+
+// Placement new - just returns the pointer
+// operator new(size_t, void*)
+U8 *_ZnwmPv(U64 size, U8 *ptr)
+{
+    return ptr;
+}
+
+// operator new[](size_t, void*)
+U8 *_ZnamPv(U64 size, U8 *ptr)
+{
+    return ptr;
+}
+
+// Placement delete - does nothing
+U0 _ZdlPvS_(U8 *ptr, U8 *place)
+{
+    // Nothing to do
+}
+
+U0 _ZdaPvS_(U8 *ptr, U8 *place)
+{
+    // Nothing to do
+}
+
+// ============================================================================
+// ALTERNATIVE SYMBOL NAMES
+// ============================================================================
+
+// Some compilers use different mangling
+// Provide aliases for common variants
+
+// GCC-style names
+#define operator_new        _Znwm
+#define operator_new_array  _Znam
+#define operator_delete     _ZdlPv
+#define operator_delete_array _ZdaPv
+
+// ============================================================================
+// MEMORY UTILITIES
+// ============================================================================
+
+// aligned_alloc (C11)
+U8 *aligned_alloc(U64 alignment, U64 size)
+{
+    if (alignment <= 16) {
+        return MAlloc(size);
+    }
+    return _ZnwmSt11align_val_t(size, alignment);
+}
+
+// posix_memalign
+I64 posix_memalign(U8 **memptr, U64 alignment, U64 size)
+{
+    if (!memptr) return EINVAL;
+    if (alignment < sizeof(U8*)) return EINVAL;
+    if ((alignment & (alignment - 1)) != 0) return EINVAL;  // Must be power of 2
+
+    *memptr = aligned_alloc(alignment, size);
+    if (!*memptr) return ENOMEM;
+
+    return 0;
+}
+
+// memalign (obsolete but used by some code)
+U8 *memalign(U64 alignment, U64 size)
+{
+    return aligned_alloc(alignment, size);
+}
+
+// valloc - allocate page-aligned memory
+U8 *valloc(U64 size)
+{
+    return aligned_alloc(4096, size);
+}
+
+// pvalloc - allocate page-aligned memory, rounded to page size
+U8 *pvalloc(U64 size)
+{
+    U64 page_size = 4096;
+    U64 rounded = (size + page_size - 1) & ~(page_size - 1);
+    return aligned_alloc(page_size, rounded);
+}
+
+// ============================================================================
+// INITIALIZATION
+// ============================================================================
+
+"ZealOS C++ new/delete loaded.\n";
+"  - operator new/delete (throwing and nothrow)\n";
+"  - operator new[]/delete[]\n";
+"  - Aligned allocation (C++17)\n";
+"  - Placement new\n";

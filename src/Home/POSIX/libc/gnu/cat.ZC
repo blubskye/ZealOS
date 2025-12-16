@@ -1,0 +1,265 @@
+// cat.ZC - GNU coreutils 'cat' implementation
+// Concatenate files and print on standard output
+//
+// Supports:
+//   -n    number all output lines
+//   -b    number nonempty output lines
+//   -s    suppress repeated empty output lines
+//   -E    display $ at end of each line
+//   -T    display TAB characters as ^I
+//   -v    use ^ and M- notation, except for LFD and TAB
+//   -A    equivalent to -vET
+//   -e    equivalent to -vE
+//   -t    equivalent to -vT
+
+// Options structure
+class CCatOpts {
+    Bool number_lines;      // -n
+    Bool number_nonblank;   // -b
+    Bool squeeze_blank;     // -s
+    Bool show_ends;         // -E
+    Bool show_tabs;         // -T
+    Bool show_nonprinting;  // -v
+};
+
+// Output a character with nonprinting representation
+U0 cat_putchar(I64 c, CCatOpts *opts)
+{
+    if (opts->show_nonprinting) {
+        if (c == '\t' && !opts->show_tabs) {
+            putchar('\t');
+        } else if (c == '\n') {
+            if (opts->show_ends)
+                putchar('$');
+            putchar('\n');
+        } else if (c < 32) {
+            putchar('^');
+            putchar(c + 64);
+        } else if (c == 127) {
+            putchar('^');
+            putchar('?');
+        } else if (c >= 128) {
+            putchar('M');
+            putchar('-');
+            if (c < 128 + 32) {
+                putchar('^');
+                putchar(c - 128 + 64);
+            } else if (c == 128 + 127) {
+                putchar('^');
+                putchar('?');
+            } else {
+                putchar(c - 128);
+            }
+        } else {
+            putchar(c);
+        }
+    } else {
+        if (c == '\t' && opts->show_tabs) {
+            putchar('^');
+            putchar('I');
+        } else if (c == '\n' && opts->show_ends) {
+            putchar('$');
+            putchar('\n');
+        } else {
+            putchar(c);
+        }
+    }
+}
+
+// Cat a single file
+I64 cat_file(FILE *fp, CCatOpts *opts, I64 *line_num)
+{
+    I64 c, prev_c = '\n';
+    Bool blank_line = FALSE;
+    Bool prev_blank = FALSE;
+
+    while ((c = fgetc(fp)) != EOF) {
+        // Track blank lines for squeeze
+        if (c == '\n' && prev_c == '\n') {
+            blank_line = TRUE;
+            if (opts->squeeze_blank && prev_blank)
+                continue;
+        } else {
+            blank_line = FALSE;
+        }
+
+        // Number lines at start of line
+        if (prev_c == '\n') {
+            if (opts->number_lines || (opts->number_nonblank && c != '\n')) {
+                printf("%6d\t", *line_num);
+                (*line_num)++;
+            }
+        }
+
+        cat_putchar(c, opts);
+
+        prev_blank = blank_line;
+        prev_c = c;
+    }
+
+    return 0;
+}
+
+// C-style main function
+I64 cat_main(I64 argc, U8 **argv)
+{
+    CCatOpts opts;
+    MemSet(&opts, 0, sizeof(CCatOpts));
+
+    I64 start = 1;
+    I64 line_num = 1;
+
+    // Parse options
+    while (start < argc && argv[start][0] == '-' && argv[start][1]) {
+        U8 *arg = argv[start];
+
+        if (strcmp(arg, "--help") == 0) {
+            printf("Usage: cat [OPTION]... [FILE]...\n");
+            printf("Concatenate FILE(s) to standard output.\n\n");
+            printf("With no FILE, or when FILE is -, read standard input.\n\n");
+            printf("  -A, --show-all           equivalent to -vET\n");
+            printf("  -b, --number-nonblank    number nonempty output lines\n");
+            printf("  -e                       equivalent to -vE\n");
+            printf("  -E, --show-ends          display $ at end of each line\n");
+            printf("  -n, --number             number all output lines\n");
+            printf("  -s, --squeeze-blank      suppress repeated empty output lines\n");
+            printf("  -t                       equivalent to -vT\n");
+            printf("  -T, --show-tabs          display TAB characters as ^I\n");
+            printf("  -v, --show-nonprinting   use ^ and M- notation, except for LFD and TAB\n");
+            printf("      --help     display this help and exit\n");
+            printf("      --version  output version information and exit\n");
+            return 0;
+        }
+
+        if (strcmp(arg, "--version") == 0) {
+            printf("cat (ZealOS coreutils) 1.0\n");
+            return 0;
+        }
+
+        // Long options
+        if (strcmp(arg, "--show-all") == 0) {
+            opts.show_nonprinting = TRUE;
+            opts.show_ends = TRUE;
+            opts.show_tabs = TRUE;
+            start++;
+            continue;
+        }
+        if (strcmp(arg, "--number-nonblank") == 0) {
+            opts.number_nonblank = TRUE;
+            start++;
+            continue;
+        }
+        if (strcmp(arg, "--show-ends") == 0) {
+            opts.show_ends = TRUE;
+            start++;
+            continue;
+        }
+        if (strcmp(arg, "--number") == 0) {
+            opts.number_lines = TRUE;
+            start++;
+            continue;
+        }
+        if (strcmp(arg, "--squeeze-blank") == 0) {
+            opts.squeeze_blank = TRUE;
+            start++;
+            continue;
+        }
+        if (strcmp(arg, "--show-tabs") == 0) {
+            opts.show_tabs = TRUE;
+            start++;
+            continue;
+        }
+        if (strcmp(arg, "--show-nonprinting") == 0) {
+            opts.show_nonprinting = TRUE;
+            start++;
+            continue;
+        }
+
+        // Short options
+        if (arg[0] == '-' && arg[1] != '-') {
+            for (I64 i = 1; arg[i]; i++) {
+                switch (arg[i]) {
+                    case 'A':
+                        opts.show_nonprinting = TRUE;
+                        opts.show_ends = TRUE;
+                        opts.show_tabs = TRUE;
+                        break;
+                    case 'b':
+                        opts.number_nonblank = TRUE;
+                        break;
+                    case 'e':
+                        opts.show_nonprinting = TRUE;
+                        opts.show_ends = TRUE;
+                        break;
+                    case 'E':
+                        opts.show_ends = TRUE;
+                        break;
+                    case 'n':
+                        opts.number_lines = TRUE;
+                        break;
+                    case 's':
+                        opts.squeeze_blank = TRUE;
+                        break;
+                    case 't':
+                        opts.show_nonprinting = TRUE;
+                        opts.show_tabs = TRUE;
+                        break;
+                    case 'T':
+                        opts.show_tabs = TRUE;
+                        break;
+                    case 'v':
+                        opts.show_nonprinting = TRUE;
+                        break;
+                    default:
+                        fprintf(stderr, "cat: invalid option -- '%c'\n", arg[i]);
+                        fprintf(stderr, "Try 'cat --help' for more information.\n");
+                        return 1;
+                }
+            }
+            start++;
+            continue;
+        }
+
+        break;  // Not an option
+    }
+
+    // -b overrides -n
+    if (opts.number_nonblank)
+        opts.number_lines = FALSE;
+
+    // Process files
+    I64 exit_status = 0;
+
+    if (start >= argc) {
+        // No files specified, read stdin
+        cat_file(stdin, &opts, &line_num);
+    } else {
+        for (I64 i = start; i < argc; i++) {
+            FILE *fp;
+
+            if (strcmp(argv[i], "-") == 0) {
+                fp = stdin;
+            } else {
+                fp = fopen(argv[i], "r");
+                if (!fp) {
+                    fprintf(stderr, "cat: %s: %s\n", argv[i], strerror(errno));
+                    exit_status = 1;
+                    continue;
+                }
+            }
+
+            cat_file(fp, &opts, &line_num);
+
+            if (fp != stdin)
+                fclose(fp);
+        }
+    }
+
+    return exit_status;
+}
+
+// Register as a utility
+U0 GnuCatRegister()
+{
+    "GNU 'cat' utility loaded. Run: CRun(&cat_main, \"cat -n file.txt\");\n";
+}

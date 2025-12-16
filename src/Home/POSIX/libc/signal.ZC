@@ -1,0 +1,626 @@
+// signal.ZC - Signal Handling for ZealOS
+// Part of the POSIX compatibility layer
+//
+// Provides signal, sigaction, sigsetjmp, siglongjmp, etc.
+
+// ============================================================================
+// SIGNAL NUMBERS
+// ============================================================================
+
+#define SIGHUP     1   // Hangup
+#define SIGINT     2   // Interrupt (Ctrl-C)
+#define SIGQUIT    3   // Quit (Ctrl-\)
+#define SIGILL     4   // Illegal instruction
+#define SIGTRAP    5   // Trace trap
+#define SIGABRT    6   // Abort
+#define SIGIOT     6   // IOT trap (same as SIGABRT)
+#define SIGBUS     7   // Bus error
+#define SIGFPE     8   // Floating point exception
+#define SIGKILL    9   // Kill (cannot be caught)
+#define SIGUSR1    10  // User signal 1
+#define SIGSEGV    11  // Segmentation fault
+#define SIGUSR2    12  // User signal 2
+#define SIGPIPE    13  // Broken pipe
+#define SIGALRM    14  // Alarm clock
+#define SIGTERM    15  // Termination
+#define SIGSTKFLT  16  // Stack fault
+#define SIGCHLD    17  // Child status changed
+#define SIGCONT    18  // Continue
+#define SIGSTOP    19  // Stop (cannot be caught)
+#define SIGTSTP    20  // Terminal stop (Ctrl-Z)
+#define SIGTTIN    21  // Background read
+#define SIGTTOU    22  // Background write
+#define SIGURG     23  // Urgent condition on socket
+#define SIGXCPU    24  // CPU time limit exceeded
+#define SIGXFSZ    25  // File size limit exceeded
+#define SIGVTALRM  26  // Virtual timer expired
+#define SIGPROF    27  // Profiling timer expired
+#define SIGWINCH   28  // Window size change
+#define SIGIO      29  // I/O possible
+#define SIGPOLL    29  // Pollable event (same as SIGIO)
+#define SIGPWR     30  // Power failure
+#define SIGSYS     31  // Bad system call
+
+#define NSIG       32  // Number of signals
+
+// ============================================================================
+// SIGNAL ACTIONS
+// ============================================================================
+
+#define SIG_DFL    ((U0 (*)(I64))0)   // Default action
+#define SIG_IGN    ((U0 (*)(I64))1)   // Ignore signal
+#define SIG_ERR    ((U0 (*)(I64))-1)  // Error return
+
+// Signal handler type
+typedef U0 (*sighandler_t)(I64);
+
+// ============================================================================
+// SIGACTION FLAGS
+// ============================================================================
+
+#define SA_NOCLDSTOP  0x00000001  // Don't send SIGCHLD when children stop
+#define SA_NOCLDWAIT  0x00000002  // Don't create zombie on child death
+#define SA_SIGINFO    0x00000004  // Use sa_sigaction instead of sa_handler
+#define SA_ONSTACK    0x08000000  // Use alternate signal stack
+#define SA_RESTART    0x10000000  // Restart syscalls if possible
+#define SA_NODEFER    0x40000000  // Don't block signal during handler
+#define SA_RESETHAND  0x80000000  // Reset to SIG_DFL after handling
+
+// ============================================================================
+// SIGNAL SETS
+// ============================================================================
+
+// Signal set - bitmap of signals
+typedef U64 sigset_t;
+
+// Initialize empty set
+I64 sigemptyset(sigset_t *set)
+{
+    if (!set) return -1;
+    *set = 0;
+    return 0;
+}
+
+// Initialize full set
+I64 sigfillset(sigset_t *set)
+{
+    if (!set) return -1;
+    *set = 0xFFFFFFFFFFFFFFFF;
+    return 0;
+}
+
+// Add signal to set
+I64 sigaddset(sigset_t *set, I64 signum)
+{
+    if (!set || signum < 1 || signum >= NSIG) {
+        errno = EINVAL;
+        return -1;
+    }
+    *set |= (1 << signum);
+    return 0;
+}
+
+// Remove signal from set
+I64 sigdelset(sigset_t *set, I64 signum)
+{
+    if (!set || signum < 1 || signum >= NSIG) {
+        errno = EINVAL;
+        return -1;
+    }
+    *set &= ~(1 << signum);
+    return 0;
+}
+
+// Test if signal is in set
+I64 sigismember(sigset_t *set, I64 signum)
+{
+    if (!set || signum < 1 || signum >= NSIG) {
+        errno = EINVAL;
+        return -1;
+    }
+    return (*set & (1 << signum)) ? 1 : 0;
+}
+
+// ============================================================================
+// SIGACTION STRUCTURE
+// ============================================================================
+
+// Signal info structure (for SA_SIGINFO)
+class siginfo_t {
+    I64 si_signo;      // Signal number
+    I64 si_errno;      // Error number
+    I64 si_code;       // Signal code
+    I64 si_pid;        // Sending process ID
+    I64 si_uid;        // Sender's UID
+    I64 si_status;     // Exit value or signal
+    U8 *si_addr;       // Faulting address
+    I64 si_band;       // Band event
+    I64 si_fd;         // File descriptor
+    U8 _pad[64];       // Padding for future use
+};
+
+// Sigaction structure
+class sigaction_t {
+    union {
+        sighandler_t sa_handler;                        // Signal handler
+        U0 (*sa_sigaction)(I64, siginfo_t*, U8*);       // Extended handler
+    };
+    sigset_t sa_mask;       // Signals to block during handler
+    I64 sa_flags;           // Flags
+    U0 (*sa_restorer)();    // Restorer (internal use)
+};
+
+// ============================================================================
+// SIGNAL STATE
+// ============================================================================
+
+class CSignalState {
+    sighandler_t handlers[NSIG];    // Current handlers
+    sigset_t blocked;               // Blocked signals
+    sigset_t pending;               // Pending signals
+    sigaction_t actions[NSIG];      // Full signal actions
+    Bool initialized;
+};
+
+static CSignalState g_signal_state;
+
+// ============================================================================
+// SIGNAL FUNCTIONS
+// ============================================================================
+
+// Initialize signal system
+U0 signal_init()
+{
+    if (g_signal_state.initialized) return;
+
+    I64 i;
+    for (i = 0; i < NSIG; i++) {
+        g_signal_state.handlers[i] = SIG_DFL;
+        sigemptyset(&g_signal_state.actions[i].sa_mask);
+        g_signal_state.actions[i].sa_flags = 0;
+    }
+
+    g_signal_state.blocked = 0;
+    g_signal_state.pending = 0;
+    g_signal_state.initialized = TRUE;
+}
+
+// Set signal handler (simple interface)
+sighandler_t signal(I64 signum, sighandler_t handler)
+{
+    signal_init();
+
+    if (signum < 1 || signum >= NSIG || signum == SIGKILL || signum == SIGSTOP) {
+        errno = EINVAL;
+        return SIG_ERR;
+    }
+
+    sighandler_t old = g_signal_state.handlers[signum];
+    g_signal_state.handlers[signum] = handler;
+    g_signal_state.actions[signum].sa_handler = handler;
+
+    return old;
+}
+
+// Set signal action (full interface)
+I64 sigaction(I64 signum, sigaction_t *act, sigaction_t *oldact)
+{
+    signal_init();
+
+    if (signum < 1 || signum >= NSIG || signum == SIGKILL || signum == SIGSTOP) {
+        errno = EINVAL;
+        return -1;
+    }
+
+    // Return old action
+    if (oldact) {
+        MemCpy(oldact, &g_signal_state.actions[signum], sizeof(sigaction_t));
+    }
+
+    // Set new action
+    if (act) {
+        MemCpy(&g_signal_state.actions[signum], act, sizeof(sigaction_t));
+        g_signal_state.handlers[signum] = act->sa_handler;
+    }
+
+    return 0;
+}
+
+// Block/unblock signals
+#define SIG_BLOCK   0
+#define SIG_UNBLOCK 1
+#define SIG_SETMASK 2
+
+I64 sigprocmask(I64 how, sigset_t *set, sigset_t *oldset)
+{
+    signal_init();
+
+    if (oldset) {
+        *oldset = g_signal_state.blocked;
+    }
+
+    if (set) {
+        switch (how) {
+            case SIG_BLOCK:
+                g_signal_state.blocked |= *set;
+                break;
+            case SIG_UNBLOCK:
+                g_signal_state.blocked &= ~(*set);
+                break;
+            case SIG_SETMASK:
+                g_signal_state.blocked = *set;
+                break;
+            default:
+                errno = EINVAL;
+                return -1;
+        }
+    }
+
+    return 0;
+}
+
+// Get pending signals
+I64 sigpending(sigset_t *set)
+{
+    signal_init();
+
+    if (!set) {
+        errno = EINVAL;
+        return -1;
+    }
+
+    *set = g_signal_state.pending;
+    return 0;
+}
+
+// Wait for signal
+I64 sigsuspend(sigset_t *mask)
+{
+    signal_init();
+
+    // Save old mask
+    sigset_t old_mask = g_signal_state.blocked;
+
+    // Set new mask
+    if (mask) {
+        g_signal_state.blocked = *mask;
+    }
+
+    // In ZealOS, we yield and check for signals
+    // This is a simplified implementation
+    Yield;
+
+    // Restore old mask
+    g_signal_state.blocked = old_mask;
+
+    errno = EINTR;
+    return -1;
+}
+
+// Send signal to process
+I64 kill(I64 pid, I64 sig)
+{
+    signal_init();
+
+    if (sig < 0 || sig >= NSIG) {
+        errno = EINVAL;
+        return -1;
+    }
+
+    // In ZealOS, we only support sending signals to ourselves
+    if (pid == 0 || pid == getpid() || pid == -1) {
+        // Raise signal to ourselves
+        return raise(sig);
+    }
+
+    // Can't send to other processes
+    errno = ESRCH;
+    return -1;
+}
+
+// Raise signal in current process
+I64 raise(I64 sig)
+{
+    signal_init();
+
+    if (sig < 0 || sig >= NSIG) {
+        errno = EINVAL;
+        return -1;
+    }
+
+    // Check if blocked
+    if (g_signal_state.blocked & (1 << sig)) {
+        g_signal_state.pending |= (1 << sig);
+        return 0;
+    }
+
+    // Get handler
+    sighandler_t handler = g_signal_state.handlers[sig];
+
+    if (handler == SIG_IGN) {
+        return 0;
+    }
+
+    if (handler == SIG_DFL) {
+        // Default actions
+        switch (sig) {
+            case SIGCHLD:
+            case SIGURG:
+            case SIGWINCH:
+                // Ignore by default
+                return 0;
+
+            case SIGSTOP:
+            case SIGTSTP:
+            case SIGTTIN:
+            case SIGTTOU:
+                // Stop process - not really supported
+                return 0;
+
+            case SIGCONT:
+                // Continue - nothing to do
+                return 0;
+
+            case SIGTERM:
+            case SIGINT:
+            case SIGQUIT:
+            case SIGKILL:
+            case SIGHUP:
+            case SIGPIPE:
+            case SIGALRM:
+            case SIGUSR1:
+            case SIGUSR2:
+            default:
+                // Terminate
+                _exit(128 + sig);
+        }
+    }
+
+    // Call custom handler
+    handler(sig);
+
+    // Reset handler if SA_RESETHAND
+    if (g_signal_state.actions[sig].sa_flags & SA_RESETHAND) {
+        g_signal_state.handlers[sig] = SIG_DFL;
+    }
+
+    return 0;
+}
+
+// ============================================================================
+// SIGSETJMP / SIGLONGJMP
+// ============================================================================
+
+// Jump buffer for sigsetjmp
+// This stores CPU registers and signal mask
+class sigjmp_buf_t {
+    U64 regs[16];       // RBX, RBP, R12-R15, RSP, RIP, etc.
+    sigset_t sigmask;   // Saved signal mask
+    I64 savesigs;       // Whether to save/restore signals
+    I64 valid;          // Is this buffer valid?
+};
+
+typedef sigjmp_buf_t sigjmp_buf[1];
+
+// Regular jmp_buf (without signal mask)
+typedef sigjmp_buf_t jmp_buf[1];
+
+// sigsetjmp - save context for later siglongjmp
+// Returns 0 when called directly, non-zero when returning from siglongjmp
+// Note: This is a simplified implementation - real sigsetjmp needs assembly
+I64 sigsetjmp(sigjmp_buf env, I64 savesigs)
+{
+    signal_init();
+
+    if (!env) return 0;
+
+    env[0].savesigs = savesigs;
+    env[0].valid = 1;
+
+    // Save signal mask if requested
+    if (savesigs) {
+        env[0].sigmask = g_signal_state.blocked;
+    }
+
+    // In a real implementation, we'd save CPU registers here
+    // For ZealOS, we use try/catch instead
+    // This returns 0 on initial call
+
+    return 0;
+}
+
+// siglongjmp - restore context saved by sigsetjmp
+U0 siglongjmp(sigjmp_buf env, I64 val)
+{
+    if (!env || !env[0].valid) {
+        return;
+    }
+
+    // Restore signal mask if it was saved
+    if (env[0].savesigs) {
+        g_signal_state.blocked = env[0].sigmask;
+    }
+
+    // In a real implementation, we'd restore CPU registers and jump
+    // For ZealOS, we throw an exception that can be caught
+    if (val == 0) val = 1;
+
+    // Use ZealOS exception mechanism
+    throw('LJMP', val);
+}
+
+// setjmp - simpler version without signal mask
+I64 setjmp(jmp_buf env)
+{
+    return sigsetjmp(env, 0);
+}
+
+// longjmp - simpler version
+U0 longjmp(jmp_buf env, I64 val)
+{
+    siglongjmp(env, val);
+}
+
+// _setjmp/_longjmp - same as setjmp/longjmp
+#define _setjmp setjmp
+#define _longjmp longjmp
+
+// ============================================================================
+// ALARM AND TIMER
+// ============================================================================
+
+static I64 g_alarm_time = 0;
+static I64 g_alarm_set = 0;
+
+// Set alarm timer
+U32 alarm(U32 seconds)
+{
+    signal_init();
+
+    U32 old_remaining = 0;
+
+    if (g_alarm_set) {
+        I64 now = GetTickCount();
+        I64 remaining = (g_alarm_time - now) / 1000;
+        if (remaining > 0) {
+            old_remaining = remaining;
+        }
+    }
+
+    if (seconds > 0) {
+        g_alarm_time = GetTickCount() + seconds * 1000;
+        g_alarm_set = 1;
+    } else {
+        g_alarm_set = 0;
+    }
+
+    return old_remaining;
+}
+
+// Check for pending alarm (call periodically)
+U0 alarm_check()
+{
+    if (g_alarm_set && GetTickCount() >= g_alarm_time) {
+        g_alarm_set = 0;
+        raise(SIGALRM);
+    }
+}
+
+// Pause until signal received
+I64 pause()
+{
+    signal_init();
+
+    // Wait for any signal
+    while (g_signal_state.pending == 0) {
+        alarm_check();
+        Yield;
+    }
+
+    errno = EINTR;
+    return -1;
+}
+
+// ============================================================================
+// BSD COMPATIBILITY
+// ============================================================================
+
+// BSD signal - like signal but with SA_RESTART
+sighandler_t bsd_signal(I64 signum, sighandler_t handler)
+{
+    sigaction_t act, oldact;
+
+    sigemptyset(&act.sa_mask);
+    act.sa_handler = handler;
+    act.sa_flags = SA_RESTART;
+
+    if (sigaction(signum, &act, &oldact) < 0) {
+        return SIG_ERR;
+    }
+
+    return oldact.sa_handler;
+}
+
+// sysv_signal - like signal but with SA_RESETHAND
+sighandler_t sysv_signal(I64 signum, sighandler_t handler)
+{
+    sigaction_t act, oldact;
+
+    sigemptyset(&act.sa_mask);
+    act.sa_handler = handler;
+    act.sa_flags = SA_RESETHAND | SA_NODEFER;
+
+    if (sigaction(signum, &act, &oldact) < 0) {
+        return SIG_ERR;
+    }
+
+    return oldact.sa_handler;
+}
+
+// Signal name strings
+static U8 *g_signal_names[NSIG] = {
+    "Signal 0",
+    "SIGHUP", "SIGINT", "SIGQUIT", "SIGILL", "SIGTRAP",
+    "SIGABRT", "SIGBUS", "SIGFPE", "SIGKILL", "SIGUSR1",
+    "SIGSEGV", "SIGUSR2", "SIGPIPE", "SIGALRM", "SIGTERM",
+    "SIGSTKFLT", "SIGCHLD", "SIGCONT", "SIGSTOP", "SIGTSTP",
+    "SIGTTIN", "SIGTTOU", "SIGURG", "SIGXCPU", "SIGXFSZ",
+    "SIGVTALRM", "SIGPROF", "SIGWINCH", "SIGIO", "SIGPWR",
+    "SIGSYS"
+};
+
+// Get signal name
+U8 *strsignal(I64 sig)
+{
+    if (sig >= 0 && sig < NSIG) {
+        return g_signal_names[sig];
+    }
+    return "Unknown signal";
+}
+
+// Print signal message
+U0 psignal(I64 sig, U8 *s)
+{
+    if (s && *s) {
+        fprintf(stderr, "%s: %s\n", s, strsignal(sig));
+    } else {
+        fprintf(stderr, "%s\n", strsignal(sig));
+    }
+}
+
+// ============================================================================
+// ABORT
+// ============================================================================
+
+U0 abort()
+{
+    signal_init();
+
+    // Unblock SIGABRT
+    sigset_t mask;
+    sigemptyset(&mask);
+    sigaddset(&mask, SIGABRT);
+    sigprocmask(SIG_UNBLOCK, &mask, NULL);
+
+    // Raise SIGABRT
+    raise(SIGABRT);
+
+    // If handler returned, reset and raise again
+    signal(SIGABRT, SIG_DFL);
+    raise(SIGABRT);
+
+    // Should never reach here
+    _exit(134);  // 128 + SIGABRT
+}
+
+// ============================================================================
+// INITIALIZATION
+// ============================================================================
+
+signal_init();
+"ZealOS signal library loaded.\n";
+"  - Signals: signal, sigaction, raise, kill\n";
+"  - Signal sets: sigemptyset, sigaddset, sigismember\n";
+"  - Blocking: sigprocmask, sigsuspend, sigpending\n";
+"  - Jumps: setjmp, longjmp, sigsetjmp, siglongjmp\n";
+"  - Timer: alarm, pause\n";

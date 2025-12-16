@@ -1,0 +1,556 @@
+// ASN1.ZC - ASN.1/DER Parser Implementation for ZealOS
+// Part of ZealOS TLS implementation
+// Provides ASN.1 DER parsing for X.509 certificates
+
+// ============================================================================
+// PARSER INITIALIZATION
+// ============================================================================
+
+// Initialize parser with DER data
+U0 ASN1ParserInit(CASN1Parser *parser, U8 *data, I64 length)
+{
+	parser->data = data;
+	parser->length = length;
+	parser->pos = 0;
+	parser->error = ASN1_OK;
+}
+
+// Check if parser has more data
+Bool ASN1HasMore(CASN1Parser *parser)
+{
+	return parser->pos < parser->length && parser->error == ASN1_OK;
+}
+
+// ============================================================================
+// LENGTH PARSING
+// ============================================================================
+
+// Parse DER length field
+// Returns length, advances parser position
+I64 ASN1ParseLength(CASN1Parser *parser)
+{
+	U8 first;
+	I64 length, num_bytes, i;
+
+	if (parser->pos >= parser->length) {
+		parser->error = ASN1_ERR_TRUNCATED;
+		return -1;
+	}
+
+	first = parser->data[parser->pos++];
+
+	// Short form: length < 128
+	if ((first & 0x80) == 0) {
+		return first;
+	}
+
+	// Long form: first byte indicates number of length bytes
+	num_bytes = first & 0x7F;
+
+	if (num_bytes == 0) {
+		// Indefinite length - not supported in DER
+		parser->error = ASN1_ERR_UNSUPPORTED;
+		return -1;
+	}
+
+	if (num_bytes > 4) {
+		// Too long for our purposes
+		parser->error = ASN1_ERR_OVERFLOW;
+		return -1;
+	}
+
+	if (parser->pos + num_bytes > parser->length) {
+		parser->error = ASN1_ERR_TRUNCATED;
+		return -1;
+	}
+
+	length = 0;
+	for (i = 0; i < num_bytes; i++) {
+		length = (length << 8) | parser->data[parser->pos++];
+	}
+
+	return length;
+}
+
+// ============================================================================
+// ELEMENT PARSING
+// ============================================================================
+
+// Parse a DER element (tag + length + content)
+// Does not consume content, just identifies it
+I64 ASN1ParseElement(CASN1Parser *parser, CASN1Element *elem)
+{
+	I64 start_pos;
+
+	if (parser->pos >= parser->length) {
+		parser->error = ASN1_ERR_TRUNCATED;
+		return ASN1_ERR_TRUNCATED;
+	}
+
+	start_pos = parser->pos;
+	elem->raw = &parser->data[start_pos];
+
+	// Parse tag
+	elem->tag = parser->data[parser->pos++];
+
+	// Parse length
+	elem->length = ASN1ParseLength(parser);
+	if (parser->error != ASN1_OK) {
+		return parser->error;
+	}
+
+	// Validate content fits
+	if (parser->pos + elem->length > parser->length) {
+		parser->error = ASN1_ERR_TRUNCATED;
+		return ASN1_ERR_TRUNCATED;
+	}
+
+	// Set content pointer
+	elem->content = &parser->data[parser->pos];
+	elem->raw_length = (parser->pos + elem->length) - start_pos;
+
+	// Advance past content
+	parser->pos += elem->length;
+
+	return ASN1_OK;
+}
+
+// Parse element without advancing past content
+I64 ASN1PeekElement(CASN1Parser *parser, CASN1Element *elem)
+{
+	I64 saved_pos = parser->pos;
+	I64 result = ASN1ParseElement(parser, elem);
+	parser->pos = saved_pos + (parser->error == ASN1_OK ? 0 : 0);
+
+	// Reset position to content start (after tag+length)
+	if (result == ASN1_OK) {
+		parser->pos = elem->content - parser->data;
+	}
+
+	return result;
+}
+
+// Skip an element
+I64 ASN1SkipElement(CASN1Parser *parser)
+{
+	CASN1Element elem;
+	return ASN1ParseElement(parser, &elem);
+}
+
+// Enter a constructed element (SEQUENCE, SET)
+// Sets up parser to read children
+I64 ASN1EnterConstructed(CASN1Parser *parser, CASN1Element *elem, CASN1Parser *child)
+{
+	I64 result = ASN1ParseElement(parser, elem);
+	if (result != ASN1_OK) return result;
+
+	if (!(elem->tag & ASN1_CONSTRUCTED)) {
+		parser->error = ASN1_ERR_UNEXPECTED_TAG;
+		return ASN1_ERR_UNEXPECTED_TAG;
+	}
+
+	// Create child parser for content
+	ASN1ParserInit(child, elem->content, elem->length);
+	return ASN1_OK;
+}
+
+// ============================================================================
+// VALUE EXTRACTION
+// ============================================================================
+
+// Parse an INTEGER value
+I64 ASN1ParseInteger(CASN1Parser *parser, I64 *value)
+{
+	CASN1Element elem;
+	I64 result, i, val;
+	Bool negative;
+
+	result = ASN1ParseElement(parser, &elem);
+	if (result != ASN1_OK) return result;
+
+	if (elem.tag != ASN1_TAG_INTEGER) {
+		parser->error = ASN1_ERR_UNEXPECTED_TAG;
+		return ASN1_ERR_UNEXPECTED_TAG;
+	}
+
+	if (elem.length == 0) {
+		*value = 0;
+		return ASN1_OK;
+	}
+
+	// Check for negative (high bit set)
+	negative = (elem.content[0] & 0x80) != 0;
+
+	// Parse value (limited to 64 bits)
+	val = 0;
+	for (i = 0; i < elem.length && i < 8; i++) {
+		val = (val << 8) | elem.content[i];
+	}
+
+	// Handle sign extension for negative numbers
+	if (negative && elem.length < 8) {
+		// Sign extend
+		I64 shift = (8 - elem.length) * 8;
+		val = (val << shift) >> shift;
+	}
+
+	*value = val;
+	return ASN1_OK;
+}
+
+// Parse big integer (for RSA modulus, etc.)
+// Returns pointer to big-endian bytes and length
+I64 ASN1ParseBigInteger(CASN1Parser *parser, U8 **data, I64 *length)
+{
+	CASN1Element elem;
+	I64 result;
+
+	result = ASN1ParseElement(parser, &elem);
+	if (result != ASN1_OK) return result;
+
+	if (elem.tag != ASN1_TAG_INTEGER) {
+		parser->error = ASN1_ERR_UNEXPECTED_TAG;
+		return ASN1_ERR_UNEXPECTED_TAG;
+	}
+
+	// Skip leading zero byte if present (for unsigned representation)
+	if (elem.length > 0 && elem.content[0] == 0) {
+		*data = elem.content + 1;
+		*length = elem.length - 1;
+	} else {
+		*data = elem.content;
+		*length = elem.length;
+	}
+
+	return ASN1_OK;
+}
+
+// Parse BOOLEAN
+I64 ASN1ParseBoolean(CASN1Parser *parser, Bool *value)
+{
+	CASN1Element elem;
+	I64 result;
+
+	result = ASN1ParseElement(parser, &elem);
+	if (result != ASN1_OK) return result;
+
+	if (elem.tag != ASN1_TAG_BOOLEAN) {
+		parser->error = ASN1_ERR_UNEXPECTED_TAG;
+		return ASN1_ERR_UNEXPECTED_TAG;
+	}
+
+	if (elem.length != 1) {
+		parser->error = ASN1_ERR_INVALID_LENGTH;
+		return ASN1_ERR_INVALID_LENGTH;
+	}
+
+	*value = (elem.content[0] != 0);
+	return ASN1_OK;
+}
+
+// Parse BIT STRING
+// Returns pointer to bit data and number of unused bits in last byte
+I64 ASN1ParseBitString(CASN1Parser *parser, U8 **data, I64 *length, I64 *unused_bits)
+{
+	CASN1Element elem;
+	I64 result;
+
+	result = ASN1ParseElement(parser, &elem);
+	if (result != ASN1_OK) return result;
+
+	if (elem.tag != ASN1_TAG_BIT_STRING) {
+		parser->error = ASN1_ERR_UNEXPECTED_TAG;
+		return ASN1_ERR_UNEXPECTED_TAG;
+	}
+
+	if (elem.length < 1) {
+		parser->error = ASN1_ERR_INVALID_LENGTH;
+		return ASN1_ERR_INVALID_LENGTH;
+	}
+
+	*unused_bits = elem.content[0];
+	*data = elem.content + 1;
+	*length = elem.length - 1;
+
+	return ASN1_OK;
+}
+
+// Parse OCTET STRING
+I64 ASN1ParseOctetString(CASN1Parser *parser, U8 **data, I64 *length)
+{
+	CASN1Element elem;
+	I64 result;
+
+	result = ASN1ParseElement(parser, &elem);
+	if (result != ASN1_OK) return result;
+
+	if (elem.tag != ASN1_TAG_OCTET_STRING) {
+		parser->error = ASN1_ERR_UNEXPECTED_TAG;
+		return ASN1_ERR_UNEXPECTED_TAG;
+	}
+
+	*data = elem.content;
+	*length = elem.length;
+	return ASN1_OK;
+}
+
+// Parse NULL
+I64 ASN1ParseNull(CASN1Parser *parser)
+{
+	CASN1Element elem;
+	I64 result;
+
+	result = ASN1ParseElement(parser, &elem);
+	if (result != ASN1_OK) return result;
+
+	if (elem.tag != ASN1_TAG_NULL) {
+		parser->error = ASN1_ERR_UNEXPECTED_TAG;
+		return ASN1_ERR_UNEXPECTED_TAG;
+	}
+
+	if (elem.length != 0) {
+		parser->error = ASN1_ERR_INVALID_LENGTH;
+		return ASN1_ERR_INVALID_LENGTH;
+	}
+
+	return ASN1_OK;
+}
+
+// ============================================================================
+// STRING PARSING
+// ============================================================================
+
+// Parse a string type (UTF8String, PrintableString, IA5String, etc.)
+// Allocates and returns new string, caller must free
+U8 *ASN1ParseString(CASN1Parser *parser, I64 *out_length)
+{
+	CASN1Element elem;
+	I64 result;
+	U8 *str;
+
+	result = ASN1ParseElement(parser, &elem);
+	if (result != ASN1_OK) return NULL;
+
+	// Accept various string types
+	if (elem.tag != ASN1_TAG_UTF8_STRING &&
+	    elem.tag != ASN1_TAG_PRINTABLE_STRING &&
+	    elem.tag != ASN1_TAG_IA5_STRING) {
+		parser->error = ASN1_ERR_UNEXPECTED_TAG;
+		return NULL;
+	}
+
+	str = MAlloc(elem.length + 1);
+	MemCpy(str, elem.content, elem.length);
+	str[elem.length] = 0;
+
+	if (out_length) *out_length = elem.length;
+	return str;
+}
+
+// Parse any string type without tag check
+U8 *ASN1ParseAnyString(CASN1Parser *parser, I64 *out_length)
+{
+	CASN1Element elem;
+	I64 result;
+	U8 *str;
+
+	result = ASN1ParseElement(parser, &elem);
+	if (result != ASN1_OK) return NULL;
+
+	str = MAlloc(elem.length + 1);
+	MemCpy(str, elem.content, elem.length);
+	str[elem.length] = 0;
+
+	if (out_length) *out_length = elem.length;
+	return str;
+}
+
+// ============================================================================
+// OID PARSING
+// ============================================================================
+
+// Parse OID and return as dotted string (e.g., "1.2.840.113549.1.1.11")
+// Allocates and returns new string, caller must free
+U8 *ASN1ParseOID(CASN1Parser *parser)
+{
+	CASN1Element elem;
+	I64 result, i;
+	U8 oid_str[256];
+	I64 offset = 0;
+	I64 value;
+	I64 first, second;
+
+	result = ASN1ParseElement(parser, &elem);
+	if (result != ASN1_OK) return NULL;
+
+	if (elem.tag != ASN1_TAG_OID) {
+		parser->error = ASN1_ERR_UNEXPECTED_TAG;
+		return NULL;
+	}
+
+	if (elem.length == 0) {
+		return StrNew("");
+	}
+
+	// First byte encodes first two components
+	first = elem.content[0] / 40;
+	second = elem.content[0] % 40;
+	offset += StrPrint(oid_str + offset, "%d.%d", first, second);
+
+	// Remaining bytes encode remaining components
+	i = 1;
+	while (i < elem.length) {
+		value = 0;
+		while (i < elem.length) {
+			U8 byte = elem.content[i++];
+			value = (value << 7) | (byte & 0x7F);
+			if ((byte & 0x80) == 0) break;
+		}
+		offset += StrPrint(oid_str + offset, ".%d", value);
+
+		if (offset > 250) break;  // Safety limit
+	}
+
+	return StrNew(oid_str);
+}
+
+// Parse OID without converting to string
+// Returns raw OID bytes
+I64 ASN1ParseOIDRaw(CASN1Parser *parser, U8 **data, I64 *length)
+{
+	CASN1Element elem;
+	I64 result;
+
+	result = ASN1ParseElement(parser, &elem);
+	if (result != ASN1_OK) return result;
+
+	if (elem.tag != ASN1_TAG_OID) {
+		parser->error = ASN1_ERR_UNEXPECTED_TAG;
+		return ASN1_ERR_UNEXPECTED_TAG;
+	}
+
+	*data = elem.content;
+	*length = elem.length;
+	return ASN1_OK;
+}
+
+// Compare OID against expected bytes
+Bool ASN1OIDEquals(U8 *oid_data, I64 oid_len, U8 *expected, I64 expected_len)
+{
+	if (oid_len != expected_len) return FALSE;
+	return MemCmp(oid_data, expected, oid_len) == 0;
+}
+
+// ============================================================================
+// TIME PARSING
+// ============================================================================
+
+// Parse UTCTime or GeneralizedTime to Unix timestamp
+// UTCTime: YYMMDDHHMMSSZ
+// GeneralizedTime: YYYYMMDDHHMMSSZ
+I64 ASN1ParseTime(CASN1Parser *parser, U64 *timestamp)
+{
+	CASN1Element elem;
+	I64 result;
+	I64 year, month, day, hour, minute, second;
+	U8 *p;
+
+	result = ASN1ParseElement(parser, &elem);
+	if (result != ASN1_OK) return result;
+
+	if (elem.tag != ASN1_TAG_UTC_TIME && elem.tag != ASN1_TAG_GENERALIZED_TIME) {
+		parser->error = ASN1_ERR_UNEXPECTED_TAG;
+		return ASN1_ERR_UNEXPECTED_TAG;
+	}
+
+	p = elem.content;
+
+	if (elem.tag == ASN1_TAG_UTC_TIME) {
+		// YYMMDDHHMMSSZ (13 bytes)
+		if (elem.length < 13) {
+			parser->error = ASN1_ERR_INVALID_LENGTH;
+			return ASN1_ERR_INVALID_LENGTH;
+		}
+		year = (p[0] - '0') * 10 + (p[1] - '0');
+		year += (year >= 50) ? 1900 : 2000;
+		p += 2;
+	} else {
+		// YYYYMMDDHHMMSSZ (15 bytes)
+		if (elem.length < 15) {
+			parser->error = ASN1_ERR_INVALID_LENGTH;
+			return ASN1_ERR_INVALID_LENGTH;
+		}
+		year = (p[0] - '0') * 1000 + (p[1] - '0') * 100 +
+		       (p[2] - '0') * 10 + (p[3] - '0');
+		p += 4;
+	}
+
+	month = (p[0] - '0') * 10 + (p[1] - '0');
+	day = (p[2] - '0') * 10 + (p[3] - '0');
+	hour = (p[4] - '0') * 10 + (p[5] - '0');
+	minute = (p[6] - '0') * 10 + (p[7] - '0');
+	second = (p[8] - '0') * 10 + (p[9] - '0');
+
+	// Convert to approximate Unix timestamp
+	// This is a simplified calculation
+	I64 days = 0;
+	I64 i;
+
+	// Days from years
+	for (i = 1970; i < year; i++) {
+		days += 365;
+		if ((i % 4 == 0 && i % 100 != 0) || i % 400 == 0) {
+			days++;  // Leap year
+		}
+	}
+
+	// Days from months
+	I64 month_days[12] = {31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31};
+	if ((year % 4 == 0 && year % 100 != 0) || year % 400 == 0) {
+		month_days[1] = 29;
+	}
+	for (i = 0; i < month - 1; i++) {
+		days += month_days[i];
+	}
+
+	// Add days
+	days += day - 1;
+
+	*timestamp = days * 86400 + hour * 3600 + minute * 60 + second;
+	return ASN1_OK;
+}
+
+// ============================================================================
+// SEQUENCE/SET HELPERS
+// ============================================================================
+
+// Expect and enter a SEQUENCE
+I64 ASN1ExpectSequence(CASN1Parser *parser, CASN1Parser *child)
+{
+	CASN1Element elem;
+	return ASN1EnterConstructed(parser, &elem, child);
+}
+
+// Skip to specific context tag
+I64 ASN1SkipToContextTag(CASN1Parser *parser, I64 tag_num)
+{
+	U8 expected_tag = ASN1_CLASS_CONTEXT | ASN1_CONSTRUCTED | tag_num;
+
+	while (ASN1HasMore(parser)) {
+		CASN1Element elem;
+		I64 saved_pos = parser->pos;
+
+		if (ASN1ParseElement(parser, &elem) != ASN1_OK) {
+			return parser->error;
+		}
+
+		if ((elem.tag & 0xDF) == (expected_tag & 0xDF)) {
+			// Found it - restore position to before element
+			parser->pos = saved_pos;
+			return ASN1_OK;
+		}
+	}
+
+	return ASN1_ERR_UNEXPECTED_TAG;
+}
+

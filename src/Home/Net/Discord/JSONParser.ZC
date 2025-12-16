@@ -1,0 +1,1094 @@
+// JSONParser.ZC - Recursive Descent JSON Parser for ZealOS
+// Part of ZealOS Discord implementation
+// Provides proper JSON parsing with array and nested object support
+
+// ============================================================================
+// FORWARD DECLARATIONS
+// ============================================================================
+
+CJSONValue *JSONParseValue(CJSONParser *parser);
+
+// ============================================================================
+// MEMORY MANAGEMENT
+// ============================================================================
+
+// Create a new JSON value
+CJSONValue *JSONValueNew(U8 type)
+{
+	CJSONValue *val = MAlloc(sizeof(CJSONValue));
+	MemSet(val, 0, sizeof(CJSONValue));
+	val->type = type;
+	return val;
+}
+
+// Free a JSON value and all children
+U0 JSONValueFree(CJSONValue *val)
+{
+	I64 i;
+
+	if (!val) return;
+
+	switch (val->type) {
+		case JSON_STRING:
+			if (val->string_val) {
+				Free(val->string_val);
+			}
+			break;
+
+		case JSON_ARRAY:
+			for (i = 0; i < val->array.count; i++) {
+				JSONValueFree(val->array.items[i]);
+			}
+			if (val->array.items) {
+				Free(val->array.items);
+			}
+			break;
+
+		case JSON_OBJECT:
+			for (i = 0; i < val->object.count; i++) {
+				if (val->object.keys[i]) Free(val->object.keys[i]);
+				JSONValueFree(val->object.values[i]);
+			}
+			if (val->object.keys) Free(val->object.keys);
+			if (val->object.values) Free(val->object.values);
+			break;
+	}
+
+	Free(val);
+}
+
+// ============================================================================
+// ARRAY OPERATIONS
+// ============================================================================
+
+// Ensure array has capacity for one more item
+U0 JSONArrayGrow(CJSONArray *arr)
+{
+	if (arr->count >= arr->capacity) {
+		I64 new_cap = arr->capacity == 0 ? JSON_INITIAL_CAPACITY : arr->capacity * 2;
+		CJSONValue **new_items = MAlloc(new_cap * sizeof(CJSONValue*));
+
+		if (arr->items) {
+			MemCpy(new_items, arr->items, arr->count * sizeof(CJSONValue*));
+			Free(arr->items);
+		}
+
+		arr->items = new_items;
+		arr->capacity = new_cap;
+	}
+}
+
+// Add item to array
+U0 JSONArrayAdd(CJSONArray *arr, CJSONValue *val)
+{
+	JSONArrayGrow(arr);
+	arr->items[arr->count++] = val;
+}
+
+// ============================================================================
+// OBJECT OPERATIONS
+// ============================================================================
+
+// Ensure object has capacity for one more pair
+U0 JSONObjectGrow(CJSONObject *obj)
+{
+	if (obj->count >= obj->capacity) {
+		I64 new_cap = obj->capacity == 0 ? JSON_INITIAL_CAPACITY : obj->capacity * 2;
+
+		U8 **new_keys = MAlloc(new_cap * sizeof(U8*));
+		CJSONValue **new_vals = MAlloc(new_cap * sizeof(CJSONValue*));
+
+		if (obj->keys) {
+			MemCpy(new_keys, obj->keys, obj->count * sizeof(U8*));
+			Free(obj->keys);
+		}
+		if (obj->values) {
+			MemCpy(new_vals, obj->values, obj->count * sizeof(CJSONValue*));
+			Free(obj->values);
+		}
+
+		obj->keys = new_keys;
+		obj->values = new_vals;
+		obj->capacity = new_cap;
+	}
+}
+
+// Add key-value pair to object
+U0 JSONObjectAdd(CJSONObject *obj, U8 *key, CJSONValue *val)
+{
+	JSONObjectGrow(obj);
+	obj->keys[obj->count] = key;
+	obj->values[obj->count] = val;
+	obj->count++;
+}
+
+// ============================================================================
+// PARSER HELPERS
+// ============================================================================
+
+// Set parser error
+U0 JSONParserError(CJSONParser *parser, I64 code, U8 *msg)
+{
+	parser->error = code;
+	StrPrint(parser->error_msg, "Line %d, Col %d: %s", parser->line, parser->col, msg);
+}
+
+// Get current character
+U8 JSONPeek(CJSONParser *parser)
+{
+	if (parser->pos >= parser->length) return 0;
+	return parser->input[parser->pos];
+}
+
+// Advance to next character
+U0 JSONAdvance(CJSONParser *parser)
+{
+	if (parser->pos < parser->length) {
+		if (parser->input[parser->pos] == '\n') {
+			parser->line++;
+			parser->col = 1;
+		} else {
+			parser->col++;
+		}
+		parser->pos++;
+	}
+}
+
+// Skip whitespace
+U0 JSONSkipWS(CJSONParser *parser)
+{
+	while (parser->pos < parser->length) {
+		U8 c = parser->input[parser->pos];
+		if (c == ' ' || c == '\t' || c == '\n' || c == '\r') {
+			JSONAdvance(parser);
+		} else {
+			break;
+		}
+	}
+}
+
+// Expect a specific character
+Bool JSONExpect(CJSONParser *parser, U8 expected)
+{
+	JSONSkipWS(parser);
+	if (JSONPeek(parser) == expected) {
+		JSONAdvance(parser);
+		return TRUE;
+	}
+	return FALSE;
+}
+
+// ============================================================================
+// STRING PARSING
+// ============================================================================
+
+// Parse a JSON string (handles escape sequences)
+U8 *JSONParseString(CJSONParser *parser)
+{
+	U8 *result;
+	I64 start, len, i, j;
+	U8 c;
+
+	if (JSONPeek(parser) != '"') {
+		JSONParserError(parser, JSON_ERR_INVALID_STRING, "Expected '\"'");
+		return NULL;
+	}
+	JSONAdvance(parser);  // Skip opening quote
+
+	// Find end of string
+	start = parser->pos;
+	len = 0;
+	while (parser->pos < parser->length) {
+		c = parser->input[parser->pos];
+		if (c == '"') break;
+		if (c == '\\') {
+			parser->pos++;
+			if (parser->pos >= parser->length) {
+				JSONParserError(parser, JSON_ERR_UNEXPECTED_END, "Unterminated string");
+				return NULL;
+			}
+		}
+		parser->pos++;
+		len++;
+	}
+
+	if (parser->pos >= parser->length) {
+		JSONParserError(parser, JSON_ERR_UNEXPECTED_END, "Unterminated string");
+		return NULL;
+	}
+
+	// Allocate result
+	result = MAlloc(len + 1);
+
+	// Copy with unescape
+	parser->pos = start;
+	j = 0;
+	while (parser->pos < parser->length) {
+		c = parser->input[parser->pos];
+		if (c == '"') break;
+
+		if (c == '\\') {
+			parser->pos++;
+			c = parser->input[parser->pos];
+			switch (c) {
+				case 'n':  result[j++] = '\n'; break;
+				case 'r':  result[j++] = '\r'; break;
+				case 't':  result[j++] = '\t'; break;
+				case '"':  result[j++] = '"';  break;
+				case '\\': result[j++] = '\\'; break;
+				case '/':  result[j++] = '/';  break;
+				case 'b':  result[j++] = '\b'; break;
+				case 'f':  result[j++] = '\f'; break;
+				case 'u':
+					// Unicode escape - simplified handling
+					// Just skip \uXXXX for now, output ?
+					parser->pos += 4;
+					result[j++] = '?';
+					break;
+				default:
+					result[j++] = c;
+					break;
+			}
+		} else {
+			result[j++] = c;
+		}
+		parser->pos++;
+	}
+	result[j] = 0;
+
+	JSONAdvance(parser);  // Skip closing quote
+	return result;
+}
+
+// ============================================================================
+// NUMBER PARSING
+// ============================================================================
+
+// Parse a JSON number
+CJSONValue *JSONParseNumber(CJSONParser *parser)
+{
+	CJSONValue *val = JSONValueNew(JSON_NUMBER);
+	I64 start = parser->pos;
+	Bool negative = FALSE;
+	Bool is_float = FALSE;
+	I64 int_val = 0;
+	F64 float_val = 0.0;
+	F64 frac = 0.1;
+	I64 exp = 0;
+	Bool exp_neg = FALSE;
+	U8 c;
+
+	// Handle negative
+	if (JSONPeek(parser) == '-') {
+		negative = TRUE;
+		JSONAdvance(parser);
+	}
+
+	// Integer part
+	while (parser->pos < parser->length) {
+		c = JSONPeek(parser);
+		if (c >= '0' && c <= '9') {
+			int_val = int_val * 10 + (c - '0');
+			JSONAdvance(parser);
+		} else {
+			break;
+		}
+	}
+
+	// Fractional part
+	if (JSONPeek(parser) == '.') {
+		is_float = TRUE;
+		float_val = int_val;
+		JSONAdvance(parser);
+
+		while (parser->pos < parser->length) {
+			c = JSONPeek(parser);
+			if (c >= '0' && c <= '9') {
+				float_val += (c - '0') * frac;
+				frac *= 0.1;
+				JSONAdvance(parser);
+			} else {
+				break;
+			}
+		}
+	}
+
+	// Exponent part
+	c = JSONPeek(parser);
+	if (c == 'e' || c == 'E') {
+		is_float = TRUE;
+		if (!val->is_float) float_val = int_val;
+		JSONAdvance(parser);
+
+		c = JSONPeek(parser);
+		if (c == '-') {
+			exp_neg = TRUE;
+			JSONAdvance(parser);
+		} else if (c == '+') {
+			JSONAdvance(parser);
+		}
+
+		while (parser->pos < parser->length) {
+			c = JSONPeek(parser);
+			if (c >= '0' && c <= '9') {
+				exp = exp * 10 + (c - '0');
+				JSONAdvance(parser);
+			} else {
+				break;
+			}
+		}
+
+		// Apply exponent
+		I64 i;
+		if (exp_neg) {
+			for (i = 0; i < exp; i++) float_val /= 10.0;
+		} else {
+			for (i = 0; i < exp; i++) float_val *= 10.0;
+		}
+	}
+
+	// Store result
+	val->is_float = is_float;
+	if (is_float) {
+		val->float_val = negative ? -float_val : float_val;
+		val->int_val = val->float_val;  // Also store as int
+	} else {
+		val->int_val = negative ? -int_val : int_val;
+		val->float_val = val->int_val;
+	}
+
+	return val;
+}
+
+// ============================================================================
+// ARRAY PARSING
+// ============================================================================
+
+CJSONValue *JSONParseArray(CJSONParser *parser)
+{
+	CJSONValue *arr = JSONValueNew(JSON_ARRAY);
+	CJSONValue *item;
+
+	if (!JSONExpect(parser, '[')) {
+		JSONParserError(parser, JSON_ERR_UNEXPECTED_CHAR, "Expected '['");
+		JSONValueFree(arr);
+		return NULL;
+	}
+
+	parser->depth++;
+	if (parser->depth > JSON_MAX_DEPTH) {
+		JSONParserError(parser, JSON_ERR_MAX_DEPTH, "Maximum nesting depth exceeded");
+		parser->depth--;
+		JSONValueFree(arr);
+		return NULL;
+	}
+
+	JSONSkipWS(parser);
+
+	// Empty array
+	if (JSONPeek(parser) == ']') {
+		JSONAdvance(parser);
+		parser->depth--;
+		return arr;
+	}
+
+	// Parse items
+	while (TRUE) {
+		item = JSONParseValue(parser);
+		if (!item || parser->error) {
+			JSONValueFree(arr);
+			parser->depth--;
+			return NULL;
+		}
+
+		JSONArrayAdd(&arr->array, item);
+
+		JSONSkipWS(parser);
+		if (JSONPeek(parser) == ']') {
+			JSONAdvance(parser);
+			break;
+		}
+
+		if (!JSONExpect(parser, ',')) {
+			JSONParserError(parser, JSON_ERR_UNEXPECTED_CHAR, "Expected ',' or ']'");
+			JSONValueFree(arr);
+			parser->depth--;
+			return NULL;
+		}
+	}
+
+	parser->depth--;
+	return arr;
+}
+
+// ============================================================================
+// OBJECT PARSING
+// ============================================================================
+
+CJSONValue *JSONParseObject(CJSONParser *parser)
+{
+	CJSONValue *obj = JSONValueNew(JSON_OBJECT);
+	U8 *key;
+	CJSONValue *val;
+
+	if (!JSONExpect(parser, '{')) {
+		JSONParserError(parser, JSON_ERR_UNEXPECTED_CHAR, "Expected '{'");
+		JSONValueFree(obj);
+		return NULL;
+	}
+
+	parser->depth++;
+	if (parser->depth > JSON_MAX_DEPTH) {
+		JSONParserError(parser, JSON_ERR_MAX_DEPTH, "Maximum nesting depth exceeded");
+		parser->depth--;
+		JSONValueFree(obj);
+		return NULL;
+	}
+
+	JSONSkipWS(parser);
+
+	// Empty object
+	if (JSONPeek(parser) == '}') {
+		JSONAdvance(parser);
+		parser->depth--;
+		return obj;
+	}
+
+	// Parse key-value pairs
+	while (TRUE) {
+		JSONSkipWS(parser);
+
+		// Parse key
+		key = JSONParseString(parser);
+		if (!key || parser->error) {
+			JSONValueFree(obj);
+			parser->depth--;
+			return NULL;
+		}
+
+		// Expect colon
+		if (!JSONExpect(parser, ':')) {
+			JSONParserError(parser, JSON_ERR_UNEXPECTED_CHAR, "Expected ':'");
+			Free(key);
+			JSONValueFree(obj);
+			parser->depth--;
+			return NULL;
+		}
+
+		// Parse value
+		val = JSONParseValue(parser);
+		if (!val || parser->error) {
+			Free(key);
+			JSONValueFree(obj);
+			parser->depth--;
+			return NULL;
+		}
+
+		JSONObjectAdd(&obj->object, key, val);
+
+		JSONSkipWS(parser);
+		if (JSONPeek(parser) == '}') {
+			JSONAdvance(parser);
+			break;
+		}
+
+		if (!JSONExpect(parser, ',')) {
+			JSONParserError(parser, JSON_ERR_UNEXPECTED_CHAR, "Expected ',' or '}'");
+			JSONValueFree(obj);
+			parser->depth--;
+			return NULL;
+		}
+	}
+
+	parser->depth--;
+	return obj;
+}
+
+// ============================================================================
+// VALUE PARSING
+// ============================================================================
+
+CJSONValue *JSONParseValue(CJSONParser *parser)
+{
+	CJSONValue *val;
+	U8 c;
+
+	JSONSkipWS(parser);
+
+	if (parser->pos >= parser->length) {
+		JSONParserError(parser, JSON_ERR_UNEXPECTED_END, "Unexpected end of input");
+		return NULL;
+	}
+
+	c = JSONPeek(parser);
+
+	// Object
+	if (c == '{') {
+		return JSONParseObject(parser);
+	}
+
+	// Array
+	if (c == '[') {
+		return JSONParseArray(parser);
+	}
+
+	// String
+	if (c == '"') {
+		val = JSONValueNew(JSON_STRING);
+		val->string_val = JSONParseString(parser);
+		if (!val->string_val) {
+			JSONValueFree(val);
+			return NULL;
+		}
+		return val;
+	}
+
+	// Number
+	if (c == '-' || (c >= '0' && c <= '9')) {
+		return JSONParseNumber(parser);
+	}
+
+	// true
+	if (c == 't' && parser->pos + 4 <= parser->length &&
+	    StrNCmp(&parser->input[parser->pos], "true", 4) == 0) {
+		parser->pos += 4;
+		val = JSONValueNew(JSON_BOOL);
+		val->bool_val = TRUE;
+		return val;
+	}
+
+	// false
+	if (c == 'f' && parser->pos + 5 <= parser->length &&
+	    StrNCmp(&parser->input[parser->pos], "false", 5) == 0) {
+		parser->pos += 5;
+		val = JSONValueNew(JSON_BOOL);
+		val->bool_val = FALSE;
+		return val;
+	}
+
+	// null
+	if (c == 'n' && parser->pos + 4 <= parser->length &&
+	    StrNCmp(&parser->input[parser->pos], "null", 4) == 0) {
+		parser->pos += 4;
+		return JSONValueNew(JSON_NULL);
+	}
+
+	JSONParserError(parser, JSON_ERR_INVALID_VALUE, "Invalid value");
+	return NULL;
+}
+
+// ============================================================================
+// MAIN PARSE FUNCTION
+// ============================================================================
+
+// Parse a JSON string and return root value
+// Returns NULL on error
+CJSONValue *JSONParse(U8 *json)
+{
+	CJSONParser parser;
+	CJSONValue *root;
+
+	if (!json) return NULL;
+
+	// Initialize parser
+	MemSet(&parser, 0, sizeof(CJSONParser));
+	parser.input = json;
+	parser.length = StrLen(json);
+	parser.pos = 0;
+	parser.line = 1;
+	parser.col = 1;
+	parser.depth = 0;
+	parser.error = JSON_OK;
+
+	// Parse root value
+	root = JSONParseValue(&parser);
+
+	if (parser.error != JSON_OK) {
+		if (root) JSONValueFree(root);
+		return NULL;
+	}
+
+	// Check for trailing content
+	JSONSkipWS(&parser);
+	if (parser.pos < parser.length) {
+		// Trailing content - could warn but allow it
+	}
+
+	return root;
+}
+
+// Parse with error reporting
+CJSONValue *JSONParseWithError(U8 *json, U8 *error_out, I64 error_max)
+{
+	CJSONParser parser;
+	CJSONValue *root;
+
+	if (!json) return NULL;
+
+	// Initialize parser
+	MemSet(&parser, 0, sizeof(CJSONParser));
+	parser.input = json;
+	parser.length = StrLen(json);
+	parser.pos = 0;
+	parser.line = 1;
+	parser.col = 1;
+	parser.depth = 0;
+	parser.error = JSON_OK;
+
+	// Parse root value
+	root = JSONParseValue(&parser);
+
+	if (parser.error != JSON_OK) {
+		if (error_out && error_max > 0) {
+			StrNCpy(error_out, parser.error_msg, error_max - 1);
+			error_out[error_max - 1] = 0;
+		}
+		if (root) JSONValueFree(root);
+		return NULL;
+	}
+
+	return root;
+}
+
+// ============================================================================
+// VALUE ACCESS FUNCTIONS
+// ============================================================================
+
+// Get object property by key (returns NULL if not found)
+CJSONValue *JSONObjectGet(CJSONValue *obj, U8 *key)
+{
+	I64 i;
+
+	if (!obj || obj->type != JSON_OBJECT) return NULL;
+
+	for (i = 0; i < obj->object.count; i++) {
+		if (StrCmp(obj->object.keys[i], key) == 0) {
+			return obj->object.values[i];
+		}
+	}
+
+	return NULL;
+}
+
+// Check if object has key
+Bool JSONObjectHas(CJSONValue *obj, U8 *key)
+{
+	return JSONObjectGet(obj, key) != NULL;
+}
+
+// Get object size
+I64 JSONObjectSize(CJSONValue *obj)
+{
+	if (!obj || obj->type != JSON_OBJECT) return 0;
+	return obj->object.count;
+}
+
+// Get object key by index
+U8 *JSONObjectKey(CJSONValue *obj, I64 index)
+{
+	if (!obj || obj->type != JSON_OBJECT) return NULL;
+	if (index < 0 || index >= obj->object.count) return NULL;
+	return obj->object.keys[index];
+}
+
+// Get object value by index
+CJSONValue *JSONObjectValue(CJSONValue *obj, I64 index)
+{
+	if (!obj || obj->type != JSON_OBJECT) return NULL;
+	if (index < 0 || index >= obj->object.count) return NULL;
+	return obj->object.values[index];
+}
+
+// Get array element by index
+CJSONValue *JSONArrayGet(CJSONValue *arr, I64 index)
+{
+	if (!arr || arr->type != JSON_ARRAY) return NULL;
+	if (index < 0 || index >= arr->array.count) return NULL;
+	return arr->array.items[index];
+}
+
+// Get array size
+I64 JSONArraySize(CJSONValue *arr)
+{
+	if (!arr || arr->type != JSON_ARRAY) return 0;
+	return arr->array.count;
+}
+
+// ============================================================================
+// TYPE CHECKING
+// ============================================================================
+
+Bool JSONIsNull(CJSONValue *val)    { return val && val->type == JSON_NULL; }
+Bool JSONIsBool(CJSONValue *val)    { return val && val->type == JSON_BOOL; }
+Bool JSONIsNumber(CJSONValue *val)  { return val && val->type == JSON_NUMBER; }
+Bool JSONIsString(CJSONValue *val)  { return val && val->type == JSON_STRING; }
+Bool JSONIsArray(CJSONValue *val)   { return val && val->type == JSON_ARRAY; }
+Bool JSONIsObject(CJSONValue *val)  { return val && val->type == JSON_OBJECT; }
+
+// ============================================================================
+// VALUE EXTRACTION
+// ============================================================================
+
+// Get string value (returns NULL if not a string)
+U8 *JSONAsString(CJSONValue *val)
+{
+	if (!val || val->type != JSON_STRING) return NULL;
+	return val->string_val;
+}
+
+// Get string value, copying to new allocation
+U8 *JSONAsStringCopy(CJSONValue *val)
+{
+	if (!val || val->type != JSON_STRING) return NULL;
+	return StrNew(val->string_val);
+}
+
+// Get integer value
+I64 JSONAsInt(CJSONValue *val)
+{
+	if (!val) return 0;
+	if (val->type == JSON_NUMBER) return val->int_val;
+	if (val->type == JSON_BOOL) return val->bool_val ? 1 : 0;
+	if (val->type == JSON_STRING) return Str2I64(val->string_val);
+	return 0;
+}
+
+// Get float value
+F64 JSONAsFloat(CJSONValue *val)
+{
+	if (!val) return 0.0;
+	if (val->type == JSON_NUMBER) return val->float_val;
+	if (val->type == JSON_BOOL) return val->bool_val ? 1.0 : 0.0;
+	return 0.0;
+}
+
+// Get boolean value
+Bool JSONAsBool(CJSONValue *val)
+{
+	if (!val) return FALSE;
+	if (val->type == JSON_BOOL) return val->bool_val;
+	if (val->type == JSON_NUMBER) return val->int_val != 0;
+	if (val->type == JSON_STRING) return val->string_val && val->string_val[0];
+	if (val->type == JSON_NULL) return FALSE;
+	return TRUE;  // Arrays and objects are truthy
+}
+
+// Get snowflake (64-bit ID from string)
+CDiscordSnowflake JSONAsSnowflake(CJSONValue *val)
+{
+	CDiscordSnowflake id = 0;
+	U8 *p;
+
+	if (!val) return 0;
+
+	if (val->type == JSON_STRING && val->string_val) {
+		p = val->string_val;
+		while (*p >= '0' && *p <= '9') {
+			id = id * 10 + (*p - '0');
+			p++;
+		}
+		return id;
+	}
+
+	if (val->type == JSON_NUMBER) {
+		return val->int_val;
+	}
+
+	return 0;
+}
+
+// ============================================================================
+// CONVENIENCE PATH ACCESS
+// ============================================================================
+
+// Get nested value by path: JSONPath(root, "user", "name", NULL)
+CJSONValue *JSONPath(CJSONValue *root, ...)
+{
+	CJSONValue *current = root;
+	U8 *key;
+
+	// ZealOS varargs handling
+	I64 *args = &root;
+	args++;  // Skip root
+
+	while (TRUE) {
+		key = *args;
+		args++;
+
+		if (!key) break;  // NULL terminator
+
+		if (!current || current->type != JSON_OBJECT) {
+			return NULL;
+		}
+
+		current = JSONObjectGet(current, key);
+	}
+
+	return current;
+}
+
+// Get string at path
+U8 *JSONPathString(CJSONValue *root, U8 *key1, U8 *key2)
+{
+	CJSONValue *val = root;
+	if (key1) val = JSONObjectGet(val, key1);
+	if (key2 && val) val = JSONObjectGet(val, key2);
+	return JSONAsString(val);
+}
+
+// Get int at path
+I64 JSONPathInt(CJSONValue *root, U8 *key1, U8 *key2)
+{
+	CJSONValue *val = root;
+	if (key1) val = JSONObjectGet(val, key1);
+	if (key2 && val) val = JSONObjectGet(val, key2);
+	return JSONAsInt(val);
+}
+
+// Get snowflake at path
+CDiscordSnowflake JSONPathSnowflake(CJSONValue *root, U8 *key1, U8 *key2)
+{
+	CJSONValue *val = root;
+	if (key1) val = JSONObjectGet(val, key1);
+	if (key2 && val) val = JSONObjectGet(val, key2);
+	return JSONAsSnowflake(val);
+}
+
+// ============================================================================
+// DEBUG / PRINTING
+// ============================================================================
+
+// Print JSON value (for debugging)
+U0 JSONPrint(CJSONValue *val, I64 indent);
+
+U0 JSONPrintIndent(I64 indent)
+{
+	I64 i;
+	for (i = 0; i < indent; i++) " ";
+}
+
+U0 JSONPrint(CJSONValue *val, I64 indent)
+{
+	I64 i;
+
+	if (!val) {
+		"null";
+		return;
+	}
+
+	switch (val->type) {
+		case JSON_NULL:
+			"null";
+			break;
+
+		case JSON_BOOL:
+			"%s", val->bool_val ? "true" : "false";
+			break;
+
+		case JSON_NUMBER:
+			if (val->is_float) {
+				"%f", val->float_val;
+			} else {
+				"%d", val->int_val;
+			}
+			break;
+
+		case JSON_STRING:
+			"\"%s\"", val->string_val ? val->string_val : "";
+			break;
+
+		case JSON_ARRAY:
+			"[\n";
+			for (i = 0; i < val->array.count; i++) {
+				JSONPrintIndent(indent + 2);
+				JSONPrint(val->array.items[i], indent + 2);
+				if (i < val->array.count - 1) ",";
+				"\n";
+			}
+			JSONPrintIndent(indent);
+			"]";
+			break;
+
+		case JSON_OBJECT:
+			"{\n";
+			for (i = 0; i < val->object.count; i++) {
+				JSONPrintIndent(indent + 2);
+				"\"%s\": ", val->object.keys[i];
+				JSONPrint(val->object.values[i], indent + 2);
+				if (i < val->object.count - 1) ",";
+				"\n";
+			}
+			JSONPrintIndent(indent);
+			"}";
+			break;
+	}
+}
+
+// ============================================================================
+// TEST FUNCTION
+// ============================================================================
+
+Bool JSONParserTest()
+{
+	CJSONValue *root;
+	CJSONValue *val;
+	U8 error[128];
+
+	"====== JSON Parser Tests ======\n\n";
+
+	// Test 1: Simple object
+	"Test 1: Simple object... ";
+	root = JSONParse("{\"name\": \"John\", \"age\": 30}");
+	if (!root) {
+		"FAILED (parse error)\n";
+		return FALSE;
+	}
+	val = JSONObjectGet(root, "name");
+	if (!val || StrCmp(JSONAsString(val), "John") != 0) {
+		"FAILED (name)\n";
+		JSONValueFree(root);
+		return FALSE;
+	}
+	val = JSONObjectGet(root, "age");
+	if (!val || JSONAsInt(val) != 30) {
+		"FAILED (age)\n";
+		JSONValueFree(root);
+		return FALSE;
+	}
+	JSONValueFree(root);
+	"PASSED\n";
+
+	// Test 2: Array
+	"Test 2: Array... ";
+	root = JSONParse("[1, 2, 3, 4, 5]");
+	if (!root || JSONArraySize(root) != 5) {
+		"FAILED (parse or size)\n";
+		if (root) JSONValueFree(root);
+		return FALSE;
+	}
+	if (JSONAsInt(JSONArrayGet(root, 2)) != 3) {
+		"FAILED (element)\n";
+		JSONValueFree(root);
+		return FALSE;
+	}
+	JSONValueFree(root);
+	"PASSED\n";
+
+	// Test 3: Nested objects
+	"Test 3: Nested objects... ";
+	root = JSONParse("{\"user\": {\"id\": \"123456789\", \"name\": \"Bot\"}}");
+	if (!root) {
+		"FAILED (parse)\n";
+		return FALSE;
+	}
+	val = JSONObjectGet(root, "user");
+	if (!val) {
+		"FAILED (user)\n";
+		JSONValueFree(root);
+		return FALSE;
+	}
+	val = JSONObjectGet(val, "id");
+	if (!val || JSONAsSnowflake(val) != 123456789) {
+		"FAILED (id)\n";
+		JSONValueFree(root);
+		return FALSE;
+	}
+	JSONValueFree(root);
+	"PASSED\n";
+
+	// Test 4: Array of objects
+	"Test 4: Array of objects... ";
+	root = JSONParse("[{\"id\": 1}, {\"id\": 2}, {\"id\": 3}]");
+	if (!root || JSONArraySize(root) != 3) {
+		"FAILED (parse or size)\n";
+		if (root) JSONValueFree(root);
+		return FALSE;
+	}
+	val = JSONArrayGet(root, 1);
+	if (!val || JSONAsInt(JSONObjectGet(val, "id")) != 2) {
+		"FAILED (element)\n";
+		JSONValueFree(root);
+		return FALSE;
+	}
+	JSONValueFree(root);
+	"PASSED\n";
+
+	// Test 5: Escaped strings
+	"Test 5: Escaped strings... ";
+	root = JSONParse("{\"msg\": \"Hello\\nWorld\\t!\"}");
+	if (!root) {
+		"FAILED (parse)\n";
+		return FALSE;
+	}
+	val = JSONObjectGet(root, "msg");
+	if (!val || StrCmp(JSONAsString(val), "Hello\nWorld\t!") != 0) {
+		"FAILED (escape)\n";
+		JSONValueFree(root);
+		return FALSE;
+	}
+	JSONValueFree(root);
+	"PASSED\n";
+
+	// Test 6: Boolean and null
+	"Test 6: Boolean and null... ";
+	root = JSONParse("{\"active\": true, \"deleted\": false, \"data\": null}");
+	if (!root) {
+		"FAILED (parse)\n";
+		return FALSE;
+	}
+	if (!JSONAsBool(JSONObjectGet(root, "active"))) {
+		"FAILED (true)\n";
+		JSONValueFree(root);
+		return FALSE;
+	}
+	if (JSONAsBool(JSONObjectGet(root, "deleted"))) {
+		"FAILED (false)\n";
+		JSONValueFree(root);
+		return FALSE;
+	}
+	if (!JSONIsNull(JSONObjectGet(root, "data"))) {
+		"FAILED (null)\n";
+		JSONValueFree(root);
+		return FALSE;
+	}
+	JSONValueFree(root);
+	"PASSED\n";
+
+	// Test 7: Numbers
+	"Test 7: Numbers... ";
+	root = JSONParse("{\"int\": -42, \"float\": 3.14, \"exp\": 1e10}");
+	if (!root) {
+		"FAILED (parse)\n";
+		return FALSE;
+	}
+	if (JSONAsInt(JSONObjectGet(root, "int")) != -42) {
+		"FAILED (int)\n";
+		JSONValueFree(root);
+		return FALSE;
+	}
+	JSONValueFree(root);
+	"PASSED\n";
+
+	// Test 8: Empty containers
+	"Test 8: Empty containers... ";
+	root = JSONParse("{\"arr\": [], \"obj\": {}}");
+	if (!root) {
+		"FAILED (parse)\n";
+		return FALSE;
+	}
+	if (JSONArraySize(JSONObjectGet(root, "arr")) != 0) {
+		"FAILED (empty array)\n";
+		JSONValueFree(root);
+		return FALSE;
+	}
+	if (JSONObjectSize(JSONObjectGet(root, "obj")) != 0) {
+		"FAILED (empty object)\n";
+		JSONValueFree(root);
+		return FALSE;
+	}
+	JSONValueFree(root);
+	"PASSED\n";
+
+	"\nAll JSON parser tests PASSED!\n";
+	return TRUE;
+}

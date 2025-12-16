@@ -1,0 +1,619 @@
+// regex.ZC - POSIX Regular Expression Support for ZealOS
+// Part of the POSIX compatibility layer
+//
+// Implements a basic regex engine supporting POSIX BRE and ERE
+
+// ============================================================================
+// REGEX CONSTANTS
+// ============================================================================
+
+// Regex compilation flags (cflags)
+#define REG_EXTENDED  0x01  // Use extended regex syntax
+#define REG_ICASE     0x02  // Case insensitive matching
+#define REG_NOSUB     0x04  // Don't report match positions
+#define REG_NEWLINE   0x08  // Treat newline as special
+
+// Regex execution flags (eflags)
+#define REG_NOTBOL    0x01  // ^ doesn't match start of string
+#define REG_NOTEOL    0x02  // $ doesn't match end of string
+
+// Regex error codes
+#define REG_OK        0     // Success
+#define REG_NOMATCH   1     // No match
+#define REG_BADPAT    2     // Invalid pattern
+#define REG_ECOLLATE  3     // Invalid collating element
+#define REG_ECTYPE    4     // Invalid character class
+#define REG_EESCAPE   5     // Trailing backslash
+#define REG_ESUBREG   6     // Invalid back reference
+#define REG_EBRACK    7     // Unmatched [
+#define REG_EPAREN    8     // Unmatched ( or \(
+#define REG_EBRACE    9     // Unmatched { or \{
+#define REG_BADBR     10    // Invalid {} content
+#define REG_ERANGE    11    // Invalid range in []
+#define REG_ESPACE    12    // Out of memory
+#define REG_BADRPT    13    // Invalid repetition
+#define REG_ENOSYS    14    // Not implemented
+
+// Maximum number of subexpressions
+#define REG_MAXSUB    16
+
+// ============================================================================
+// REGEX TYPES
+// ============================================================================
+
+// Match position
+class regmatch_t {
+    I64 rm_so;    // Start offset
+    I64 rm_eo;    // End offset (one past last char)
+};
+
+// Compiled regex - opaque structure
+#define REGEX_MAX_PATTERN 1024
+#define REGEX_MAX_STATES  256
+
+// Regex instruction types
+#define RE_OP_END       0   // End of pattern
+#define RE_OP_CHAR      1   // Match literal character
+#define RE_OP_ANY       2   // Match any char (.)
+#define RE_OP_CLASS     3   // Match character class [...]
+#define RE_OP_NCLASS    4   // Match negated class [^...]
+#define RE_OP_BOL       5   // Match beginning of line ^
+#define RE_OP_EOL       6   // Match end of line $
+#define RE_OP_STAR      7   // Zero or more *
+#define RE_OP_PLUS      8   // One or more +
+#define RE_OP_QUEST     9   // Zero or one ?
+#define RE_OP_BRANCH    10  // Alternative |
+#define RE_OP_LPAREN    11  // Start group (
+#define RE_OP_RPAREN    12  // End group )
+#define RE_OP_BACKREF   13  // Backreference \n
+#define RE_OP_WORD      14  // Word character \w
+#define RE_OP_NWORD     15  // Non-word \W
+#define RE_OP_DIGIT     16  // Digit \d
+#define RE_OP_NDIGIT    17  // Non-digit \D
+#define RE_OP_SPACE     18  // Whitespace \s
+#define RE_OP_NSPACE    19  // Non-whitespace \S
+
+// Regex instruction
+class CRegexInstr {
+    U8 op;          // Operation type
+    U8 c;           // Character (for RE_OP_CHAR)
+    U16 next;       // Next instruction
+    U16 alt;        // Alternative (for RE_OP_BRANCH)
+    U8 group;       // Group number (for parens)
+    U8 class_bitmap[32];  // Character class bitmap (256 bits)
+};
+
+// Compiled regex structure
+class regex_t {
+    I64 re_nsub;                // Number of subexpressions
+    I64 cflags;                 // Compilation flags
+    CRegexInstr instrs[REGEX_MAX_STATES];
+    I64 ninstr;                 // Number of instructions
+    U8 pattern[REGEX_MAX_PATTERN];  // Original pattern
+};
+
+// ============================================================================
+// CHARACTER CLASS HELPERS
+// ============================================================================
+
+U0 regex_class_set(U8 *bitmap, U8 c)
+{
+    bitmap[c >> 3] |= (1 << (c & 7));
+}
+
+Bool regex_class_test(U8 *bitmap, U8 c)
+{
+    return (bitmap[c >> 3] & (1 << (c & 7))) != 0;
+}
+
+U0 regex_class_clear(U8 *bitmap)
+{
+    MemSet(bitmap, 0, 32);
+}
+
+U0 regex_class_add_range(U8 *bitmap, U8 start, U8 end)
+{
+    for (I64 c = start; c <= end; c++) {
+        regex_class_set(bitmap, c);
+    }
+}
+
+// ============================================================================
+// REGEX COMPILATION
+// ============================================================================
+
+// Compile a regular expression
+I64 regcomp(regex_t *preg, U8 *pattern, I64 cflags)
+{
+    if (!preg || !pattern) return REG_BADPAT;
+
+    MemSet(preg, 0, sizeof(regex_t));
+    preg->cflags = cflags;
+    StrNCpy(preg->pattern, pattern, REGEX_MAX_PATTERN - 1);
+
+    Bool extended = (cflags & REG_EXTENDED) != 0;
+    Bool icase = (cflags & REG_ICASE) != 0;
+
+    U8 *p = pattern;
+    I64 pc = 0;  // Program counter
+    I64 group = 0;
+    I64 paren_stack[REG_MAXSUB];
+    I64 paren_sp = 0;
+
+    while (*p && pc < REGEX_MAX_STATES - 1) {
+        CRegexInstr *instr = &preg->instrs[pc];
+        MemSet(instr, 0, sizeof(CRegexInstr));
+        instr->next = pc + 1;
+
+        switch (*p) {
+            case '^':
+                instr->op = RE_OP_BOL;
+                p++;
+                pc++;
+                break;
+
+            case '$':
+                instr->op = RE_OP_EOL;
+                p++;
+                pc++;
+                break;
+
+            case '.':
+                instr->op = RE_OP_ANY;
+                p++;
+                pc++;
+                break;
+
+            case '*':
+                if (pc == 0) {
+                    // Literal * at start
+                    instr->op = RE_OP_CHAR;
+                    instr->c = '*';
+                } else {
+                    // Apply to previous instruction
+                    pc--;
+                    preg->instrs[pc].next = pc;  // Loop back
+                    // Continue without adding instruction
+                }
+                p++;
+                break;
+
+            case '+':
+                if (extended) {
+                    if (pc == 0) return REG_BADRPT;
+                    // Match one, then zero or more
+                    // Simplified: just mark as "plus"
+                    p++;
+                } else {
+                    // Literal + in BRE
+                    instr->op = RE_OP_CHAR;
+                    instr->c = '+';
+                    p++;
+                    pc++;
+                }
+                break;
+
+            case '?':
+                if (extended) {
+                    if (pc == 0) return REG_BADRPT;
+                    p++;
+                } else {
+                    instr->op = RE_OP_CHAR;
+                    instr->c = '?';
+                    p++;
+                    pc++;
+                }
+                break;
+
+            case '|':
+                if (extended) {
+                    instr->op = RE_OP_BRANCH;
+                    p++;
+                    pc++;
+                } else {
+                    instr->op = RE_OP_CHAR;
+                    instr->c = '|';
+                    p++;
+                    pc++;
+                }
+                break;
+
+            case '(':
+                if (extended) {
+                    instr->op = RE_OP_LPAREN;
+                    instr->group = ++group;
+                    if (paren_sp < REG_MAXSUB) {
+                        paren_stack[paren_sp++] = pc;
+                    }
+                    p++;
+                    pc++;
+                } else {
+                    instr->op = RE_OP_CHAR;
+                    instr->c = '(';
+                    p++;
+                    pc++;
+                }
+                break;
+
+            case ')':
+                if (extended) {
+                    if (paren_sp == 0) return REG_EPAREN;
+                    instr->op = RE_OP_RPAREN;
+                    instr->group = preg->instrs[paren_stack[--paren_sp]].group;
+                    p++;
+                    pc++;
+                } else {
+                    instr->op = RE_OP_CHAR;
+                    instr->c = ')';
+                    p++;
+                    pc++;
+                }
+                break;
+
+            case '[': {
+                // Character class
+                p++;
+                Bool negate = FALSE;
+                if (*p == '^') {
+                    negate = TRUE;
+                    p++;
+                }
+
+                instr->op = negate ? RE_OP_NCLASS : RE_OP_CLASS;
+                regex_class_clear(instr->class_bitmap);
+
+                // First char can be ] or -
+                if (*p == ']') {
+                    regex_class_set(instr->class_bitmap, ']');
+                    p++;
+                }
+
+                while (*p && *p != ']') {
+                    U8 c1 = *p++;
+
+                    if (c1 == '\\' && *p) {
+                        c1 = *p++;
+                    }
+
+                    if (*p == '-' && p[1] && p[1] != ']') {
+                        // Range
+                        p++;  // Skip -
+                        U8 c2 = *p++;
+                        if (c2 == '\\' && *p) {
+                            c2 = *p++;
+                        }
+                        regex_class_add_range(instr->class_bitmap, c1, c2);
+                    } else {
+                        regex_class_set(instr->class_bitmap, c1);
+                        if (icase && c1 >= 'a' && c1 <= 'z') {
+                            regex_class_set(instr->class_bitmap, c1 - 32);
+                        } else if (icase && c1 >= 'A' && c1 <= 'Z') {
+                            regex_class_set(instr->class_bitmap, c1 + 32);
+                        }
+                    }
+                }
+
+                if (*p != ']') return REG_EBRACK;
+                p++;
+                pc++;
+                break;
+            }
+
+            case '\\':
+                p++;
+                if (!*p) return REG_EESCAPE;
+
+                if (*p >= '1' && *p <= '9') {
+                    // Backreference
+                    instr->op = RE_OP_BACKREF;
+                    instr->group = *p - '0';
+                } else if (*p == '(' && !extended) {
+                    // BRE group start
+                    instr->op = RE_OP_LPAREN;
+                    instr->group = ++group;
+                    if (paren_sp < REG_MAXSUB) {
+                        paren_stack[paren_sp++] = pc;
+                    }
+                } else if (*p == ')' && !extended) {
+                    // BRE group end
+                    if (paren_sp == 0) return REG_EPAREN;
+                    instr->op = RE_OP_RPAREN;
+                    instr->group = preg->instrs[paren_stack[--paren_sp]].group;
+                } else if (*p == 'd') {
+                    instr->op = RE_OP_DIGIT;
+                } else if (*p == 'D') {
+                    instr->op = RE_OP_NDIGIT;
+                } else if (*p == 'w') {
+                    instr->op = RE_OP_WORD;
+                } else if (*p == 'W') {
+                    instr->op = RE_OP_NWORD;
+                } else if (*p == 's') {
+                    instr->op = RE_OP_SPACE;
+                } else if (*p == 'S') {
+                    instr->op = RE_OP_NSPACE;
+                } else {
+                    // Escaped literal
+                    instr->op = RE_OP_CHAR;
+                    instr->c = *p;
+                    if (icase && *p >= 'a' && *p <= 'z') {
+                        instr->c = *p - 32;  // Store uppercase
+                    }
+                }
+                p++;
+                pc++;
+                break;
+
+            default:
+                // Literal character
+                instr->op = RE_OP_CHAR;
+                instr->c = *p;
+                if (icase && *p >= 'a' && *p <= 'z') {
+                    instr->c = *p - 32;  // Store uppercase
+                }
+                p++;
+                pc++;
+                break;
+        }
+    }
+
+    // End marker
+    preg->instrs[pc].op = RE_OP_END;
+    preg->ninstr = pc + 1;
+    preg->re_nsub = group;
+
+    if (paren_sp != 0) return REG_EPAREN;
+
+    return REG_OK;
+}
+
+// ============================================================================
+// REGEX EXECUTION
+// ============================================================================
+
+// Match state
+class CRegexMatch {
+    U8 *str;            // String being matched
+    U8 *start;          // Start of current attempt
+    I64 eflags;         // Execution flags
+    Bool icase;         // Case insensitive
+    regmatch_t groups[REG_MAXSUB];
+};
+
+// Forward declaration
+Bool regex_match_here(regex_t *preg, I64 pc, U8 *s, CRegexMatch *match);
+
+// Match a single instruction
+Bool regex_match_instr(regex_t *preg, I64 pc, U8 *s, CRegexMatch *match)
+{
+    CRegexInstr *instr = &preg->instrs[pc];
+    U8 c = *s;
+
+    switch (instr->op) {
+        case RE_OP_END:
+            return TRUE;
+
+        case RE_OP_CHAR:
+            if (match->icase) {
+                U8 uc = c;
+                if (c >= 'a' && c <= 'z') uc = c - 32;
+                if (uc == instr->c) {
+                    return regex_match_here(preg, instr->next, s + 1, match);
+                }
+            } else {
+                if (c == instr->c) {
+                    return regex_match_here(preg, instr->next, s + 1, match);
+                }
+            }
+            return FALSE;
+
+        case RE_OP_ANY:
+            if (c && c != '\n') {
+                return regex_match_here(preg, instr->next, s + 1, match);
+            }
+            return FALSE;
+
+        case RE_OP_CLASS:
+            if (c && regex_class_test(instr->class_bitmap, c)) {
+                return regex_match_here(preg, instr->next, s + 1, match);
+            }
+            return FALSE;
+
+        case RE_OP_NCLASS:
+            if (c && !regex_class_test(instr->class_bitmap, c)) {
+                return regex_match_here(preg, instr->next, s + 1, match);
+            }
+            return FALSE;
+
+        case RE_OP_BOL:
+            if (s == match->str || (s > match->str && s[-1] == '\n')) {
+                if (!(match->eflags & REG_NOTBOL) || s > match->str) {
+                    return regex_match_here(preg, instr->next, s, match);
+                }
+            }
+            return FALSE;
+
+        case RE_OP_EOL:
+            if (!c || c == '\n') {
+                if (!(match->eflags & REG_NOTEOL) || c == '\n') {
+                    return regex_match_here(preg, instr->next, s, match);
+                }
+            }
+            return FALSE;
+
+        case RE_OP_DIGIT:
+            if (c >= '0' && c <= '9') {
+                return regex_match_here(preg, instr->next, s + 1, match);
+            }
+            return FALSE;
+
+        case RE_OP_NDIGIT:
+            if (c && (c < '0' || c > '9')) {
+                return regex_match_here(preg, instr->next, s + 1, match);
+            }
+            return FALSE;
+
+        case RE_OP_WORD:
+            if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+                (c >= '0' && c <= '9') || c == '_') {
+                return regex_match_here(preg, instr->next, s + 1, match);
+            }
+            return FALSE;
+
+        case RE_OP_NWORD:
+            if (c && !((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+                       (c >= '0' && c <= '9') || c == '_')) {
+                return regex_match_here(preg, instr->next, s + 1, match);
+            }
+            return FALSE;
+
+        case RE_OP_SPACE:
+            if (c == ' ' || c == '\t' || c == '\n' || c == '\r' ||
+                c == '\f' || c == '\v') {
+                return regex_match_here(preg, instr->next, s + 1, match);
+            }
+            return FALSE;
+
+        case RE_OP_NSPACE:
+            if (c && c != ' ' && c != '\t' && c != '\n' && c != '\r' &&
+                c != '\f' && c != '\v') {
+                return regex_match_here(preg, instr->next, s + 1, match);
+            }
+            return FALSE;
+
+        case RE_OP_LPAREN:
+            match->groups[instr->group].rm_so = s - match->str;
+            return regex_match_here(preg, instr->next, s, match);
+
+        case RE_OP_RPAREN:
+            match->groups[instr->group].rm_eo = s - match->str;
+            return regex_match_here(preg, instr->next, s, match);
+
+        default:
+            return regex_match_here(preg, instr->next, s, match);
+    }
+}
+
+// Match from current position
+Bool regex_match_here(regex_t *preg, I64 pc, U8 *s, CRegexMatch *match)
+{
+    if (pc >= preg->ninstr) return TRUE;
+
+    CRegexInstr *instr = &preg->instrs[pc];
+
+    // Handle star (greedy)
+    if (instr->next == pc) {
+        // This is a star - try matching as many as possible first
+        U8 *t = s;
+        while (*t && regex_match_instr(preg, pc, t, match)) {
+            t++;
+        }
+        // Now try backing off
+        while (t >= s) {
+            if (regex_match_here(preg, pc + 1, t, match)) {
+                return TRUE;
+            }
+            t--;
+        }
+        return FALSE;
+    }
+
+    return regex_match_instr(preg, pc, s, match);
+}
+
+// Execute a compiled regex
+I64 regexec(regex_t *preg, U8 *string, I64 nmatch, regmatch_t *pmatch, I64 eflags)
+{
+    if (!preg || !string) return REG_NOMATCH;
+
+    CRegexMatch match;
+    match.str = string;
+    match.eflags = eflags;
+    match.icase = (preg->cflags & REG_ICASE) != 0;
+
+    // Initialize groups
+    for (I64 i = 0; i < REG_MAXSUB; i++) {
+        match.groups[i].rm_so = -1;
+        match.groups[i].rm_eo = -1;
+    }
+
+    // Try matching at each position
+    U8 *s = string;
+    do {
+        match.start = s;
+        match.groups[0].rm_so = s - string;
+
+        if (regex_match_here(preg, 0, s, &match)) {
+            match.groups[0].rm_eo = s - string;
+
+            // Find actual end position
+            for (I64 i = 1; i < REG_MAXSUB; i++) {
+                if (match.groups[i].rm_eo > match.groups[0].rm_eo) {
+                    match.groups[0].rm_eo = match.groups[i].rm_eo;
+                }
+            }
+
+            // Copy results
+            if (pmatch && nmatch > 0 && !(preg->cflags & REG_NOSUB)) {
+                for (I64 i = 0; i < nmatch && i < REG_MAXSUB; i++) {
+                    pmatch[i] = match.groups[i];
+                }
+            }
+
+            return REG_OK;
+        }
+    } while (*s++);
+
+    return REG_NOMATCH;
+}
+
+// Free compiled regex
+U0 regfree(regex_t *preg)
+{
+    if (preg) {
+        MemSet(preg, 0, sizeof(regex_t));
+    }
+}
+
+// Get error message
+I64 regerror(I64 errcode, regex_t *preg, U8 *errbuf, I64 errbuf_size)
+{
+    static U8 *errors[] = {
+        "Success",
+        "No match",
+        "Invalid pattern",
+        "Invalid collating element",
+        "Invalid character class",
+        "Trailing backslash",
+        "Invalid back reference",
+        "Unmatched [",
+        "Unmatched ( or \\(",
+        "Unmatched { or \\{",
+        "Invalid {} content",
+        "Invalid range in []",
+        "Out of memory",
+        "Invalid repetition",
+        "Not implemented"
+    };
+
+    U8 *msg = "Unknown error";
+    if (errcode >= 0 && errcode <= REG_ENOSYS) {
+        msg = errors[errcode];
+    }
+
+    I64 len = StrLen(msg) + 1;
+
+    if (errbuf && errbuf_size > 0) {
+        StrNCpy(errbuf, msg, errbuf_size - 1);
+        errbuf[errbuf_size - 1] = 0;
+    }
+
+    return len;
+}
+
+// ============================================================================
+// INITIALIZATION
+// ============================================================================
+
+"ZealOS regex library loaded.\n";
+"  - POSIX BRE and ERE support\n";
+"  - regcomp, regexec, regfree, regerror\n";

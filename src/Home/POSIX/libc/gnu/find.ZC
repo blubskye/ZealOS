@@ -1,0 +1,757 @@
+// find.ZC - GNU 'find' implementation
+// Search for files in a directory hierarchy
+
+#define FIND_MAX_DEPTH 256
+#define FIND_MAX_EXPR  64
+
+// Expression types
+#define FEXP_NAME      1
+#define FEXP_INAME     2
+#define FEXP_PATH      3
+#define FEXP_TYPE      4
+#define FEXP_SIZE      5
+#define FEXP_MTIME     6
+#define FEXP_ATIME     7
+#define FEXP_CTIME     8
+#define FEXP_NEWER     9
+#define FEXP_PERM      10
+#define FEXP_USER      11
+#define FEXP_GROUP     12
+#define FEXP_EMPTY     13
+#define FEXP_MAXDEPTH  14
+#define FEXP_MINDEPTH  15
+#define FEXP_PRINT     20
+#define FEXP_PRINT0    21
+#define FEXP_EXEC      22
+#define FEXP_EXECDIR   23
+#define FEXP_DELETE    24
+#define FEXP_PRUNE     25
+#define FEXP_AND       30
+#define FEXP_OR        31
+#define FEXP_NOT       32
+#define FEXP_LPAREN    33
+#define FEXP_RPAREN    34
+#define FEXP_TRUE      35
+#define FEXP_FALSE     36
+
+class CFindExpr {
+    I64 type;
+    U8 arg[PATH_MAX];
+    I64 num_arg;
+    U8 num_prefix;    // +, -, or 0 for exact
+    // For -exec
+    U8 *exec_args[64];
+    I64 exec_argc;
+    Bool exec_plus;   // -exec ... {} +
+};
+
+class CFindState {
+    CFindExpr exprs[FIND_MAX_EXPR];
+    I64 expr_count;
+
+    I64 max_depth;
+    I64 min_depth;
+    Bool depth_first;      // -depth
+    Bool xdev;             // -xdev (don't cross filesystems)
+    Bool follow_symlinks;  // -L
+    Bool no_follow;        // -P
+
+    I64 exit_status;
+    Bool printed_something;
+};
+
+// ============================================================================
+// PATTERN MATCHING (glob-style)
+// ============================================================================
+
+Bool FindGlobMatch(U8 *str, U8 *pattern)
+{
+    while (*pattern) {
+        if (*pattern == '*') {
+            pattern++;
+            if (!*pattern) return TRUE;  // Trailing * matches all
+
+            while (*str) {
+                if (FindGlobMatch(str, pattern))
+                    return TRUE;
+                str++;
+            }
+            return FALSE;
+        }
+        else if (*pattern == '?') {
+            if (!*str) return FALSE;
+            str++;
+            pattern++;
+        }
+        else if (*pattern == '[') {
+            if (!*str) return FALSE;
+            pattern++;
+            Bool negated = (*pattern == '!' || *pattern == '^');
+            if (negated) pattern++;
+
+            Bool matched = FALSE;
+            while (*pattern && *pattern != ']') {
+                if (*(pattern + 1) == '-' && *(pattern + 2) && *(pattern + 2) != ']') {
+                    if (*str >= *pattern && *str <= *(pattern + 2))
+                        matched = TRUE;
+                    pattern += 3;
+                } else {
+                    if (*str == *pattern)
+                        matched = TRUE;
+                    pattern++;
+                }
+            }
+            if (*pattern == ']') pattern++;
+
+            if (negated) matched = !matched;
+            if (!matched) return FALSE;
+            str++;
+        }
+        else {
+            if (*str != *pattern) return FALSE;
+            str++;
+            pattern++;
+        }
+    }
+
+    return (*str == 0);
+}
+
+Bool FindGlobMatchI(U8 *str, U8 *pattern)
+{
+    // Case-insensitive version
+    U8 str_lower[PATH_MAX];
+    U8 pat_lower[PATH_MAX];
+
+    I64 i;
+    for (i = 0; str[i] && i < PATH_MAX - 1; i++)
+        str_lower[i] = tolower(str[i]);
+    str_lower[i] = 0;
+
+    for (i = 0; pattern[i] && i < PATH_MAX - 1; i++)
+        pat_lower[i] = tolower(pattern[i]);
+    pat_lower[i] = 0;
+
+    return FindGlobMatch(str_lower, pat_lower);
+}
+
+// ============================================================================
+// EXPRESSION EVALUATION
+// ============================================================================
+
+Bool FindEvalExpr(CFindState *find, CFindExpr *expr, U8 *path, U8 *name,
+                  CPosixStat *st, I64 depth)
+{
+    switch (expr->type) {
+        case FEXP_TRUE:
+            return TRUE;
+
+        case FEXP_FALSE:
+            return FALSE;
+
+        case FEXP_NAME:
+            return FindGlobMatch(name, expr->arg);
+
+        case FEXP_INAME:
+            return FindGlobMatchI(name, expr->arg);
+
+        case FEXP_PATH:
+            return FindGlobMatch(path, expr->arg);
+
+        case FEXP_TYPE: {
+            U8 t = expr->arg[0];
+            if (t == 'f') return S_ISREG(st->st_mode);
+            if (t == 'd') return S_ISDIR(st->st_mode);
+            if (t == 'l') return S_ISLNK(st->st_mode);
+            if (t == 'c') return S_ISCHR(st->st_mode);
+            if (t == 'b') return S_ISBLK(st->st_mode);
+            if (t == 'p') return S_ISFIFO(st->st_mode);
+            if (t == 's') return S_ISSOCK(st->st_mode);
+            return FALSE;
+        }
+
+        case FEXP_SIZE: {
+            I64 size = st->st_size;
+            I64 target = expr->num_arg;
+
+            // Check suffix
+            I64 len = strlen(expr->arg);
+            if (len > 0) {
+                U8 suffix = expr->arg[len - 1];
+                if (suffix == 'c') {
+                    // Bytes - already correct
+                } else if (suffix == 'k') {
+                    target *= 1024;
+                } else if (suffix == 'M') {
+                    target *= 1024 * 1024;
+                } else if (suffix == 'G') {
+                    target *= 1024 * 1024 * 1024;
+                } else {
+                    // Default: 512-byte blocks
+                    target *= 512;
+                    size = (size + 511) / 512 * 512;
+                }
+            }
+
+            if (expr->num_prefix == '+') return size > target;
+            if (expr->num_prefix == '-') return size < target;
+            return size == target;
+        }
+
+        case FEXP_MTIME:
+        case FEXP_ATIME:
+        case FEXP_CTIME: {
+            U64 now = time(NULL);
+            U64 file_time;
+            if (expr->type == FEXP_MTIME) file_time = st->st_mtime;
+            else if (expr->type == FEXP_ATIME) file_time = st->st_atime;
+            else file_time = st->st_ctime;
+
+            I64 days = (now - file_time) / 86400;
+            I64 target = expr->num_arg;
+
+            if (expr->num_prefix == '+') return days > target;
+            if (expr->num_prefix == '-') return days < target;
+            return days == target;
+        }
+
+        case FEXP_NEWER: {
+            CPosixStat ref_st;
+            if (PosixStat(expr->arg, &ref_st) < 0) return FALSE;
+            return st->st_mtime > ref_st.st_mtime;
+        }
+
+        case FEXP_PERM: {
+            I64 mode = st->st_mode & 07777;
+            I64 target = expr->num_arg;
+
+            if (expr->arg[0] == '-') {
+                // All bits must be set
+                return (mode & target) == target;
+            } else if (expr->arg[0] == '/') {
+                // Any bit must be set
+                return (mode & target) != 0;
+            } else {
+                // Exact match
+                return mode == target;
+            }
+        }
+
+        case FEXP_USER:
+            return st->st_uid == expr->num_arg;
+
+        case FEXP_GROUP:
+            return st->st_gid == expr->num_arg;
+
+        case FEXP_EMPTY:
+            if (S_ISREG(st->st_mode)) return st->st_size == 0;
+            if (S_ISDIR(st->st_mode)) {
+                // Check if directory is empty
+                I64 dir_fd = PosixOpenDir(path);
+                if (dir_fd < 0) return FALSE;
+                CPosixDirent *entry;
+                Bool empty = TRUE;
+                while ((entry = PosixReadDir(dir_fd)) != NULL) {
+                    if (strcmp(entry->d_name, ".") != 0 &&
+                        strcmp(entry->d_name, "..") != 0) {
+                        empty = FALSE;
+                        break;
+                    }
+                }
+                PosixCloseDir(dir_fd);
+                return empty;
+            }
+            return FALSE;
+
+        case FEXP_PRINT:
+            printf("%s\n", path);
+            find->printed_something = TRUE;
+            return TRUE;
+
+        case FEXP_PRINT0:
+            printf("%s%c", path, 0);
+            find->printed_something = TRUE;
+            return TRUE;
+
+        case FEXP_DELETE:
+            if (S_ISDIR(st->st_mode)) {
+                if (PosixRmdir(path) < 0) {
+                    fprintf(stderr, "find: cannot delete '%s': %s\n", path, strerror(errno));
+                    find->exit_status = 1;
+                    return FALSE;
+                }
+            } else {
+                if (PosixUnlink(path) < 0) {
+                    fprintf(stderr, "find: cannot delete '%s': %s\n", path, strerror(errno));
+                    find->exit_status = 1;
+                    return FALSE;
+                }
+            }
+            return TRUE;
+
+        case FEXP_EXEC:
+        case FEXP_EXECDIR: {
+            // Build command with {} replaced by path
+            U8 cmd[4096] = "";
+            U8 *use_path = (expr->type == FEXP_EXECDIR) ? name : path;
+
+            for (I64 i = 0; i < expr->exec_argc; i++) {
+                if (i > 0) strcat(cmd, " ");
+                if (strcmp(expr->exec_args[i], "{}") == 0) {
+                    strcat(cmd, "\"");
+                    strcat(cmd, use_path);
+                    strcat(cmd, "\"");
+                } else {
+                    strcat(cmd, expr->exec_args[i]);
+                }
+            }
+
+            // Try to run via shell or GnuRun
+            // For now, simplified execution
+            I64 result = GnuRun(cmd);
+            return (result == 0);
+        }
+
+        case FEXP_PRUNE:
+            // Handled specially in traversal
+            return TRUE;
+    }
+
+    return TRUE;
+}
+
+// ============================================================================
+// EXPRESSION PARSING
+// ============================================================================
+
+I64 FindParseExpr(CFindState *find, I64 argc, U8 **argv, I64 start)
+{
+    I64 i = start;
+
+    while (i < argc) {
+        U8 *arg = argv[i];
+
+        // Check for expression terminators
+        if (arg[0] != '-' && arg[0] != '(' && arg[0] != ')' && arg[0] != '!' &&
+            arg[0] != ',') {
+            break;
+        }
+
+        CFindExpr *expr = &find->exprs[find->expr_count];
+        MemSet(expr, 0, sizeof(CFindExpr));
+
+        if (strcmp(arg, "-name") == 0 && i + 1 < argc) {
+            expr->type = FEXP_NAME;
+            strcpy(expr->arg, argv[++i]);
+            find->expr_count++;
+        }
+        else if (strcmp(arg, "-iname") == 0 && i + 1 < argc) {
+            expr->type = FEXP_INAME;
+            strcpy(expr->arg, argv[++i]);
+            find->expr_count++;
+        }
+        else if (strcmp(arg, "-path") == 0 && i + 1 < argc) {
+            expr->type = FEXP_PATH;
+            strcpy(expr->arg, argv[++i]);
+            find->expr_count++;
+        }
+        else if (strcmp(arg, "-type") == 0 && i + 1 < argc) {
+            expr->type = FEXP_TYPE;
+            strcpy(expr->arg, argv[++i]);
+            find->expr_count++;
+        }
+        else if (strcmp(arg, "-size") == 0 && i + 1 < argc) {
+            expr->type = FEXP_SIZE;
+            U8 *size_arg = argv[++i];
+            if (size_arg[0] == '+' || size_arg[0] == '-') {
+                expr->num_prefix = size_arg[0];
+                size_arg++;
+            }
+            expr->num_arg = strtol(size_arg, NULL, 10);
+            strcpy(expr->arg, argv[i]);
+            find->expr_count++;
+        }
+        else if (strcmp(arg, "-mtime") == 0 && i + 1 < argc) {
+            expr->type = FEXP_MTIME;
+            U8 *time_arg = argv[++i];
+            if (time_arg[0] == '+' || time_arg[0] == '-') {
+                expr->num_prefix = time_arg[0];
+                time_arg++;
+            }
+            expr->num_arg = strtol(time_arg, NULL, 10);
+            find->expr_count++;
+        }
+        else if (strcmp(arg, "-atime") == 0 && i + 1 < argc) {
+            expr->type = FEXP_ATIME;
+            U8 *time_arg = argv[++i];
+            if (time_arg[0] == '+' || time_arg[0] == '-') {
+                expr->num_prefix = time_arg[0];
+                time_arg++;
+            }
+            expr->num_arg = strtol(time_arg, NULL, 10);
+            find->expr_count++;
+        }
+        else if (strcmp(arg, "-ctime") == 0 && i + 1 < argc) {
+            expr->type = FEXP_CTIME;
+            U8 *time_arg = argv[++i];
+            if (time_arg[0] == '+' || time_arg[0] == '-') {
+                expr->num_prefix = time_arg[0];
+                time_arg++;
+            }
+            expr->num_arg = strtol(time_arg, NULL, 10);
+            find->expr_count++;
+        }
+        else if (strcmp(arg, "-newer") == 0 && i + 1 < argc) {
+            expr->type = FEXP_NEWER;
+            strcpy(expr->arg, argv[++i]);
+            find->expr_count++;
+        }
+        else if (strcmp(arg, "-perm") == 0 && i + 1 < argc) {
+            expr->type = FEXP_PERM;
+            U8 *perm_arg = argv[++i];
+            strcpy(expr->arg, perm_arg);
+            if (perm_arg[0] == '-' || perm_arg[0] == '/') perm_arg++;
+            expr->num_arg = strtol(perm_arg, NULL, 8);
+            find->expr_count++;
+        }
+        else if (strcmp(arg, "-user") == 0 && i + 1 < argc) {
+            expr->type = FEXP_USER;
+            // Simplified - just numeric uid
+            expr->num_arg = atoi(argv[++i]);
+            find->expr_count++;
+        }
+        else if (strcmp(arg, "-group") == 0 && i + 1 < argc) {
+            expr->type = FEXP_GROUP;
+            expr->num_arg = atoi(argv[++i]);
+            find->expr_count++;
+        }
+        else if (strcmp(arg, "-empty") == 0) {
+            expr->type = FEXP_EMPTY;
+            find->expr_count++;
+        }
+        else if (strcmp(arg, "-maxdepth") == 0 && i + 1 < argc) {
+            find->max_depth = atoi(argv[++i]);
+        }
+        else if (strcmp(arg, "-mindepth") == 0 && i + 1 < argc) {
+            find->min_depth = atoi(argv[++i]);
+        }
+        else if (strcmp(arg, "-depth") == 0) {
+            find->depth_first = TRUE;
+        }
+        else if (strcmp(arg, "-xdev") == 0 || strcmp(arg, "-mount") == 0) {
+            find->xdev = TRUE;
+        }
+        else if (strcmp(arg, "-print") == 0) {
+            expr->type = FEXP_PRINT;
+            find->expr_count++;
+        }
+        else if (strcmp(arg, "-print0") == 0) {
+            expr->type = FEXP_PRINT0;
+            find->expr_count++;
+        }
+        else if (strcmp(arg, "-delete") == 0) {
+            expr->type = FEXP_DELETE;
+            find->depth_first = TRUE;  // -delete implies -depth
+            find->expr_count++;
+        }
+        else if (strcmp(arg, "-prune") == 0) {
+            expr->type = FEXP_PRUNE;
+            find->expr_count++;
+        }
+        else if ((strcmp(arg, "-exec") == 0 || strcmp(arg, "-execdir") == 0) && i + 1 < argc) {
+            expr->type = (strcmp(arg, "-exec") == 0) ? FEXP_EXEC : FEXP_EXECDIR;
+            i++;
+
+            // Collect args until ; or +
+            while (i < argc && strcmp(argv[i], ";") != 0 && strcmp(argv[i], "+") != 0) {
+                expr->exec_args[expr->exec_argc++] = argv[i++];
+            }
+            if (i < argc && strcmp(argv[i], "+") == 0) {
+                expr->exec_plus = TRUE;
+            }
+            find->expr_count++;
+        }
+        else if (strcmp(arg, "-a") == 0 || strcmp(arg, "-and") == 0) {
+            expr->type = FEXP_AND;
+            find->expr_count++;
+        }
+        else if (strcmp(arg, "-o") == 0 || strcmp(arg, "-or") == 0) {
+            expr->type = FEXP_OR;
+            find->expr_count++;
+        }
+        else if (strcmp(arg, "!") == 0 || strcmp(arg, "-not") == 0) {
+            expr->type = FEXP_NOT;
+            find->expr_count++;
+        }
+        else if (strcmp(arg, "(") == 0) {
+            expr->type = FEXP_LPAREN;
+            find->expr_count++;
+        }
+        else if (strcmp(arg, ")") == 0) {
+            expr->type = FEXP_RPAREN;
+            find->expr_count++;
+        }
+        else if (strcmp(arg, "-true") == 0) {
+            expr->type = FEXP_TRUE;
+            find->expr_count++;
+        }
+        else if (strcmp(arg, "-false") == 0) {
+            expr->type = FEXP_FALSE;
+            find->expr_count++;
+        }
+        else {
+            // Unknown option - stop parsing expressions
+            break;
+        }
+
+        i++;
+    }
+
+    return i;
+}
+
+// ============================================================================
+// FILE TRAVERSAL
+// ============================================================================
+
+Bool FindEvalAll(CFindState *find, U8 *path, U8 *name, CPosixStat *st, I64 depth)
+{
+    // Simple left-to-right evaluation with AND/OR/NOT
+    Bool result = TRUE;
+    Bool have_action = FALSE;
+    I64 i = 0;
+
+    while (i < find->expr_count) {
+        CFindExpr *expr = &find->exprs[i];
+
+        // Check for actions
+        if (expr->type == FEXP_PRINT || expr->type == FEXP_PRINT0 ||
+            expr->type == FEXP_EXEC || expr->type == FEXP_EXECDIR ||
+            expr->type == FEXP_DELETE) {
+            have_action = TRUE;
+        }
+
+        if (expr->type == FEXP_AND) {
+            i++;
+            continue;  // AND is default
+        }
+
+        if (expr->type == FEXP_OR) {
+            if (result) {
+                // Short-circuit: skip rest
+                break;
+            }
+            result = TRUE;  // Reset for OR
+            i++;
+            continue;
+        }
+
+        if (expr->type == FEXP_NOT) {
+            i++;
+            if (i < find->expr_count) {
+                Bool sub = FindEvalExpr(find, &find->exprs[i], path, name, st, depth);
+                result = result && !sub;
+                i++;
+            }
+            continue;
+        }
+
+        if (expr->type == FEXP_LPAREN || expr->type == FEXP_RPAREN) {
+            // Simplified - just skip
+            i++;
+            continue;
+        }
+
+        Bool sub = FindEvalExpr(find, expr, path, name, st, depth);
+        result = result && sub;
+
+        // Prune handling
+        if (expr->type == FEXP_PRUNE && result) {
+            return FALSE;  // Don't descend
+        }
+
+        i++;
+    }
+
+    // Default action if none specified
+    if (!have_action && result) {
+        printf("%s\n", path);
+        find->printed_something = TRUE;
+    }
+
+    return result;
+}
+
+U0 FindTraverse(CFindState *find, U8 *path, I64 depth, I64 start_dev)
+{
+    if (find->max_depth >= 0 && depth > find->max_depth)
+        return;
+
+    CPosixStat st;
+    if (find->follow_symlinks) {
+        if (PosixStat(path, &st) < 0) {
+            fprintf(stderr, "find: '%s': %s\n", path, strerror(errno));
+            find->exit_status = 1;
+            return;
+        }
+    } else {
+        if (PosixLstat(path, &st) < 0) {
+            fprintf(stderr, "find: '%s': %s\n", path, strerror(errno));
+            find->exit_status = 1;
+            return;
+        }
+    }
+
+    // Cross-device check
+    if (find->xdev && depth > 0 && st.st_dev != start_dev)
+        return;
+
+    // Get basename
+    U8 *name = strrchr(path, '/');
+    name = name ? name + 1 : path;
+
+    // For depth-first: process directory contents before the directory itself
+    Bool descend = TRUE;
+
+    if (!find->depth_first) {
+        // Process this entry first
+        if (depth >= find->min_depth) {
+            descend = FindEvalAll(find, path, name, &st, depth);
+        }
+    }
+
+    // Descend into directories
+    if (S_ISDIR(st.st_mode) && descend) {
+        I64 dir_fd = PosixOpenDir(path);
+        if (dir_fd < 0) {
+            fprintf(stderr, "find: '%s': %s\n", path, strerror(errno));
+            find->exit_status = 1;
+        } else {
+            CPosixDirent *entry;
+            while ((entry = PosixReadDir(dir_fd)) != NULL) {
+                if (strcmp(entry->d_name, ".") == 0 ||
+                    strcmp(entry->d_name, "..") == 0)
+                    continue;
+
+                U8 child_path[PATH_MAX];
+                snprintf(child_path, PATH_MAX, "%s/%s", path, entry->d_name);
+
+                FindTraverse(find, child_path, depth + 1, start_dev);
+            }
+            PosixCloseDir(dir_fd);
+        }
+    }
+
+    if (find->depth_first) {
+        // Process this entry after children
+        if (depth >= find->min_depth) {
+            FindEvalAll(find, path, name, &st, depth);
+        }
+    }
+}
+
+// ============================================================================
+// MAIN
+// ============================================================================
+
+I64 find_main(I64 argc, U8 **argv)
+{
+    U8 *paths[64];
+    I64 path_count = 0;
+    I64 start = 1;
+
+    // Parse options
+    while (start < argc && argv[start][0] == '-' && strlen(argv[start]) == 2) {
+        U8 *arg = argv[start];
+
+        if (strcmp(arg, "--help") == 0) {
+            printf("Usage: find [PATH...] [EXPRESSION]\n\n");
+            printf("Search for files in directory hierarchy.\n\n");
+            printf("Options:\n");
+            printf("  -L              follow symbolic links\n");
+            printf("  -P              never follow symbolic links (default)\n");
+            printf("  -H              follow symlinks on command line only\n");
+            printf("\nTests:\n");
+            printf("  -name PATTERN   base of filename matches PATTERN\n");
+            printf("  -iname PATTERN  like -name but case insensitive\n");
+            printf("  -path PATTERN   path matches PATTERN\n");
+            printf("  -type [fdlcbps] file type\n");
+            printf("  -size N[ckMG]   file uses N units of space\n");
+            printf("  -mtime N        modified N days ago\n");
+            printf("  -atime N        accessed N days ago\n");
+            printf("  -newer FILE     modified more recently than FILE\n");
+            printf("  -perm MODE      permission bits are MODE\n");
+            printf("  -empty          file is empty or directory is empty\n");
+            printf("  -maxdepth N     descend at most N levels\n");
+            printf("  -mindepth N     ignore first N levels\n");
+            printf("\nActions:\n");
+            printf("  -print          print pathname (default)\n");
+            printf("  -print0         print pathname with null terminator\n");
+            printf("  -exec CMD ;     execute CMD\n");
+            printf("  -delete         delete files\n");
+            printf("  -prune          do not descend into directory\n");
+            printf("\nOperators:\n");
+            printf("  -a, -and        logical AND\n");
+            printf("  -o, -or         logical OR\n");
+            printf("  !, -not         logical NOT\n");
+            printf("  ( EXPR )        grouping\n");
+            return 0;
+        }
+
+        if (strcmp(arg, "--version") == 0) {
+            printf("find (ZealOS) 1.0\n");
+            return 0;
+        }
+
+        if (strcmp(arg, "-L") == 0) {
+            start++;
+            continue;
+        }
+
+        if (strcmp(arg, "-P") == 0 || strcmp(arg, "-H") == 0) {
+            start++;
+            continue;
+        }
+
+        break;
+    }
+
+    // Collect paths (arguments that don't start with - or are just -)
+    while (start < argc && (argv[start][0] != '-' || strcmp(argv[start], "-") == 0) &&
+           argv[start][0] != '(' && argv[start][0] != '!' && argv[start][0] != ',') {
+        paths[path_count++] = argv[start++];
+    }
+
+    // Default to current directory
+    if (path_count == 0) {
+        paths[path_count++] = ".";
+    }
+
+    // Initialize state
+    CFindState find;
+    MemSet(&find, 0, sizeof(CFindState));
+    find.max_depth = -1;  // No limit
+    find.min_depth = 0;
+
+    // Parse expressions
+    FindParseExpr(&find, argc, argv, start);
+
+    // Traverse paths
+    for (I64 i = 0; i < path_count; i++) {
+        CPosixStat st;
+        if (PosixStat(paths[i], &st) < 0) {
+            fprintf(stderr, "find: '%s': %s\n", paths[i], strerror(errno));
+            find.exit_status = 1;
+            continue;
+        }
+
+        FindTraverse(&find, paths[i], 0, st.st_dev);
+    }
+
+    return find.exit_status;
+}
+
+U0 GnuFindRegister()
+{
+    "GNU 'find' utility loaded.\n";
+}

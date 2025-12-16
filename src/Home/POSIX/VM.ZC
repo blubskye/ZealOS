@@ -1,0 +1,1096 @@
+// VM.ZC - Virtual Memory Management Implementation for POSIX Processes
+// Provides per-process virtual address spaces with copy-on-write fork()
+
+#include "VM.HH"
+
+// ============================================================================
+// GLOBAL STATE
+// ============================================================================
+
+U64 *vm_kernel_pml4 = NULL;
+CPageAllocator *vm_page_allocator = NULL;
+CPhysPage *vm_phys_page_hash[PHYS_PAGE_HASH_SIZE];
+
+// Memory pool for VM structures
+#define VM_POOL_SIZE 4096
+static CVMContext *vm_context_pool = NULL;
+static CVMRegion *vm_region_pool = NULL;
+static CPhysPage *vm_physpage_pool = NULL;
+static Bool vm_initialized = FALSE;
+
+// ============================================================================
+// LOW-LEVEL PAGE TABLE ACCESS (INLINE ASSEMBLY)
+// ============================================================================
+
+// Read CR3 register
+U64 VMReadCR3()
+{
+    U64 cr3;
+    asm {
+        MOV RAX, CR3
+        MOV U64 [&cr3], RAX
+    };
+    return cr3;
+}
+
+// Write CR3 register (switches page tables)
+U0 VMWriteCR3(U64 cr3)
+{
+    asm {
+        MOV RAX, U64 [&cr3]
+        MOV CR3, RAX
+    };
+}
+
+// Flush entire TLB
+U0 VMFlushTLB()
+{
+    U64 cr3 = VMReadCR3();
+    VMWriteCR3(cr3);
+}
+
+// Flush single TLB entry
+U0 VMFlushTLBPage(U64 virt_addr)
+{
+    asm {
+        MOV RAX, U64 [&virt_addr]
+        INVLPG [RAX]
+    };
+}
+
+// ============================================================================
+// PAGE ALLOCATOR
+// ============================================================================
+
+// Hash function for physical page address
+I64 VMPhysPageHash(U64 phys_addr)
+{
+    return (phys_addr >> PAGE_SHIFT) & (PHYS_PAGE_HASH_SIZE - 1);
+}
+
+// Initialize page allocator for user-space pages
+// We'll allocate from a dedicated region to avoid conflicting with ZealOS heap
+U0 VMPageAllocatorInit(U64 base, U64 size)
+{
+    I64 num_pages, bitmap_bytes, i;
+
+    vm_page_allocator = MAlloc(sizeof(CPageAllocator));
+    MemSet(vm_page_allocator, 0, sizeof(CPageAllocator));
+
+    // Align base to page boundary
+    base = (base + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
+    size = size & ~(PAGE_SIZE - 1);
+
+    vm_page_allocator->base_addr = base;
+    num_pages = size / PAGE_SIZE;
+    vm_page_allocator->total_pages = num_pages;
+
+    // Create bitmap (1 bit per page)
+    bitmap_bytes = (num_pages + 7) / 8;
+    vm_page_allocator->bitmap = MAlloc(bitmap_bytes);
+    vm_page_allocator->bitmap_size = bitmap_bytes;
+
+    // Mark all pages as free (0 = free, 1 = used)
+    MemSet(vm_page_allocator->bitmap, 0, bitmap_bytes);
+    vm_page_allocator->free_count = num_pages;
+
+    // Initialize physical page hash
+    for (i = 0; i < PHYS_PAGE_HASH_SIZE; i++)
+        vm_phys_page_hash[i] = NULL;
+}
+
+// Allocate a single physical page
+U64 VMAllocPage()
+{
+    I64 i, byte_idx, bit_idx;
+    U64 phys_addr;
+
+    if (!vm_page_allocator || vm_page_allocator->free_count == 0)
+        return 0;
+
+    // Find first free page in bitmap
+    for (i = 0; i < vm_page_allocator->total_pages; i++) {
+        byte_idx = i / 8;
+        bit_idx = i % 8;
+
+        if (!(vm_page_allocator->bitmap[byte_idx] & (1 << bit_idx))) {
+            // Mark as used
+            vm_page_allocator->bitmap[byte_idx] |= (1 << bit_idx);
+            vm_page_allocator->free_count--;
+
+            phys_addr = vm_page_allocator->base_addr + (i * PAGE_SIZE);
+
+            // Zero the page
+            VMZeroPage(phys_addr);
+
+            return phys_addr;
+        }
+    }
+
+    return 0; // No free pages
+}
+
+// Free a physical page
+U0 VMFreePage(U64 phys_addr)
+{
+    I64 page_idx, byte_idx, bit_idx;
+
+    if (!vm_page_allocator)
+        return;
+
+    if (phys_addr < vm_page_allocator->base_addr)
+        return;
+
+    page_idx = (phys_addr - vm_page_allocator->base_addr) / PAGE_SIZE;
+
+    if (page_idx >= vm_page_allocator->total_pages)
+        return;
+
+    byte_idx = page_idx / 8;
+    bit_idx = page_idx % 8;
+
+    // Mark as free
+    if (vm_page_allocator->bitmap[byte_idx] & (1 << bit_idx)) {
+        vm_page_allocator->bitmap[byte_idx] &= ~(1 << bit_idx);
+        vm_page_allocator->free_count++;
+    }
+}
+
+// Allocate contiguous pages
+U64 VMAllocPages(I64 count)
+{
+    I64 i, j, start, byte_idx, bit_idx;
+    U64 phys_addr;
+    Bool found;
+
+    if (!vm_page_allocator || count <= 0)
+        return 0;
+
+    // Find contiguous free pages
+    for (i = 0; i <= vm_page_allocator->total_pages - count; i++) {
+        found = TRUE;
+
+        for (j = 0; j < count; j++) {
+            byte_idx = (i + j) / 8;
+            bit_idx = (i + j) % 8;
+
+            if (vm_page_allocator->bitmap[byte_idx] & (1 << bit_idx)) {
+                found = FALSE;
+                break;
+            }
+        }
+
+        if (found) {
+            // Mark all as used
+            for (j = 0; j < count; j++) {
+                byte_idx = (i + j) / 8;
+                bit_idx = (i + j) % 8;
+                vm_page_allocator->bitmap[byte_idx] |= (1 << bit_idx);
+            }
+            vm_page_allocator->free_count -= count;
+
+            phys_addr = vm_page_allocator->base_addr + (i * PAGE_SIZE);
+
+            // Zero all pages
+            for (j = 0; j < count; j++)
+                VMZeroPage(phys_addr + j * PAGE_SIZE);
+
+            return phys_addr;
+        }
+    }
+
+    return 0;
+}
+
+// Free contiguous pages
+U0 VMFreePages(U64 phys_addr, I64 count)
+{
+    I64 i;
+
+    for (i = 0; i < count; i++)
+        VMFreePage(phys_addr + i * PAGE_SIZE);
+}
+
+// ============================================================================
+// PHYSICAL PAGE REFERENCE COUNTING
+// ============================================================================
+
+// Get or create physical page tracking entry
+CPhysPage *VMPhysPageGet(U64 phys_addr, Bool create)
+{
+    I64 hash;
+    CPhysPage *pp;
+
+    hash = VMPhysPageHash(phys_addr);
+    pp = vm_phys_page_hash[hash];
+
+    while (pp) {
+        if (pp->phys_addr == phys_addr)
+            return pp;
+        pp = pp->next;
+    }
+
+    if (!create)
+        return NULL;
+
+    // Create new entry
+    pp = MAlloc(sizeof(CPhysPage));
+    pp->phys_addr = phys_addr;
+    pp->ref_count = 0;
+    pp->next = vm_phys_page_hash[hash];
+    vm_phys_page_hash[hash] = pp;
+
+    return pp;
+}
+
+// Increment reference count
+I64 VMPhysPageRef(U64 phys_addr)
+{
+    CPhysPage *pp = VMPhysPageGet(phys_addr, TRUE);
+    return ++pp->ref_count;
+}
+
+// Decrement reference count
+I64 VMPhysPageUnref(U64 phys_addr)
+{
+    CPhysPage *pp = VMPhysPageGet(phys_addr, FALSE);
+    if (!pp)
+        return 0;
+    if (pp->ref_count > 0)
+        pp->ref_count--;
+    return pp->ref_count;
+}
+
+// Get reference count
+I64 VMPhysPageGetRef(U64 phys_addr)
+{
+    CPhysPage *pp = VMPhysPageGet(phys_addr, FALSE);
+    if (!pp)
+        return 0;
+    return pp->ref_count;
+}
+
+// ============================================================================
+// PAGE TABLE MANIPULATION
+// ============================================================================
+
+// Zero a page (using virtual address - identity mapped in kernel)
+U0 VMZeroPage(U64 phys_addr)
+{
+    // ZealOS uses identity mapping, so phys_addr == virt_addr for kernel
+    MemSet(phys_addr(U8 *), 0, PAGE_SIZE);
+}
+
+// Copy a page
+U0 VMCopyPage(U64 dst_phys, U64 src_phys)
+{
+    // ZealOS uses identity mapping
+    MemCpy(dst_phys(U8 *), src_phys(U8 *), PAGE_SIZE);
+}
+
+// Allocate a new page table (PML4, PML3, PML2, or PT)
+U64 VMAllocPageTable()
+{
+    U64 page = VMAllocPage();
+    if (page)
+        VMZeroPage(page);
+    return page;
+}
+
+// Get page table entry for a virtual address
+// If create is TRUE, creates intermediate page tables as needed
+U64 *VMGetPTE(CVMContext *ctx, U64 virt_addr, Bool create)
+{
+    U64 *pml4, *pml3, *pml2, *pt;
+    I64 pml4_idx, pml3_idx, pml2_idx, pt_idx;
+    U64 entry, next_table;
+
+    if (!ctx || !ctx->pml4_virt)
+        return NULL;
+
+    pml4_idx = PML4_INDEX(virt_addr);
+    pml3_idx = PML3_INDEX(virt_addr);
+    pml2_idx = PML2_INDEX(virt_addr);
+    pt_idx = PT_INDEX(virt_addr);
+
+    pml4 = ctx->pml4_virt;
+
+    // PML4 -> PML3
+    entry = pml4[pml4_idx];
+    if (!(entry & PTE_PRESENT)) {
+        if (!create)
+            return NULL;
+        next_table = VMAllocPageTable();
+        if (!next_table)
+            return NULL;
+        pml4[pml4_idx] = next_table | PTE_PRESENT | PTE_WRITE | PTE_USER;
+        entry = pml4[pml4_idx];
+    }
+    pml3 = (entry & PTE_ADDR_MASK)(U64 *);
+
+    // PML3 -> PML2
+    entry = pml3[pml3_idx];
+    if (!(entry & PTE_PRESENT)) {
+        if (!create)
+            return NULL;
+        next_table = VMAllocPageTable();
+        if (!next_table)
+            return NULL;
+        pml3[pml3_idx] = next_table | PTE_PRESENT | PTE_WRITE | PTE_USER;
+        entry = pml3[pml3_idx];
+    }
+    // Check for 1GB page
+    if (entry & PTE_PS)
+        return NULL; // Can't get PTE for large page
+
+    pml2 = (entry & PTE_ADDR_MASK)(U64 *);
+
+    // PML2 -> PT
+    entry = pml2[pml2_idx];
+    if (!(entry & PTE_PRESENT)) {
+        if (!create)
+            return NULL;
+        next_table = VMAllocPageTable();
+        if (!next_table)
+            return NULL;
+        pml2[pml2_idx] = next_table | PTE_PRESENT | PTE_WRITE | PTE_USER;
+        entry = pml2[pml2_idx];
+    }
+    // Check for 2MB page
+    if (entry & PTE_PS)
+        return NULL; // Can't get PTE for large page
+
+    pt = (entry & PTE_ADDR_MASK)(U64 *);
+
+    return &pt[pt_idx];
+}
+
+// Map a virtual address to a physical address
+U0 VMMapPage(CVMContext *ctx, U64 virt_addr, U64 phys_addr, U64 flags)
+{
+    U64 *pte;
+
+    pte = VMGetPTE(ctx, virt_addr, TRUE);
+    if (!pte)
+        return;
+
+    // Build PTE
+    *pte = (phys_addr & PTE_ADDR_MASK) | flags | PTE_PRESENT;
+
+    // Invalidate TLB for this address
+    VMFlushTLBPage(virt_addr);
+}
+
+// Unmap a virtual address
+U0 VMUnmapPage(CVMContext *ctx, U64 virt_addr)
+{
+    U64 *pte;
+
+    pte = VMGetPTE(ctx, virt_addr, FALSE);
+    if (!pte)
+        return;
+
+    // Clear the PTE
+    *pte = 0;
+
+    // Invalidate TLB
+    VMFlushTLBPage(virt_addr);
+}
+
+// Translate virtual address to physical address
+U64 VMTranslate(CVMContext *ctx, U64 virt_addr)
+{
+    U64 *pte;
+
+    pte = VMGetPTE(ctx, virt_addr, FALSE);
+    if (!pte || !(*pte & PTE_PRESENT))
+        return 0;
+
+    return (*pte & PTE_ADDR_MASK) | (virt_addr & (PAGE_SIZE - 1));
+}
+
+// ============================================================================
+// VIRTUAL MEMORY CONTEXT
+// ============================================================================
+
+// Create a new VM context with its own page tables
+CVMContext *VMContextNew()
+{
+    CVMContext *ctx;
+    U64 pml4_phys;
+    I64 i;
+    U64 *kernel_pml4;
+
+    ctx = MAlloc(sizeof(CVMContext));
+    if (!ctx)
+        return NULL;
+    MemSet(ctx, 0, sizeof(CVMContext));
+
+    // Allocate PML4
+    pml4_phys = VMAllocPageTable();
+    if (!pml4_phys) {
+        Free(ctx);
+        return NULL;
+    }
+
+    ctx->cr3 = pml4_phys;
+    ctx->pml4_virt = pml4_phys(U64 *); // Identity mapping
+
+    // Copy kernel mappings from the system PML4
+    // Kernel is in upper half (entries 256-511)
+    kernel_pml4 = vm_kernel_pml4;
+    if (kernel_pml4) {
+        for (i = 256; i < 512; i++) {
+            ctx->pml4_virt[i] = kernel_pml4[i];
+        }
+    }
+
+    // Initialize regions
+    ctx->regions = NULL;
+    ctx->region_count = 0;
+
+    // Initialize heap (starts after code/data)
+    ctx->heap_start = 0x10000000; // 256MB
+    ctx->heap_end = ctx->heap_start;
+    ctx->heap_max = 0x40000000;   // 1GB max
+
+    // Initialize stack (grows down from high address)
+    ctx->stack_top = 0x7FFFFFFFF000ULL;  // Just below user space limit
+    ctx->stack_bottom = ctx->stack_top;
+    ctx->stack_max = 8 * 1024 * 1024;    // 8MB max stack
+
+    ctx->ref_count = 1;
+    ctx->parent = NULL;
+
+    return ctx;
+}
+
+// Free a VM context and all its resources
+U0 VMContextFree(CVMContext *ctx)
+{
+    CVMRegion *region, *next;
+    I64 i, j, k;
+    U64 *pml4, *pml3, *pml2, *pt;
+    U64 entry, phys;
+
+    if (!ctx)
+        return;
+
+    // Decrement ref count
+    ctx->ref_count--;
+    if (ctx->ref_count > 0)
+        return;
+
+    // Free all regions
+    region = ctx->regions;
+    while (region) {
+        next = region->next;
+        if (region->name)
+            Free(region->name);
+        Free(region);
+        region = next;
+    }
+
+    // Walk page tables and free user pages (PML4 entries 0-255)
+    pml4 = ctx->pml4_virt;
+    if (pml4) {
+        for (i = 0; i < 256; i++) {
+            if (!(pml4[i] & PTE_PRESENT))
+                continue;
+
+            pml3 = (pml4[i] & PTE_ADDR_MASK)(U64 *);
+
+            for (j = 0; j < 512; j++) {
+                if (!(pml3[j] & PTE_PRESENT))
+                    continue;
+                if (pml3[j] & PTE_PS)
+                    continue; // Skip 1GB pages
+
+                pml2 = (pml3[j] & PTE_ADDR_MASK)(U64 *);
+
+                for (k = 0; k < 512; k++) {
+                    if (!(pml2[k] & PTE_PRESENT))
+                        continue;
+                    if (pml2[k] & PTE_PS)
+                        continue; // Skip 2MB pages
+
+                    pt = (pml2[k] & PTE_ADDR_MASK)(U64 *);
+
+                    // Free all pages in this PT
+                    for (I64 l = 0; l < 512; l++) {
+                        if (pt[l] & PTE_PRESENT) {
+                            phys = pt[l] & PTE_ADDR_MASK;
+                            if (VMPhysPageUnref(phys) == 0)
+                                VMFreePage(phys);
+                        }
+                    }
+
+                    // Free PT itself
+                    VMFreePage(pml2[k] & PTE_ADDR_MASK);
+                }
+
+                // Free PML2
+                VMFreePage(pml3[j] & PTE_ADDR_MASK);
+            }
+
+            // Free PML3
+            VMFreePage(pml4[i] & PTE_ADDR_MASK);
+        }
+
+        // Free PML4
+        VMFreePage(ctx->cr3);
+    }
+
+    Free(ctx);
+}
+
+// Fork a VM context with copy-on-write semantics
+CVMContext *VMContextFork(CVMContext *parent)
+{
+    CVMContext *child;
+    CVMRegion *region, *new_region;
+    I64 i, j, k, l;
+    U64 *pml4, *pml3, *pml2, *pt;
+    U64 *child_pml4, *child_pml3, *child_pml2, *child_pt;
+    U64 entry, phys;
+
+    if (!parent)
+        return NULL;
+
+    // Create new context
+    child = VMContextNew();
+    if (!child)
+        return NULL;
+
+    child->parent = parent;
+
+    // Copy heap/stack settings
+    child->heap_start = parent->heap_start;
+    child->heap_end = parent->heap_end;
+    child->heap_max = parent->heap_max;
+    child->stack_top = parent->stack_top;
+    child->stack_bottom = parent->stack_bottom;
+    child->stack_max = parent->stack_max;
+
+    // Copy regions list
+    region = parent->regions;
+    while (region) {
+        new_region = MAlloc(sizeof(CVMRegion));
+        MemCpy(new_region, region, sizeof(CVMRegion));
+        new_region->next = child->regions;
+        new_region->prev = NULL;
+        if (child->regions)
+            child->regions->prev = new_region;
+        child->regions = new_region;
+        child->region_count++;
+
+        if (region->name)
+            new_region->name = StrNew(region->name);
+
+        region = region->next;
+    }
+
+    // Copy page tables with COW
+    pml4 = parent->pml4_virt;
+    child_pml4 = child->pml4_virt;
+
+    for (i = 0; i < 256; i++) { // User space only
+        if (!(pml4[i] & PTE_PRESENT))
+            continue;
+
+        pml3 = (pml4[i] & PTE_ADDR_MASK)(U64 *);
+
+        // Allocate child PML3
+        U64 child_pml3_phys = VMAllocPageTable();
+        if (!child_pml3_phys)
+            goto fork_fail;
+        child_pml4[i] = child_pml3_phys | (pml4[i] & ~PTE_ADDR_MASK);
+        child_pml3 = child_pml3_phys(U64 *);
+
+        for (j = 0; j < 512; j++) {
+            if (!(pml3[j] & PTE_PRESENT))
+                continue;
+            if (pml3[j] & PTE_PS)
+                continue; // Skip 1GB pages
+
+            pml2 = (pml3[j] & PTE_ADDR_MASK)(U64 *);
+
+            // Allocate child PML2
+            U64 child_pml2_phys = VMAllocPageTable();
+            if (!child_pml2_phys)
+                goto fork_fail;
+            child_pml3[j] = child_pml2_phys | (pml3[j] & ~PTE_ADDR_MASK);
+            child_pml2 = child_pml2_phys(U64 *);
+
+            for (k = 0; k < 512; k++) {
+                if (!(pml2[k] & PTE_PRESENT))
+                    continue;
+                if (pml2[k] & PTE_PS)
+                    continue; // Skip 2MB pages
+
+                pt = (pml2[k] & PTE_ADDR_MASK)(U64 *);
+
+                // Allocate child PT
+                U64 child_pt_phys = VMAllocPageTable();
+                if (!child_pt_phys)
+                    goto fork_fail;
+                child_pml2[k] = child_pt_phys | (pml2[k] & ~PTE_ADDR_MASK);
+                child_pt = child_pt_phys(U64 *);
+
+                for (l = 0; l < 512; l++) {
+                    if (!(pt[l] & PTE_PRESENT))
+                        continue;
+
+                    phys = pt[l] & PTE_ADDR_MASK;
+
+                    // Mark both parent and child as COW (read-only)
+                    entry = pt[l];
+                    if (entry & PTE_WRITE) {
+                        entry &= ~PTE_WRITE;  // Remove write permission
+                        entry |= PTE_COW;     // Mark as COW
+                        pt[l] = entry;        // Update parent
+                    }
+
+                    // Copy to child with same flags
+                    child_pt[l] = entry;
+
+                    // Increment reference count on physical page
+                    VMPhysPageRef(phys);
+                }
+            }
+        }
+    }
+
+    // Flush TLB to ensure COW changes take effect
+    VMFlushTLB();
+
+    return child;
+
+fork_fail:
+    VMContextFree(child);
+    return NULL;
+}
+
+// ============================================================================
+// MEMORY REGIONS
+// ============================================================================
+
+// Add a memory region
+CVMRegion *VMRegionAdd(CVMContext *ctx, U64 start, U64 end, U8 type, U8 flags)
+{
+    CVMRegion *region;
+
+    region = MAlloc(sizeof(CVMRegion));
+    if (!region)
+        return NULL;
+
+    MemSet(region, 0, sizeof(CVMRegion));
+    region->start = start;
+    region->end = end;
+    region->type = type;
+    region->flags = flags;
+
+    // Add to list
+    region->next = ctx->regions;
+    region->prev = NULL;
+    if (ctx->regions)
+        ctx->regions->prev = region;
+    ctx->regions = region;
+    ctx->region_count++;
+
+    return region;
+}
+
+// Remove a memory region
+U0 VMRegionRemove(CVMContext *ctx, CVMRegion *region)
+{
+    if (!region)
+        return;
+
+    if (region->prev)
+        region->prev->next = region->next;
+    else
+        ctx->regions = region->next;
+
+    if (region->next)
+        region->next->prev = region->prev;
+
+    if (region->name)
+        Free(region->name);
+    Free(region);
+    ctx->region_count--;
+}
+
+// Find region containing address
+CVMRegion *VMRegionFind(CVMContext *ctx, U64 addr)
+{
+    CVMRegion *region;
+
+    region = ctx->regions;
+    while (region) {
+        if (addr >= region->start && addr < region->end)
+            return region;
+        region = region->next;
+    }
+
+    return NULL;
+}
+
+// ============================================================================
+// MEMORY MAPPING
+// ============================================================================
+
+// Map anonymous memory
+U64 VMMmap(CVMContext *ctx, U64 addr, U64 length, U8 flags)
+{
+    U64 start, end, virt;
+    U64 phys, pte_flags;
+    CVMRegion *region;
+
+    // Round length up to page size
+    length = (length + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
+
+    // Find free region if addr is 0
+    if (addr == 0) {
+        // Simple: start from heap_max and go up
+        addr = ctx->heap_max;
+        ctx->heap_max += length;
+    }
+
+    // Align address
+    start = addr & ~(PAGE_SIZE - 1);
+    end = start + length;
+
+    // Build PTE flags
+    pte_flags = PTE_USER;
+    if (flags & VM_FLAG_WRITE)
+        pte_flags |= PTE_WRITE;
+    if (!(flags & VM_FLAG_EXEC))
+        pte_flags |= PTE_NX;
+
+    // Map pages
+    for (virt = start; virt < end; virt += PAGE_SIZE) {
+        phys = VMAllocPage();
+        if (!phys)
+            return 0;
+
+        VMMapPage(ctx, virt, phys, pte_flags);
+        VMPhysPageRef(phys);
+        ctx->total_pages++;
+    }
+
+    // Create region
+    region = VMRegionAdd(ctx, start, end, VM_REGION_MMAP, flags);
+    if (region)
+        region->name = StrNew("mmap");
+
+    return start;
+}
+
+// Unmap memory
+U0 VMMunmap(CVMContext *ctx, U64 addr, U64 length)
+{
+    U64 start, end, virt;
+    U64 *pte, phys;
+    CVMRegion *region;
+
+    start = addr & ~(PAGE_SIZE - 1);
+    length = (length + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
+    end = start + length;
+
+    // Unmap pages
+    for (virt = start; virt < end; virt += PAGE_SIZE) {
+        pte = VMGetPTE(ctx, virt, FALSE);
+        if (pte && (*pte & PTE_PRESENT)) {
+            phys = *pte & PTE_ADDR_MASK;
+            VMUnmapPage(ctx, virt);
+            if (VMPhysPageUnref(phys) == 0)
+                VMFreePage(phys);
+            ctx->total_pages--;
+        }
+    }
+
+    // Find and remove region
+    region = VMRegionFind(ctx, start);
+    if (region && region->start == start && region->end == end)
+        VMRegionRemove(ctx, region);
+}
+
+// ============================================================================
+// HEAP MANAGEMENT (brk/sbrk)
+// ============================================================================
+
+U64 VMBrk(CVMContext *ctx, U64 new_brk)
+{
+    U64 old_brk, virt, phys;
+    U64 pte_flags;
+
+    old_brk = ctx->heap_end;
+
+    if (new_brk == 0)
+        return old_brk;
+
+    // Align to page
+    new_brk = (new_brk + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
+
+    if (new_brk < ctx->heap_start)
+        return old_brk; // Can't shrink below start
+
+    if (new_brk > ctx->heap_max)
+        return old_brk; // Can't grow past max
+
+    pte_flags = PTE_USER | PTE_WRITE | PTE_NX;
+
+    if (new_brk > old_brk) {
+        // Grow heap
+        for (virt = old_brk; virt < new_brk; virt += PAGE_SIZE) {
+            phys = VMAllocPage();
+            if (!phys)
+                return ctx->heap_end; // Out of memory
+
+            VMMapPage(ctx, virt, phys, pte_flags);
+            VMPhysPageRef(phys);
+            ctx->total_pages++;
+        }
+    } else if (new_brk < old_brk) {
+        // Shrink heap
+        for (virt = new_brk; virt < old_brk; virt += PAGE_SIZE) {
+            U64 *pte = VMGetPTE(ctx, virt, FALSE);
+            if (pte && (*pte & PTE_PRESENT)) {
+                phys = *pte & PTE_ADDR_MASK;
+                VMUnmapPage(ctx, virt);
+                if (VMPhysPageUnref(phys) == 0)
+                    VMFreePage(phys);
+                ctx->total_pages--;
+            }
+        }
+    }
+
+    ctx->heap_end = new_brk;
+    return new_brk;
+}
+
+// ============================================================================
+// STACK MANAGEMENT
+// ============================================================================
+
+// Grow stack down to accommodate fault address
+U64 VMStackGrow(CVMContext *ctx, U64 fault_addr)
+{
+    U64 new_bottom, virt, phys;
+    U64 pte_flags;
+
+    // Check if within stack limits
+    if (fault_addr >= ctx->stack_top)
+        return 0;
+    if (ctx->stack_top - fault_addr > ctx->stack_max)
+        return 0;
+
+    // Align down to page
+    new_bottom = fault_addr & ~(PAGE_SIZE - 1);
+
+    pte_flags = PTE_USER | PTE_WRITE | PTE_NX;
+
+    // Map pages from new_bottom to current stack_bottom
+    for (virt = new_bottom; virt < ctx->stack_bottom; virt += PAGE_SIZE) {
+        phys = VMAllocPage();
+        if (!phys)
+            return 0;
+
+        VMMapPage(ctx, virt, phys, pte_flags);
+        VMPhysPageRef(phys);
+        ctx->total_pages++;
+    }
+
+    ctx->stack_bottom = new_bottom;
+    return new_bottom;
+}
+
+// ============================================================================
+// PAGE FAULT HANDLING
+// ============================================================================
+
+// Handle copy-on-write fault
+I64 VMHandleCOW(CVMContext *ctx, U64 fault_addr)
+{
+    U64 *pte, entry, old_phys, new_phys;
+    I64 ref_count;
+
+    pte = VMGetPTE(ctx, fault_addr, FALSE);
+    if (!pte)
+        return -1;
+
+    entry = *pte;
+
+    // Check if this is a COW page
+    if (!(entry & PTE_COW))
+        return -1;
+
+    old_phys = entry & PTE_ADDR_MASK;
+    ref_count = VMPhysPageGetRef(old_phys);
+
+    if (ref_count == 1) {
+        // We're the only reference, just make writable
+        entry |= PTE_WRITE;
+        entry &= ~PTE_COW;
+        *pte = entry;
+        VMFlushTLBPage(fault_addr);
+        return 0;
+    }
+
+    // Need to copy the page
+    new_phys = VMAllocPage();
+    if (!new_phys)
+        return -1;
+
+    VMCopyPage(new_phys, old_phys);
+
+    // Update PTE to point to new page with write permission
+    entry = new_phys | PTE_PRESENT | PTE_USER | PTE_WRITE;
+    if (entry & PTE_NX)
+        entry |= PTE_NX;
+    *pte = entry;
+
+    // Update reference counts
+    VMPhysPageRef(new_phys);
+    if (VMPhysPageUnref(old_phys) == 0)
+        VMFreePage(old_phys);
+
+    VMFlushTLBPage(fault_addr);
+    ctx->cow_pages++;
+
+    return 0;
+}
+
+// Main page fault handler
+// error_code: bit 0 = present, bit 1 = write, bit 2 = user
+I64 VMPageFault(CVMContext *ctx, U64 fault_addr, U64 error_code)
+{
+    CVMRegion *region;
+    Bool is_write, is_user, is_present;
+
+    ctx->page_faults++;
+
+    is_present = error_code & 0x01;
+    is_write = error_code & 0x02;
+    is_user = error_code & 0x04;
+
+    // Only handle user-mode faults
+    if (!is_user)
+        return -1;
+
+    // Check if this is a COW fault
+    if (is_present && is_write) {
+        if (VMHandleCOW(ctx, fault_addr) == 0)
+            return 0;
+    }
+
+    // Check if we need to grow the stack
+    if (fault_addr < ctx->stack_bottom && fault_addr >= ctx->stack_top - ctx->stack_max) {
+        if (VMStackGrow(ctx, fault_addr))
+            return 0;
+    }
+
+    // Check if address is in a valid region
+    region = VMRegionFind(ctx, fault_addr);
+    if (!region)
+        return -1; // SIGSEGV
+
+    // Check permissions
+    if (is_write && !(region->flags & VM_FLAG_WRITE))
+        return -1; // SIGSEGV
+
+    return -1; // Unhandled fault
+}
+
+// ============================================================================
+// CONTEXT SWITCHING
+// ============================================================================
+
+// Switch to a different VM context
+U0 VMSwitchContext(CVMContext *ctx)
+{
+    if (!ctx)
+        return;
+
+    VMWriteCR3(ctx->cr3);
+}
+
+// ============================================================================
+// INITIALIZATION
+// ============================================================================
+
+U0 VMInit()
+{
+    U64 mem_size, vm_pool_base;
+    I64 i;
+
+    if (vm_initialized)
+        return;
+
+    "VM: Initializing virtual memory subsystem...\n";
+
+    // Get system PML4 address (current CR3)
+    vm_kernel_pml4 = VMReadCR3()(U64 *);
+    "VM: Kernel PML4 at 0x%016X\n", vm_kernel_pml4;
+
+    // Initialize physical page hash
+    for (i = 0; i < PHYS_PAGE_HASH_SIZE; i++)
+        vm_phys_page_hash[i] = NULL;
+
+    // Allocate a memory pool for user pages
+    // We'll use 256MB for user-space pages
+    mem_size = 256 * 1024 * 1024; // 256 MB
+    vm_pool_base = MAlloc(mem_size)(U64);
+
+    if (!vm_pool_base) {
+        "VM: Failed to allocate page pool!\n";
+        return;
+    }
+
+    "VM: Allocated %d MB page pool at 0x%016X\n", mem_size / (1024*1024), vm_pool_base;
+
+    VMPageAllocatorInit(vm_pool_base, mem_size);
+
+    "VM: Page allocator initialized with %d pages\n", vm_page_allocator->total_pages;
+
+    vm_initialized = TRUE;
+    "VM: Virtual memory subsystem ready.\n";
+}
+
+// ============================================================================
+// DEBUG
+// ============================================================================
+
+U0 VMDumpContext(CVMContext *ctx)
+{
+    CVMRegion *region;
+
+    if (!ctx) {
+        "VM: NULL context\n";
+        return;
+    }
+
+    "VM Context:\n";
+    "  CR3: 0x%016X\n", ctx->cr3;
+    "  PML4: 0x%016X\n", ctx->pml4_virt;
+    "  Heap: 0x%016X - 0x%016X (max 0x%016X)\n",
+        ctx->heap_start, ctx->heap_end, ctx->heap_max;
+    "  Stack: 0x%016X - 0x%016X\n",
+        ctx->stack_bottom, ctx->stack_top;
+    "  Total pages: %d\n", ctx->total_pages;
+    "  COW pages: %d\n", ctx->cow_pages;
+    "  Page faults: %d\n", ctx->page_faults;
+    "  Ref count: %d\n", ctx->ref_count;
+
+    "  Regions (%d):\n", ctx->region_count;
+    region = ctx->regions;
+    while (region) {
+        "    0x%016X - 0x%016X type=%d flags=0x%02X",
+            region->start, region->end, region->type, region->flags;
+        if (region->name)
+            " (%s)", region->name;
+        "\n";
+        region = region->next;
+    }
+}

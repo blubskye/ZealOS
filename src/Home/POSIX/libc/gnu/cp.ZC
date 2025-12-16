@@ -1,0 +1,279 @@
+// cp.ZC - GNU coreutils 'cp' implementation
+// Copy files and directories
+
+#define CP_BUF_SIZE 65536
+
+// C-style main function
+I64 cp_main(I64 argc, U8 **argv)
+{
+    Bool force = FALSE;         // -f
+    Bool interactive = FALSE;   // -i
+    Bool recursive = FALSE;     // -r/-R
+    Bool verbose = FALSE;       // -v
+    Bool no_clobber = FALSE;    // -n
+    Bool update = FALSE;        // -u
+    Bool preserve = FALSE;      // -p (simplified)
+    I64 start = 1;
+
+    // Parse options
+    while (start < argc && argv[start][0] == '-' && argv[start][1]) {
+        U8 *arg = argv[start];
+
+        if (strcmp(arg, "--help") == 0) {
+            printf("Usage: cp [OPTION]... SOURCE... DEST\n");
+            printf("  or:  cp [OPTION]... -t DIRECTORY SOURCE...\n");
+            printf("Copy SOURCE to DEST, or multiple SOURCE(s) to DIRECTORY.\n\n");
+            printf("  -f, --force             if destination exists and cannot be opened, remove it\n");
+            printf("  -i, --interactive       prompt before overwrite\n");
+            printf("  -n, --no-clobber        do not overwrite an existing file\n");
+            printf("  -r, -R, --recursive     copy directories recursively\n");
+            printf("  -u, --update            copy only when SOURCE is newer than dest\n");
+            printf("  -v, --verbose           explain what is being done\n");
+            printf("  -p                      preserve mode, ownership, timestamps\n");
+            printf("      --help              display this help and exit\n");
+            printf("      --version           output version information and exit\n");
+            return 0;
+        }
+
+        if (strcmp(arg, "--version") == 0) {
+            printf("cp (ZealOS coreutils) 1.0\n");
+            return 0;
+        }
+
+        if (strcmp(arg, "-f") == 0 || strcmp(arg, "--force") == 0) {
+            force = TRUE;
+            start++;
+            continue;
+        }
+
+        if (strcmp(arg, "-i") == 0 || strcmp(arg, "--interactive") == 0) {
+            interactive = TRUE;
+            start++;
+            continue;
+        }
+
+        if (strcmp(arg, "-n") == 0 || strcmp(arg, "--no-clobber") == 0) {
+            no_clobber = TRUE;
+            start++;
+            continue;
+        }
+
+        if (strcmp(arg, "-r") == 0 || strcmp(arg, "-R") == 0 ||
+            strcmp(arg, "--recursive") == 0) {
+            recursive = TRUE;
+            start++;
+            continue;
+        }
+
+        if (strcmp(arg, "-u") == 0 || strcmp(arg, "--update") == 0) {
+            update = TRUE;
+            start++;
+            continue;
+        }
+
+        if (strcmp(arg, "-v") == 0 || strcmp(arg, "--verbose") == 0) {
+            verbose = TRUE;
+            start++;
+            continue;
+        }
+
+        if (strcmp(arg, "-p") == 0) {
+            preserve = TRUE;
+            start++;
+            continue;
+        }
+
+        // Combined short options
+        if (arg[0] == '-' && arg[1] != '-') {
+            for (I64 i = 1; arg[i]; i++) {
+                switch (arg[i]) {
+                    case 'f': force = TRUE; break;
+                    case 'i': interactive = TRUE; break;
+                    case 'n': no_clobber = TRUE; break;
+                    case 'r':
+                    case 'R': recursive = TRUE; break;
+                    case 'u': update = TRUE; break;
+                    case 'v': verbose = TRUE; break;
+                    case 'p': preserve = TRUE; break;
+                    default:
+                        fprintf(stderr, "cp: invalid option -- '%c'\n", arg[i]);
+                        return 1;
+                }
+            }
+            start++;
+            continue;
+        }
+
+        if (strcmp(arg, "--") == 0) {
+            start++;
+            break;
+        }
+
+        break;
+    }
+
+    I64 num_args = argc - start;
+    if (num_args < 2) {
+        fprintf(stderr, "cp: missing %s operand\n",
+                num_args == 0 ? "file" : "destination file");
+        return 1;
+    }
+
+    I64 exit_status = 0;
+
+    // Copy a single file
+    auto copy_file = [](U8 *src, U8 *dst, Bool verbose) -> I64 {
+        I64 src_fd = PosixOpen(src, O_RDONLY, 0);
+        if (src_fd < 0) {
+            fprintf(stderr, "cp: cannot open '%s' for reading: %s\n", src, strerror(errno));
+            return -1;
+        }
+
+        I64 dst_fd = PosixOpen(dst, O_WRONLY | O_CREAT | O_TRUNC, 0666);
+        if (dst_fd < 0) {
+            fprintf(stderr, "cp: cannot create '%s': %s\n", dst, strerror(errno));
+            PosixClose(src_fd);
+            return -1;
+        }
+
+        U8 *buf = MAlloc(CP_BUF_SIZE);
+        I64 n;
+
+        while ((n = PosixRead(src_fd, buf, CP_BUF_SIZE)) > 0) {
+            if (PosixWrite(dst_fd, buf, n) != n) {
+                fprintf(stderr, "cp: write error: %s\n", strerror(errno));
+                Free(buf);
+                PosixClose(src_fd);
+                PosixClose(dst_fd);
+                return -1;
+            }
+        }
+
+        Free(buf);
+        PosixClose(src_fd);
+        PosixClose(dst_fd);
+
+        if (verbose) {
+            printf("'%s' -> '%s'\n", src, dst);
+        }
+
+        return 0;
+    };
+
+    // Copy directory recursively
+    I64 copy_dir(U8 *src, U8 *dst, Bool verbose);
+    copy_dir = [&copy_file, &copy_dir](U8 *src, U8 *dst, Bool verbose) -> I64 {
+        // Create destination directory
+        if (PosixMkdir(dst, 0777) < 0 && errno != EEXIST) {
+            fprintf(stderr, "cp: cannot create directory '%s': %s\n", dst, strerror(errno));
+            return -1;
+        }
+
+        I64 dir_fd = PosixOpenDir(src);
+        if (dir_fd < 0) {
+            fprintf(stderr, "cp: cannot open directory '%s': %s\n", src, strerror(errno));
+            return -1;
+        }
+
+        CPosixDirent *entry;
+        U8 src_path[PATH_MAX], dst_path[PATH_MAX];
+        I64 result = 0;
+
+        while ((entry = PosixReadDir(dir_fd)) != NULL) {
+            if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0)
+                continue;
+
+            snprintf(src_path, PATH_MAX, "%s/%s", src, entry->d_name);
+            snprintf(dst_path, PATH_MAX, "%s/%s", dst, entry->d_name);
+
+            CPosixStat st;
+            if (PosixStat(src_path, &st) < 0)
+                continue;
+
+            if (S_ISDIR(st.st_mode)) {
+                if (copy_dir(src_path, dst_path, verbose) < 0)
+                    result = -1;
+            } else {
+                if (copy_file(src_path, dst_path, verbose) < 0)
+                    result = -1;
+            }
+        }
+
+        PosixCloseDir(dir_fd);
+        return result;
+    };
+
+    // Get destination
+    U8 *dest = argv[argc - 1];
+    CPosixStat dest_stat;
+    Bool dest_is_dir = (PosixStat(dest, &dest_stat) == 0 && S_ISDIR(dest_stat.st_mode));
+
+    // Multiple sources require directory destination
+    if (num_args > 2 && !dest_is_dir) {
+        fprintf(stderr, "cp: target '%s' is not a directory\n", dest);
+        return 1;
+    }
+
+    // Copy each source
+    for (I64 i = start; i < argc - 1; i++) {
+        U8 *src = argv[i];
+        CPosixStat src_stat;
+
+        if (PosixStat(src, &src_stat) < 0) {
+            fprintf(stderr, "cp: cannot stat '%s': %s\n", src, strerror(errno));
+            exit_status = 1;
+            continue;
+        }
+
+        // Build destination path
+        U8 dst_path[PATH_MAX];
+        if (dest_is_dir) {
+            U8 *base = strrchr(src, '/');
+            base = base ? base + 1 : src;
+            snprintf(dst_path, PATH_MAX, "%s/%s", dest, base);
+        } else {
+            strncpy(dst_path, dest, PATH_MAX - 1);
+            dst_path[PATH_MAX - 1] = 0;
+        }
+
+        // Check if destination exists
+        CPosixStat dst_stat;
+        Bool dst_exists = (PosixStat(dst_path, &dst_stat) == 0);
+
+        if (dst_exists) {
+            if (no_clobber) {
+                continue;  // Skip
+            }
+            if (interactive) {
+                printf("cp: overwrite '%s'? ", dst_path);
+                I64 c = getchar();
+                I64 response = c;
+                while (c != '\n' && c != EOF)
+                    c = getchar();
+                if (response != 'y' && response != 'Y')
+                    continue;
+            }
+        }
+
+        // Perform copy
+        if (S_ISDIR(src_stat.st_mode)) {
+            if (!recursive) {
+                fprintf(stderr, "cp: -r not specified; omitting directory '%s'\n", src);
+                exit_status = 1;
+                continue;
+            }
+            if (copy_dir(src, dst_path, verbose) < 0)
+                exit_status = 1;
+        } else {
+            if (copy_file(src, dst_path, verbose) < 0)
+                exit_status = 1;
+        }
+    }
+
+    return exit_status;
+}
+
+U0 GnuCpRegister()
+{
+    "GNU 'cp' utility loaded.\n";
+}

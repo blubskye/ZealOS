@@ -1,0 +1,165 @@
+// id.ZC - GNU coreutils 'id' implementation
+// Print user and group information
+
+// C-style main function
+I64 id_main(I64 argc, U8 **argv)
+{
+    Bool print_group = FALSE;     // -g
+    Bool print_groups = FALSE;    // -G
+    Bool print_name = FALSE;      // -n
+    Bool print_user = FALSE;      // -u
+    Bool print_real = FALSE;      // -r
+    Bool zero_delim = FALSE;      // -z
+    U8 *username = NULL;
+    I64 start = 1;
+
+    // Parse options
+    while (start < argc && argv[start][0] == '-' && argv[start][1]) {
+        U8 *arg = argv[start];
+
+        if (strcmp(arg, "--help") == 0) {
+            printf("Usage: id [OPTION]... [USER]\n");
+            printf("Print user and group information for USER (default current user).\n\n");
+            printf("  -g, --group     print only the effective group ID\n");
+            printf("  -G, --groups    print all group IDs\n");
+            printf("  -n, --name      print a name instead of a number, for -ugG\n");
+            printf("  -r, --real      print the real ID instead of effective, for -ugG\n");
+            printf("  -u, --user      print only the effective user ID\n");
+            printf("  -z, --zero      delimit entries with NUL characters, not whitespace\n");
+            printf("      --help      display this help and exit\n");
+            printf("      --version   output version information and exit\n");
+            return 0;
+        }
+
+        if (strcmp(arg, "--version") == 0) {
+            printf("id (ZealOS coreutils) 1.0\n");
+            return 0;
+        }
+
+        if (strcmp(arg, "-g") == 0 || strcmp(arg, "--group") == 0) {
+            print_group = TRUE; start++; continue;
+        }
+        if (strcmp(arg, "-G") == 0 || strcmp(arg, "--groups") == 0) {
+            print_groups = TRUE; start++; continue;
+        }
+        if (strcmp(arg, "-n") == 0 || strcmp(arg, "--name") == 0) {
+            print_name = TRUE; start++; continue;
+        }
+        if (strcmp(arg, "-r") == 0 || strcmp(arg, "--real") == 0) {
+            print_real = TRUE; start++; continue;
+        }
+        if (strcmp(arg, "-u") == 0 || strcmp(arg, "--user") == 0) {
+            print_user = TRUE; start++; continue;
+        }
+        if (strcmp(arg, "-z") == 0 || strcmp(arg, "--zero") == 0) {
+            zero_delim = TRUE; start++; continue;
+        }
+
+        // Combined options
+        if (arg[0] == '-' && arg[1] != '-') {
+            for (I64 i = 1; arg[i]; i++) {
+                switch (arg[i]) {
+                    case 'g': print_group = TRUE; break;
+                    case 'G': print_groups = TRUE; break;
+                    case 'n': print_name = TRUE; break;
+                    case 'r': print_real = TRUE; break;
+                    case 'u': print_user = TRUE; break;
+                    case 'z': zero_delim = TRUE; break;
+                    default:
+                        fprintf(stderr, "id: invalid option -- '%c'\n", arg[i]);
+                        return 1;
+                }
+            }
+            start++;
+            continue;
+        }
+
+        if (strcmp(arg, "--") == 0) {
+            start++;
+            break;
+        }
+
+        break;
+    }
+
+    // Get username if provided
+    if (start < argc) {
+        username = argv[start];
+    }
+
+    // Get IDs
+    I64 uid, gid;
+    if (username) {
+        // Look up user by name - simplified, just check "root"
+        if (strcmp(username, "root") == 0) {
+            uid = 0;
+            gid = 0;
+        } else {
+            // Assume UID 1000 for other users
+            uid = 1000;
+            gid = 1000;
+        }
+    } else {
+        if (print_real) {
+            uid = PosixGetUid();
+            gid = PosixGetGid();
+        } else {
+            uid = PosixGetEuid();
+            gid = PosixGetEgid();
+        }
+    }
+
+    // Get username from UID
+    U8 *uname;
+    if (uid == 0) uname = "root";
+    else uname = "user";
+
+    // Get group name from GID
+    U8 *gname;
+    if (gid == 0) gname = "root";
+    else gname = "users";
+
+    U8 delim = zero_delim ? 0 : ' ';
+
+    if (print_user) {
+        if (print_name) {
+            printf("%s", uname);
+        } else {
+            printf("%ld", uid);
+        }
+        printf("\n");
+        return 0;
+    }
+
+    if (print_group) {
+        if (print_name) {
+            printf("%s", gname);
+        } else {
+            printf("%ld", gid);
+        }
+        printf("\n");
+        return 0;
+    }
+
+    if (print_groups) {
+        // Print all groups (simplified - just primary group)
+        if (print_name) {
+            printf("%s", gname);
+        } else {
+            printf("%ld", gid);
+        }
+        printf("\n");
+        return 0;
+    }
+
+    // Default format: uid=X(name) gid=X(name) groups=X(name)
+    printf("uid=%ld(%s) gid=%ld(%s) groups=%ld(%s)\n",
+           uid, uname, gid, gname, gid, gname);
+
+    return 0;
+}
+
+U0 GnuIdRegister()
+{
+    "GNU 'id' utility loaded.\n";
+}

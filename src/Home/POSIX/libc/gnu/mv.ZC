@@ -1,0 +1,229 @@
+// mv.ZC - GNU coreutils 'mv' implementation
+// Move (rename) files
+
+#define MV_BUF_SIZE 65536
+
+// C-style main function
+I64 mv_main(I64 argc, U8 **argv)
+{
+    Bool force = FALSE;         // -f
+    Bool interactive = FALSE;   // -i
+    Bool no_clobber = FALSE;    // -n
+    Bool verbose = FALSE;       // -v
+    Bool update = FALSE;        // -u
+    I64 start = 1;
+
+    // Parse options
+    while (start < argc && argv[start][0] == '-' && argv[start][1]) {
+        U8 *arg = argv[start];
+
+        if (strcmp(arg, "--help") == 0) {
+            printf("Usage: mv [OPTION]... SOURCE... DEST\n");
+            printf("  or:  mv [OPTION]... -t DIRECTORY SOURCE...\n");
+            printf("Rename SOURCE to DEST, or move SOURCE(s) to DIRECTORY.\n\n");
+            printf("  -f, --force             do not prompt before overwriting\n");
+            printf("  -i, --interactive       prompt before overwrite\n");
+            printf("  -n, --no-clobber        do not overwrite an existing file\n");
+            printf("  -u, --update            move only when SOURCE is newer\n");
+            printf("  -v, --verbose           explain what is being done\n");
+            printf("      --help              display this help and exit\n");
+            printf("      --version           output version information and exit\n");
+            return 0;
+        }
+
+        if (strcmp(arg, "--version") == 0) {
+            printf("mv (ZealOS coreutils) 1.0\n");
+            return 0;
+        }
+
+        if (strcmp(arg, "-f") == 0 || strcmp(arg, "--force") == 0) {
+            force = TRUE;
+            interactive = FALSE;
+            start++;
+            continue;
+        }
+
+        if (strcmp(arg, "-i") == 0 || strcmp(arg, "--interactive") == 0) {
+            interactive = TRUE;
+            force = FALSE;
+            start++;
+            continue;
+        }
+
+        if (strcmp(arg, "-n") == 0 || strcmp(arg, "--no-clobber") == 0) {
+            no_clobber = TRUE;
+            start++;
+            continue;
+        }
+
+        if (strcmp(arg, "-u") == 0 || strcmp(arg, "--update") == 0) {
+            update = TRUE;
+            start++;
+            continue;
+        }
+
+        if (strcmp(arg, "-v") == 0 || strcmp(arg, "--verbose") == 0) {
+            verbose = TRUE;
+            start++;
+            continue;
+        }
+
+        // Combined short options
+        if (arg[0] == '-' && arg[1] != '-') {
+            for (I64 i = 1; arg[i]; i++) {
+                switch (arg[i]) {
+                    case 'f': force = TRUE; interactive = FALSE; break;
+                    case 'i': interactive = TRUE; force = FALSE; break;
+                    case 'n': no_clobber = TRUE; break;
+                    case 'u': update = TRUE; break;
+                    case 'v': verbose = TRUE; break;
+                    default:
+                        fprintf(stderr, "mv: invalid option -- '%c'\n", arg[i]);
+                        return 1;
+                }
+            }
+            start++;
+            continue;
+        }
+
+        if (strcmp(arg, "--") == 0) {
+            start++;
+            break;
+        }
+
+        break;
+    }
+
+    I64 num_args = argc - start;
+    if (num_args < 2) {
+        fprintf(stderr, "mv: missing %s operand\n",
+                num_args == 0 ? "file" : "destination file");
+        return 1;
+    }
+
+    I64 exit_status = 0;
+
+    // Move via copy then delete (for cross-filesystem moves)
+    auto move_by_copy = [](U8 *src, U8 *dst, Bool verbose) -> I64 {
+        I64 src_fd = PosixOpen(src, O_RDONLY, 0);
+        if (src_fd < 0)
+            return -1;
+
+        I64 dst_fd = PosixOpen(dst, O_WRONLY | O_CREAT | O_TRUNC, 0666);
+        if (dst_fd < 0) {
+            PosixClose(src_fd);
+            return -1;
+        }
+
+        U8 *buf = MAlloc(MV_BUF_SIZE);
+        I64 n;
+        I64 result = 0;
+
+        while ((n = PosixRead(src_fd, buf, MV_BUF_SIZE)) > 0) {
+            if (PosixWrite(dst_fd, buf, n) != n) {
+                result = -1;
+                break;
+            }
+        }
+
+        Free(buf);
+        PosixClose(src_fd);
+        PosixClose(dst_fd);
+
+        if (result == 0) {
+            PosixUnlink(src);
+            if (verbose)
+                printf("renamed '%s' -> '%s'\n", src, dst);
+        }
+
+        return result;
+    };
+
+    // Get destination
+    U8 *dest = argv[argc - 1];
+    CPosixStat dest_stat;
+    Bool dest_is_dir = (PosixStat(dest, &dest_stat) == 0 && S_ISDIR(dest_stat.st_mode));
+
+    // Multiple sources require directory destination
+    if (num_args > 2 && !dest_is_dir) {
+        fprintf(stderr, "mv: target '%s' is not a directory\n", dest);
+        return 1;
+    }
+
+    // Move each source
+    for (I64 i = start; i < argc - 1; i++) {
+        U8 *src = argv[i];
+        CPosixStat src_stat;
+
+        if (PosixStat(src, &src_stat) < 0) {
+            fprintf(stderr, "mv: cannot stat '%s': %s\n", src, strerror(errno));
+            exit_status = 1;
+            continue;
+        }
+
+        // Build destination path
+        U8 dst_path[PATH_MAX];
+        if (dest_is_dir) {
+            U8 *base = strrchr(src, '/');
+            base = base ? base + 1 : src;
+            snprintf(dst_path, PATH_MAX, "%s/%s", dest, base);
+        } else {
+            strncpy(dst_path, dest, PATH_MAX - 1);
+            dst_path[PATH_MAX - 1] = 0;
+        }
+
+        // Check if destination exists
+        CPosixStat dst_stat;
+        Bool dst_exists = (PosixStat(dst_path, &dst_stat) == 0);
+
+        if (dst_exists) {
+            if (no_clobber) {
+                continue;  // Skip
+            }
+            if (interactive && !force) {
+                printf("mv: overwrite '%s'? ", dst_path);
+                I64 c = getchar();
+                I64 response = c;
+                while (c != '\n' && c != EOF)
+                    c = getchar();
+                if (response != 'y' && response != 'Y')
+                    continue;
+            }
+            // Remove destination first
+            if (S_ISDIR(dst_stat.st_mode)) {
+                fprintf(stderr, "mv: cannot overwrite directory '%s'\n", dst_path);
+                exit_status = 1;
+                continue;
+            }
+        }
+
+        // Try rename first (same filesystem)
+        if (PosixRename(src, dst_path) == 0) {
+            if (verbose)
+                printf("renamed '%s' -> '%s'\n", src, dst_path);
+        } else if (errno == EXDEV) {
+            // Cross-filesystem move - copy then delete
+            if (S_ISDIR(src_stat.st_mode)) {
+                fprintf(stderr, "mv: cannot move directory across filesystems: '%s'\n", src);
+                exit_status = 1;
+            } else {
+                if (move_by_copy(src, dst_path, verbose) < 0) {
+                    fprintf(stderr, "mv: cannot move '%s' to '%s': %s\n",
+                            src, dst_path, strerror(errno));
+                    exit_status = 1;
+                }
+            }
+        } else {
+            fprintf(stderr, "mv: cannot move '%s' to '%s': %s\n",
+                    src, dst_path, strerror(errno));
+            exit_status = 1;
+        }
+    }
+
+    return exit_status;
+}
+
+U0 GnuMvRegister()
+{
+    "GNU 'mv' utility loaded.\n";
+}

@@ -1,0 +1,717 @@
+// DiscordEvents.ZC - Extended Discord Event Handlers for ZealOS
+// Part of ZealOS Discord implementation
+// Provides handlers for guild, member, reaction, interaction, and other events
+
+// ============================================================================
+// EVENT REGISTRATION FUNCTIONS
+// ============================================================================
+
+// Message Events
+U0 DiscordOnMessageUpdate(CDiscordClient *client, DiscordOnMessageUpdate callback)
+{
+	client->on_message_update = callback;
+}
+
+U0 DiscordOnMessageDelete(CDiscordClient *client, DiscordOnMessageDelete callback)
+{
+	client->on_message_delete = callback;
+}
+
+// Guild Events
+U0 DiscordOnGuildCreate(CDiscordClient *client, DiscordOnGuildCreate callback)
+{
+	client->on_guild_create = callback;
+}
+
+U0 DiscordOnGuildUpdate(CDiscordClient *client, DiscordOnGuildUpdate callback)
+{
+	client->on_guild_update = callback;
+}
+
+U0 DiscordOnGuildDelete(CDiscordClient *client, DiscordOnGuildDelete callback)
+{
+	client->on_guild_delete = callback;
+}
+
+// Member Events
+U0 DiscordOnMemberAdd(CDiscordClient *client, DiscordOnMemberAdd callback)
+{
+	client->on_member_add = callback;
+}
+
+U0 DiscordOnMemberRemove(CDiscordClient *client, DiscordOnMemberRemove callback)
+{
+	client->on_member_remove = callback;
+}
+
+U0 DiscordOnMemberUpdate(CDiscordClient *client, DiscordOnMemberUpdate callback)
+{
+	client->on_member_update = callback;
+}
+
+// Reaction Events
+U0 DiscordOnReactionAdd(CDiscordClient *client, DiscordOnReactionAdd callback)
+{
+	client->on_reaction_add = callback;
+}
+
+U0 DiscordOnReactionRemove(CDiscordClient *client, DiscordOnReactionRemove callback)
+{
+	client->on_reaction_remove = callback;
+}
+
+U0 DiscordOnReactionRemoveAll(CDiscordClient *client, DiscordOnReactionRemoveAll callback)
+{
+	client->on_reaction_remove_all = callback;
+}
+
+// Interaction Events
+U0 DiscordOnInteraction(CDiscordClient *client, DiscordOnInteraction callback)
+{
+	client->on_interaction = callback;
+}
+
+// Typing Events
+U0 DiscordOnTypingStart(CDiscordClient *client, DiscordOnTypingStart callback)
+{
+	client->on_typing_start = callback;
+}
+
+// Presence Events
+U0 DiscordOnPresenceUpdate(CDiscordClient *client, DiscordOnPresenceUpdate callback)
+{
+	client->on_presence_update = callback;
+}
+
+// ============================================================================
+// HELPER FUNCTIONS
+// ============================================================================
+
+// Parse emoji from JSON
+U0 DiscordParseEmoji(CJSONValue *json, CDiscordEmoji *emoji)
+{
+	if (!json || !emoji) return;
+
+	emoji->id = JSONAsSnowflake(JSONObjectGet(json, "id"));
+	U8 *name = JSONAsString(JSONObjectGet(json, "name"));
+	if (name) {
+		emoji->name = StrNew(name);
+	}
+	emoji->animated = JSONAsBool(JSONObjectGet(json, "animated"));
+}
+
+// Free emoji resources
+U0 DiscordFreeEmoji(CDiscordEmoji *emoji)
+{
+	if (emoji->name) {
+		Free(emoji->name);
+		emoji->name = NULL;
+	}
+}
+
+// Parse user from JSON
+U0 DiscordParseUser(CJSONValue *json, CDiscordUser *user)
+{
+	if (!json || !user) return;
+
+	user->id = JSONAsSnowflake(JSONObjectGet(json, "id"));
+	U8 *username = JSONAsString(JSONObjectGet(json, "username"));
+	if (username) {
+		user->username = StrNew(username);
+	}
+	U8 *discrim = JSONAsString(JSONObjectGet(json, "discriminator"));
+	if (discrim) {
+		user->discriminator = StrNew(discrim);
+	}
+	U8 *avatar = JSONAsString(JSONObjectGet(json, "avatar"));
+	if (avatar) {
+		user->avatar = StrNew(avatar);
+	}
+	user->bot = JSONAsBool(JSONObjectGet(json, "bot"));
+}
+
+// Free user resources
+U0 DiscordFreeUser(CDiscordUser *user)
+{
+	if (user->username) {
+		Free(user->username);
+		user->username = NULL;
+	}
+	if (user->discriminator) {
+		Free(user->discriminator);
+		user->discriminator = NULL;
+	}
+	if (user->avatar) {
+		Free(user->avatar);
+		user->avatar = NULL;
+	}
+}
+
+// Parse guild from JSON
+U0 DiscordParseGuild(CJSONValue *json, CDiscordGuild *guild)
+{
+	if (!json || !guild) return;
+
+	guild->id = JSONAsSnowflake(JSONObjectGet(json, "id"));
+	U8 *name = JSONAsString(JSONObjectGet(json, "name"));
+	if (name) {
+		guild->name = StrNew(name);
+	}
+	U8 *icon = JSONAsString(JSONObjectGet(json, "icon"));
+	if (icon) {
+		guild->icon = StrNew(icon);
+	}
+	guild->owner_id = JSONAsSnowflake(JSONObjectGet(json, "owner_id"));
+	guild->member_count = JSONAsInt(JSONObjectGet(json, "member_count"));
+	U8 *desc = JSONAsString(JSONObjectGet(json, "description"));
+	if (desc) {
+		guild->description = StrNew(desc);
+	}
+	guild->unavailable = JSONAsBool(JSONObjectGet(json, "unavailable"));
+}
+
+// Free guild resources
+U0 DiscordFreeGuild(CDiscordGuild *guild)
+{
+	if (guild->name) {
+		Free(guild->name);
+		guild->name = NULL;
+	}
+	if (guild->icon) {
+		Free(guild->icon);
+		guild->icon = NULL;
+	}
+	if (guild->description) {
+		Free(guild->description);
+		guild->description = NULL;
+	}
+}
+
+// Parse member from JSON
+U0 DiscordParseMember(CJSONValue *json, CDiscordMember *member)
+{
+	I64 i;
+	if (!json || !member) return;
+
+	// Parse user sub-object
+	CJSONValue *user_json = JSONObjectGet(json, "user");
+	if (user_json) {
+		DiscordParseUser(user_json, &member->user);
+	}
+
+	// Nick
+	U8 *nick = JSONAsString(JSONObjectGet(json, "nick"));
+	if (nick) {
+		member->nick = StrNew(nick);
+	}
+
+	// Roles array
+	CJSONValue *roles_arr = JSONObjectGet(json, "roles");
+	if (roles_arr && JSONIsArray(roles_arr)) {
+		member->role_count = JSONArraySize(roles_arr);
+		if (member->role_count > 0) {
+			member->roles = MAlloc(member->role_count * sizeof(CDiscordSnowflake));
+			for (i = 0; i < member->role_count; i++) {
+				member->roles[i] = JSONAsSnowflake(JSONArrayGet(roles_arr, i));
+			}
+		}
+	}
+
+	member->deaf = JSONAsBool(JSONObjectGet(json, "deaf"));
+	member->mute = JSONAsBool(JSONObjectGet(json, "mute"));
+}
+
+// Free member resources
+U0 DiscordFreeMember(CDiscordMember *member)
+{
+	DiscordFreeUser(&member->user);
+	if (member->nick) {
+		Free(member->nick);
+		member->nick = NULL;
+	}
+	if (member->roles) {
+		Free(member->roles);
+		member->roles = NULL;
+	}
+}
+
+// ============================================================================
+// CORE EVENT HANDLERS (READY, MESSAGE_CREATE)
+// ============================================================================
+
+// Parse and handle READY event
+U0 DiscordHandleReady(CDiscordClient *client, CJSONValue *data)
+{
+	// Extract session_id
+	U8 *session = JSONAsString(JSONObjectGet(data, "session_id"));
+	if (session) {
+		if (client->session_id) Free(client->session_id);
+		client->session_id = StrNew(session);
+	}
+
+	// Extract resume_gateway_url
+	U8 *resume_url = JSONAsString(JSONObjectGet(data, "resume_gateway_url"));
+	if (resume_url) {
+		if (client->resume_gateway_url) Free(client->resume_gateway_url);
+		client->resume_gateway_url = StrNew(resume_url);
+	}
+
+	// Extract user info
+	CJSONValue *user_obj = JSONObjectGet(data, "user");
+	if (user_obj) {
+		client->self.id = JSONAsSnowflake(JSONObjectGet(user_obj, "id"));
+
+		if (client->self.username) Free(client->self.username);
+		U8 *username = JSONAsString(JSONObjectGet(user_obj, "username"));
+		client->self.username = username ? StrNew(username) : NULL;
+
+		if (client->self.discriminator) Free(client->self.discriminator);
+		U8 *discrim = JSONAsString(JSONObjectGet(user_obj, "discriminator"));
+		client->self.discriminator = discrim ? StrNew(discrim) : NULL;
+
+		if (client->self.avatar) Free(client->self.avatar);
+		U8 *avatar = JSONAsString(JSONObjectGet(user_obj, "avatar"));
+		client->self.avatar = avatar ? StrNew(avatar) : NULL;
+
+		client->self.bot = JSONAsBool(JSONObjectGet(user_obj, "bot"));
+	}
+
+	client->state = DISCORD_STATE_CONNECTED;
+
+	// Call user callback
+	if (client->on_ready) {
+		client->on_ready(client, &client->self);
+	}
+}
+
+// Parse and handle MESSAGE_CREATE event
+U0 DiscordHandleMessage(CDiscordClient *client, CJSONValue *data)
+{
+	if (!client->on_message) return;
+
+	CDiscordMessage msg;
+	MemSet(&msg, 0, sizeof(CDiscordMessage));
+
+	msg.id = JSONAsSnowflake(JSONObjectGet(data, "id"));
+	msg.channel_id = JSONAsSnowflake(JSONObjectGet(data, "channel_id"));
+	msg.guild_id = JSONAsSnowflake(JSONObjectGet(data, "guild_id"));
+
+	U8 *content = JSONAsString(JSONObjectGet(data, "content"));
+	msg.content = content ? StrNew(content) : NULL;
+
+	msg.mention_everyone = JSONAsBool(JSONObjectGet(data, "mention_everyone"));
+
+	// Parse author
+	CJSONValue *author_obj = JSONObjectGet(data, "author");
+	if (author_obj) {
+		msg.author.id = JSONAsSnowflake(JSONObjectGet(author_obj, "id"));
+		U8 *username = JSONAsString(JSONObjectGet(author_obj, "username"));
+		msg.author.username = username ? StrNew(username) : NULL;
+		U8 *discrim = JSONAsString(JSONObjectGet(author_obj, "discriminator"));
+		msg.author.discriminator = discrim ? StrNew(discrim) : NULL;
+		msg.author.bot = JSONAsBool(JSONObjectGet(author_obj, "bot"));
+	}
+
+	// Call user callback
+	client->on_message(client, &msg);
+
+	// Cleanup
+	if (msg.content) Free(msg.content);
+	if (msg.author.username) Free(msg.author.username);
+	if (msg.author.discriminator) Free(msg.author.discriminator);
+}
+
+// ============================================================================
+// EXTENDED EVENT HANDLERS
+// ============================================================================
+
+// Handle MESSAGE_UPDATE event
+U0 DiscordHandleMessageUpdate(CDiscordClient *client, CJSONValue *data)
+{
+	if (!client->on_message_update) return;
+
+	CDiscordMessage msg;
+	MemSet(&msg, 0, sizeof(CDiscordMessage));
+
+	msg.id = JSONAsSnowflake(JSONObjectGet(data, "id"));
+	msg.channel_id = JSONAsSnowflake(JSONObjectGet(data, "channel_id"));
+	msg.guild_id = JSONAsSnowflake(JSONObjectGet(data, "guild_id"));
+
+	U8 *content = JSONAsString(JSONObjectGet(data, "content"));
+	if (content) {
+		msg.content = StrNew(content);
+	}
+
+	// Parse author if present
+	CJSONValue *author_json = JSONObjectGet(data, "author");
+	if (author_json) {
+		DiscordParseUser(author_json, &msg.author);
+	}
+
+	client->on_message_update(client, &msg);
+
+	// Cleanup
+	if (msg.content) Free(msg.content);
+	DiscordFreeUser(&msg.author);
+}
+
+// Handle MESSAGE_DELETE event
+U0 DiscordHandleMessageDelete(CDiscordClient *client, CJSONValue *data)
+{
+	if (!client->on_message_delete) return;
+
+	CDiscordSnowflake channel_id = JSONAsSnowflake(JSONObjectGet(data, "channel_id"));
+	CDiscordSnowflake message_id = JSONAsSnowflake(JSONObjectGet(data, "id"));
+	CDiscordSnowflake guild_id = JSONAsSnowflake(JSONObjectGet(data, "guild_id"));
+
+	client->on_message_delete(client, channel_id, message_id, guild_id);
+}
+
+// Handle GUILD_CREATE event
+U0 DiscordHandleGuildCreate(CDiscordClient *client, CJSONValue *data)
+{
+	if (!client->on_guild_create) return;
+
+	CDiscordGuild guild;
+	MemSet(&guild, 0, sizeof(CDiscordGuild));
+
+	DiscordParseGuild(data, &guild);
+
+	client->on_guild_create(client, &guild);
+
+	DiscordFreeGuild(&guild);
+}
+
+// Handle GUILD_UPDATE event
+U0 DiscordHandleGuildUpdate(CDiscordClient *client, CJSONValue *data)
+{
+	if (!client->on_guild_update) return;
+
+	CDiscordGuild guild;
+	MemSet(&guild, 0, sizeof(CDiscordGuild));
+
+	DiscordParseGuild(data, &guild);
+
+	client->on_guild_update(client, &guild);
+
+	DiscordFreeGuild(&guild);
+}
+
+// Handle GUILD_DELETE event
+U0 DiscordHandleGuildDelete(CDiscordClient *client, CJSONValue *data)
+{
+	if (!client->on_guild_delete) return;
+
+	CDiscordSnowflake guild_id = JSONAsSnowflake(JSONObjectGet(data, "id"));
+
+	client->on_guild_delete(client, guild_id);
+}
+
+// Handle GUILD_MEMBER_ADD event
+U0 DiscordHandleMemberAdd(CDiscordClient *client, CJSONValue *data)
+{
+	if (!client->on_member_add) return;
+
+	CDiscordSnowflake guild_id = JSONAsSnowflake(JSONObjectGet(data, "guild_id"));
+
+	CDiscordMember member;
+	MemSet(&member, 0, sizeof(CDiscordMember));
+
+	DiscordParseMember(data, &member);
+
+	client->on_member_add(client, guild_id, &member);
+
+	DiscordFreeMember(&member);
+}
+
+// Handle GUILD_MEMBER_REMOVE event
+U0 DiscordHandleMemberRemove(CDiscordClient *client, CJSONValue *data)
+{
+	if (!client->on_member_remove) return;
+
+	CDiscordSnowflake guild_id = JSONAsSnowflake(JSONObjectGet(data, "guild_id"));
+
+	CDiscordUser user;
+	MemSet(&user, 0, sizeof(CDiscordUser));
+
+	CJSONValue *user_json = JSONObjectGet(data, "user");
+	if (user_json) {
+		DiscordParseUser(user_json, &user);
+	}
+
+	client->on_member_remove(client, guild_id, &user);
+
+	DiscordFreeUser(&user);
+}
+
+// Handle GUILD_MEMBER_UPDATE event
+U0 DiscordHandleMemberUpdate(CDiscordClient *client, CJSONValue *data)
+{
+	if (!client->on_member_update) return;
+
+	CDiscordSnowflake guild_id = JSONAsSnowflake(JSONObjectGet(data, "guild_id"));
+
+	CDiscordMember member;
+	MemSet(&member, 0, sizeof(CDiscordMember));
+
+	// Parse user
+	CJSONValue *user_json = JSONObjectGet(data, "user");
+	if (user_json) {
+		DiscordParseUser(user_json, &member.user);
+	}
+
+	// Nick
+	U8 *nick = JSONAsString(JSONObjectGet(data, "nick"));
+	if (nick) {
+		member.nick = StrNew(nick);
+	}
+
+	// Roles array
+	CJSONValue *roles_arr = JSONObjectGet(data, "roles");
+	if (roles_arr && JSONIsArray(roles_arr)) {
+		member.role_count = JSONArraySize(roles_arr);
+		if (member.role_count > 0) {
+			I64 i;
+			member.roles = MAlloc(member.role_count * sizeof(CDiscordSnowflake));
+			for (i = 0; i < member.role_count; i++) {
+				member.roles[i] = JSONAsSnowflake(JSONArrayGet(roles_arr, i));
+			}
+		}
+	}
+
+	client->on_member_update(client, guild_id, &member);
+
+	DiscordFreeMember(&member);
+}
+
+// Handle MESSAGE_REACTION_ADD event
+U0 DiscordHandleReactionAdd(CDiscordClient *client, CJSONValue *data)
+{
+	if (!client->on_reaction_add) return;
+
+	CDiscordReaction reaction;
+	MemSet(&reaction, 0, sizeof(CDiscordReaction));
+
+	reaction.user_id = JSONAsSnowflake(JSONObjectGet(data, "user_id"));
+	reaction.channel_id = JSONAsSnowflake(JSONObjectGet(data, "channel_id"));
+	reaction.message_id = JSONAsSnowflake(JSONObjectGet(data, "message_id"));
+	reaction.guild_id = JSONAsSnowflake(JSONObjectGet(data, "guild_id"));
+
+	CJSONValue *emoji_json = JSONObjectGet(data, "emoji");
+	if (emoji_json) {
+		DiscordParseEmoji(emoji_json, &reaction.emoji);
+	}
+
+	client->on_reaction_add(client, &reaction);
+
+	DiscordFreeEmoji(&reaction.emoji);
+}
+
+// Handle MESSAGE_REACTION_REMOVE event
+U0 DiscordHandleReactionRemove(CDiscordClient *client, CJSONValue *data)
+{
+	if (!client->on_reaction_remove) return;
+
+	CDiscordReaction reaction;
+	MemSet(&reaction, 0, sizeof(CDiscordReaction));
+
+	reaction.user_id = JSONAsSnowflake(JSONObjectGet(data, "user_id"));
+	reaction.channel_id = JSONAsSnowflake(JSONObjectGet(data, "channel_id"));
+	reaction.message_id = JSONAsSnowflake(JSONObjectGet(data, "message_id"));
+	reaction.guild_id = JSONAsSnowflake(JSONObjectGet(data, "guild_id"));
+
+	CJSONValue *emoji_json = JSONObjectGet(data, "emoji");
+	if (emoji_json) {
+		DiscordParseEmoji(emoji_json, &reaction.emoji);
+	}
+
+	client->on_reaction_remove(client, &reaction);
+
+	DiscordFreeEmoji(&reaction.emoji);
+}
+
+// Handle MESSAGE_REACTION_REMOVE_ALL event
+U0 DiscordHandleReactionRemoveAll(CDiscordClient *client, CJSONValue *data)
+{
+	if (!client->on_reaction_remove_all) return;
+
+	CDiscordSnowflake channel_id = JSONAsSnowflake(JSONObjectGet(data, "channel_id"));
+	CDiscordSnowflake message_id = JSONAsSnowflake(JSONObjectGet(data, "message_id"));
+	CDiscordSnowflake guild_id = JSONAsSnowflake(JSONObjectGet(data, "guild_id"));
+
+	client->on_reaction_remove_all(client, channel_id, message_id, guild_id);
+}
+
+// Handle TYPING_START event
+U0 DiscordHandleTypingStart(CDiscordClient *client, CJSONValue *data)
+{
+	if (!client->on_typing_start) return;
+
+	CDiscordTyping typing;
+	MemSet(&typing, 0, sizeof(CDiscordTyping));
+
+	typing.channel_id = JSONAsSnowflake(JSONObjectGet(data, "channel_id"));
+	typing.guild_id = JSONAsSnowflake(JSONObjectGet(data, "guild_id"));
+	typing.user_id = JSONAsSnowflake(JSONObjectGet(data, "user_id"));
+	typing.timestamp = JSONAsInt(JSONObjectGet(data, "timestamp"));
+
+	client->on_typing_start(client, &typing);
+}
+
+// Handle PRESENCE_UPDATE event
+U0 DiscordHandlePresenceUpdate(CDiscordClient *client, CJSONValue *data)
+{
+	if (!client->on_presence_update) return;
+
+	CDiscordPresence presence;
+	MemSet(&presence, 0, sizeof(CDiscordPresence));
+
+	// Parse user
+	CJSONValue *user_json = JSONObjectGet(data, "user");
+	if (user_json) {
+		DiscordParseUser(user_json, &presence.user);
+	}
+
+	presence.guild_id = JSONAsSnowflake(JSONObjectGet(data, "guild_id"));
+
+	// Parse status
+	U8 *status_str = JSONAsString(JSONObjectGet(data, "status"));
+	if (status_str) {
+		if (StrCmp(status_str, "online") == 0) {
+			presence.status = DISCORD_STATUS_ONLINE;
+		} else if (StrCmp(status_str, "dnd") == 0) {
+			presence.status = DISCORD_STATUS_DND;
+		} else if (StrCmp(status_str, "idle") == 0) {
+			presence.status = DISCORD_STATUS_IDLE;
+		} else if (StrCmp(status_str, "invisible") == 0) {
+			presence.status = DISCORD_STATUS_INVISIBLE;
+		} else {
+			presence.status = DISCORD_STATUS_OFFLINE;
+		}
+	}
+
+	client->on_presence_update(client, &presence);
+
+	DiscordFreeUser(&presence.user);
+}
+
+// Handle INTERACTION_CREATE event
+U0 DiscordHandleInteractionCreate(CDiscordClient *client, CJSONValue *data)
+{
+	I64 i;
+	if (!client->on_interaction) return;
+
+	CDiscordInteraction interaction;
+	MemSet(&interaction, 0, sizeof(CDiscordInteraction));
+
+	interaction.id = JSONAsSnowflake(JSONObjectGet(data, "id"));
+	interaction.application_id = JSONAsSnowflake(JSONObjectGet(data, "application_id"));
+	interaction.type = JSONAsInt(JSONObjectGet(data, "type"));
+	interaction.guild_id = JSONAsSnowflake(JSONObjectGet(data, "guild_id"));
+	interaction.channel_id = JSONAsSnowflake(JSONObjectGet(data, "channel_id"));
+
+	// Token for responding
+	U8 *token = JSONAsString(JSONObjectGet(data, "token"));
+	if (token) {
+		interaction.token = StrNew(token);
+	}
+
+	// Parse interaction data
+	CJSONValue *int_data = JSONObjectGet(data, "data");
+	if (int_data) {
+		interaction.data.id = JSONAsSnowflake(JSONObjectGet(int_data, "id"));
+		U8 *name = JSONAsString(JSONObjectGet(int_data, "name"));
+		if (name) {
+			interaction.data.name = StrNew(name);
+		}
+		interaction.data.type = JSONAsInt(JSONObjectGet(int_data, "type"));
+
+		U8 *custom_id = JSONAsString(JSONObjectGet(int_data, "custom_id"));
+		if (custom_id) {
+			interaction.data.custom_id = StrNew(custom_id);
+		}
+
+		// Parse options
+		CJSONValue *options_arr = JSONObjectGet(int_data, "options");
+		if (options_arr && JSONIsArray(options_arr)) {
+			interaction.data.option_count = JSONArraySize(options_arr);
+			if (interaction.data.option_count > 0) {
+				interaction.data.options = MAlloc(
+					interaction.data.option_count * sizeof(CDiscordInteractionOption)
+				);
+				MemSet(interaction.data.options, 0,
+					interaction.data.option_count * sizeof(CDiscordInteractionOption));
+
+				for (i = 0; i < interaction.data.option_count; i++) {
+					CJSONValue *opt = JSONArrayGet(options_arr, i);
+					CDiscordInteractionOption *out_opt = &interaction.data.options[i];
+
+					U8 *opt_name = JSONAsString(JSONObjectGet(opt, "name"));
+					if (opt_name) {
+						out_opt->name = StrNew(opt_name);
+					}
+					out_opt->type = JSONAsInt(JSONObjectGet(opt, "type"));
+
+					// Get value based on type
+					CJSONValue *value = JSONObjectGet(opt, "value");
+					if (value) {
+						switch (out_opt->type) {
+							case DISCORD_OPTION_STRING:
+								{
+									U8 *str_val = JSONAsString(value);
+									if (str_val) {
+										out_opt->string_val = StrNew(str_val);
+									}
+								}
+								break;
+							case DISCORD_OPTION_INTEGER:
+							case DISCORD_OPTION_BOOLEAN:
+							case DISCORD_OPTION_NUMBER:
+								out_opt->int_val = JSONAsInt(value);
+								break;
+							case DISCORD_OPTION_USER:
+							case DISCORD_OPTION_CHANNEL:
+							case DISCORD_OPTION_ROLE:
+							case DISCORD_OPTION_MENTIONABLE:
+								out_opt->snowflake_val = JSONAsSnowflake(value);
+								break;
+						}
+					}
+				}
+			}
+		}
+	}
+
+	// Parse member (for guild interactions)
+	CJSONValue *member_json = JSONObjectGet(data, "member");
+	if (member_json) {
+		DiscordParseMember(member_json, &interaction.member);
+	}
+
+	// Parse user (for DM interactions)
+	CJSONValue *user_json = JSONObjectGet(data, "user");
+	if (user_json) {
+		DiscordParseUser(user_json, &interaction.user);
+	}
+
+	client->on_interaction(client, &interaction);
+
+	// Cleanup
+	if (interaction.token) Free(interaction.token);
+	if (interaction.data.name) Free(interaction.data.name);
+	if (interaction.data.custom_id) Free(interaction.data.custom_id);
+	if (interaction.data.options) {
+		for (i = 0; i < interaction.data.option_count; i++) {
+			if (interaction.data.options[i].name) {
+				Free(interaction.data.options[i].name);
+			}
+			if (interaction.data.options[i].string_val) {
+				Free(interaction.data.options[i].string_val);
+			}
+		}
+		Free(interaction.data.options);
+	}
+	DiscordFreeMember(&interaction.member);
+	DiscordFreeUser(&interaction.user);
+}
+

@@ -1,0 +1,284 @@
+// tr.ZC - GNU coreutils 'tr' implementation
+// Translate or delete characters
+
+#define TR_BUF_SIZE 4096
+
+// C-style main function
+I64 tr_main(I64 argc, U8 **argv)
+{
+    Bool complement = FALSE;     // -c/-C
+    Bool delete_chars = FALSE;   // -d
+    Bool squeeze = FALSE;        // -s
+    Bool truncate_set = FALSE;   // -t
+    I64 start = 1;
+
+    // Parse options
+    while (start < argc && argv[start][0] == '-' && argv[start][1]) {
+        U8 *arg = argv[start];
+
+        if (strcmp(arg, "--help") == 0) {
+            printf("Usage: tr [OPTION]... SET1 [SET2]\n");
+            printf("Translate, squeeze, and/or delete characters from standard input,\n");
+            printf("writing to standard output.\n\n");
+            printf("  -c, -C, --complement    use the complement of SET1\n");
+            printf("  -d, --delete            delete characters in SET1, do not translate\n");
+            printf("  -s, --squeeze-repeats   replace each input sequence of a repeated char\n");
+            printf("                          in SET1 with a single occurrence of that char\n");
+            printf("  -t, --truncate-set1     first truncate SET1 to length of SET2\n");
+            printf("      --help              display this help and exit\n");
+            printf("      --version           output version information and exit\n");
+            printf("\nSETs are strings of characters. Special sequences:\n");
+            printf("  \\\\NNN   character with octal value NNN\n");
+            printf("  \\\\n     newline, \\\\r carriage return, \\\\t tab\n");
+            printf("  CHAR1-CHAR2  all characters from CHAR1 to CHAR2 in ascending order\n");
+            printf("  [:alnum:]  all letters and digits\n");
+            printf("  [:alpha:]  all letters\n");
+            printf("  [:digit:]  all digits\n");
+            printf("  [:lower:]  all lower case letters\n");
+            printf("  [:upper:]  all upper case letters\n");
+            printf("  [:space:]  all whitespace\n");
+            return 0;
+        }
+
+        if (strcmp(arg, "--version") == 0) {
+            printf("tr (ZealOS coreutils) 1.0\n");
+            return 0;
+        }
+
+        if (strcmp(arg, "-c") == 0 || strcmp(arg, "-C") == 0 ||
+            strcmp(arg, "--complement") == 0) {
+            complement = TRUE; start++; continue;
+        }
+
+        if (strcmp(arg, "-d") == 0 || strcmp(arg, "--delete") == 0) {
+            delete_chars = TRUE; start++; continue;
+        }
+
+        if (strcmp(arg, "-s") == 0 || strcmp(arg, "--squeeze-repeats") == 0) {
+            squeeze = TRUE; start++; continue;
+        }
+
+        if (strcmp(arg, "-t") == 0 || strcmp(arg, "--truncate-set1") == 0) {
+            truncate_set = TRUE; start++; continue;
+        }
+
+        // Combined options
+        if (arg[0] == '-' && arg[1] != '-') {
+            for (I64 i = 1; arg[i]; i++) {
+                switch (arg[i]) {
+                    case 'c':
+                    case 'C': complement = TRUE; break;
+                    case 'd': delete_chars = TRUE; break;
+                    case 's': squeeze = TRUE; break;
+                    case 't': truncate_set = TRUE; break;
+                    default:
+                        fprintf(stderr, "tr: invalid option -- '%c'\n", arg[i]);
+                        return 1;
+                }
+            }
+            start++;
+            continue;
+        }
+
+        if (strcmp(arg, "--") == 0) {
+            start++;
+            break;
+        }
+
+        break;
+    }
+
+    if (start >= argc) {
+        fprintf(stderr, "tr: missing operand\n");
+        return 1;
+    }
+
+    // Expand a set specification into a character array
+    // Returns allocated buffer and sets *out_len
+    auto expand_set = [](U8 *spec) -> U8* {
+        U8 *result = MAlloc(512);  // Max 256 chars possible
+        I64 pos = 0;
+        U8 *p = spec;
+
+        while (*p && pos < 511) {
+            // Check for character class
+            if (*p == '[' && *(p+1) == ':') {
+                U8 *class_end = strstr(p, ":]");
+                if (class_end) {
+                    U8 class_name[32];
+                    I64 len = class_end - p - 2;
+                    if (len > 0 && len < 31) {
+                        strncpy(class_name, p + 2, len);
+                        class_name[len] = 0;
+
+                        if (strcmp(class_name, "alnum") == 0) {
+                            for (I64 c = '0'; c <= '9' && pos < 511; c++) result[pos++] = c;
+                            for (I64 c = 'A'; c <= 'Z' && pos < 511; c++) result[pos++] = c;
+                            for (I64 c = 'a'; c <= 'z' && pos < 511; c++) result[pos++] = c;
+                        } else if (strcmp(class_name, "alpha") == 0) {
+                            for (I64 c = 'A'; c <= 'Z' && pos < 511; c++) result[pos++] = c;
+                            for (I64 c = 'a'; c <= 'z' && pos < 511; c++) result[pos++] = c;
+                        } else if (strcmp(class_name, "digit") == 0) {
+                            for (I64 c = '0'; c <= '9' && pos < 511; c++) result[pos++] = c;
+                        } else if (strcmp(class_name, "lower") == 0) {
+                            for (I64 c = 'a'; c <= 'z' && pos < 511; c++) result[pos++] = c;
+                        } else if (strcmp(class_name, "upper") == 0) {
+                            for (I64 c = 'A'; c <= 'Z' && pos < 511; c++) result[pos++] = c;
+                        } else if (strcmp(class_name, "space") == 0) {
+                            result[pos++] = ' ';
+                            result[pos++] = '\t';
+                            result[pos++] = '\n';
+                            result[pos++] = '\r';
+                            result[pos++] = '\f';
+                            result[pos++] = '\v';
+                        } else if (strcmp(class_name, "blank") == 0) {
+                            result[pos++] = ' ';
+                            result[pos++] = '\t';
+                        } else if (strcmp(class_name, "punct") == 0) {
+                            for (I64 c = 33; c <= 47 && pos < 511; c++) result[pos++] = c;
+                            for (I64 c = 58; c <= 64 && pos < 511; c++) result[pos++] = c;
+                            for (I64 c = 91; c <= 96 && pos < 511; c++) result[pos++] = c;
+                            for (I64 c = 123; c <= 126 && pos < 511; c++) result[pos++] = c;
+                        }
+                    }
+                    p = class_end + 2;
+                    continue;
+                }
+            }
+
+            // Check for escape sequence
+            if (*p == '\\' && *(p+1)) {
+                p++;
+                switch (*p) {
+                    case 'n': result[pos++] = '\n'; break;
+                    case 't': result[pos++] = '\t'; break;
+                    case 'r': result[pos++] = '\r'; break;
+                    case 'f': result[pos++] = '\f'; break;
+                    case 'v': result[pos++] = '\v'; break;
+                    case '\\': result[pos++] = '\\'; break;
+                    case '0': case '1': case '2': case '3':
+                    case '4': case '5': case '6': case '7': {
+                        // Octal
+                        I64 val = 0;
+                        for (I64 i = 0; i < 3 && *p >= '0' && *p <= '7'; i++) {
+                            val = val * 8 + (*p - '0');
+                            p++;
+                        }
+                        p--;  // Will be incremented below
+                        result[pos++] = val;
+                        break;
+                    }
+                    default:
+                        result[pos++] = *p;
+                }
+                p++;
+                continue;
+            }
+
+            // Check for range
+            if (*(p+1) == '-' && *(p+2)) {
+                U8 c1 = *p;
+                U8 c2 = *(p+2);
+                if (c1 <= c2) {
+                    for (I64 c = c1; c <= c2 && pos < 511; c++) {
+                        result[pos++] = c;
+                    }
+                }
+                p += 3;
+                continue;
+            }
+
+            // Regular character
+            result[pos++] = *p++;
+        }
+
+        result[pos] = 0;
+        return result;
+    };
+
+    U8 *set1_spec = argv[start];
+    U8 *set2_spec = (start + 1 < argc) ? argv[start + 1] : NULL;
+
+    U8 *set1 = expand_set(set1_spec);
+    U8 *set2 = set2_spec ? expand_set(set2_spec) : NULL;
+
+    I64 set1_len = strlen(set1);
+    I64 set2_len = set2 ? strlen(set2) : 0;
+
+    // Build translation table
+    U8 trans[256];
+    Bool in_set1[256];
+
+    for (I64 i = 0; i < 256; i++) {
+        trans[i] = i;
+        in_set1[i] = FALSE;
+    }
+
+    // Mark characters in set1
+    for (I64 i = 0; i < set1_len; i++) {
+        in_set1[(U8)set1[i]] = TRUE;
+    }
+
+    // Complement if requested
+    if (complement) {
+        for (I64 i = 0; i < 256; i++) {
+            in_set1[i] = !in_set1[i];
+        }
+    }
+
+    // Build translation mapping
+    if (set2 && !delete_chars) {
+        if (truncate_set) {
+            // Truncate set1 to set2 length
+            if (set1_len > set2_len)
+                set1_len = set2_len;
+        }
+
+        for (I64 i = 0; i < set1_len; i++) {
+            U8 c1 = set1[i];
+            U8 c2;
+            if (i < set2_len) {
+                c2 = set2[i];
+            } else if (set2_len > 0) {
+                c2 = set2[set2_len - 1];  // Extend last char
+            } else {
+                c2 = c1;
+            }
+            trans[c1] = c2;
+        }
+    }
+
+    // Process input
+    I64 c;
+    I64 last_out = -1;
+
+    while ((c = getchar()) != EOF) {
+        Bool is_in_set = complement ? !in_set1[c] : in_set1[c];
+
+        if (delete_chars) {
+            if (!is_in_set) {
+                if (squeeze && c == last_out) continue;
+                putchar(c);
+                last_out = c;
+            }
+        } else {
+            U8 out_c = trans[c];
+            if (squeeze) {
+                Bool is_squeezable = set2 ? (strchr(set2, out_c) != NULL) : is_in_set;
+                if (is_squeezable && out_c == last_out) continue;
+            }
+            putchar(out_c);
+            last_out = out_c;
+        }
+    }
+
+    Free(set1);
+    if (set2) Free(set2);
+
+    return 0;
+}
+
+U0 GnuTrRegister()
+{
+    "GNU 'tr' utility loaded.\n";
+}

@@ -1,0 +1,127 @@
+// basename.ZC - GNU coreutils 'basename' implementation
+// Strip directory and suffix from filenames
+
+// C-style main function
+I64 basename_main(I64 argc, U8 **argv)
+{
+    Bool multiple = FALSE;
+    U8 *suffix = NULL;
+    Bool zero_term = FALSE;
+    I64 start = 1;
+
+    // Parse options
+    while (start < argc && argv[start][0] == '-' && argv[start][1]) {
+        U8 *arg = argv[start];
+
+        if (strcmp(arg, "--help") == 0) {
+            printf("Usage: basename NAME [SUFFIX]\n");
+            printf("  or:  basename OPTION... NAME...\n");
+            printf("Print NAME with any leading directory components removed.\n");
+            printf("If specified, also remove a trailing SUFFIX.\n\n");
+            printf("  -a, --multiple       support multiple arguments and treat each as a NAME\n");
+            printf("  -s, --suffix=SUFFIX  remove a trailing SUFFIX; implies -a\n");
+            printf("  -z, --zero           end each output line with NUL, not newline\n");
+            printf("      --help           display this help and exit\n");
+            printf("      --version        output version information and exit\n");
+            return 0;
+        }
+
+        if (strcmp(arg, "--version") == 0) {
+            printf("basename (ZealOS coreutils) 1.0\n");
+            return 0;
+        }
+
+        if (strcmp(arg, "-a") == 0 || strcmp(arg, "--multiple") == 0) {
+            multiple = TRUE;
+            start++;
+            continue;
+        }
+
+        if (strcmp(arg, "-z") == 0 || strcmp(arg, "--zero") == 0) {
+            zero_term = TRUE;
+            start++;
+            continue;
+        }
+
+        if (strncmp(arg, "-s", 2) == 0) {
+            multiple = TRUE;
+            if (arg[2]) {
+                suffix = &arg[2];
+            } else if (start + 1 < argc) {
+                start++;
+                suffix = argv[start];
+            }
+            start++;
+            continue;
+        }
+
+        if (strncmp(arg, "--suffix=", 9) == 0) {
+            multiple = TRUE;
+            suffix = &arg[9];
+            start++;
+            continue;
+        }
+
+        if (strcmp(arg, "--") == 0) {
+            start++;
+            break;
+        }
+
+        break;
+    }
+
+    if (start >= argc) {
+        fprintf(stderr, "basename: missing operand\n");
+        return 1;
+    }
+
+    // Process basename for a single name
+    auto do_basename = [](U8 *name, U8 *suffix, Bool zero) {
+        U8 *base = name;
+
+        // Find last slash
+        U8 *p = strrchr(name, '/');
+        if (p)
+            base = p + 1;
+
+        // Handle trailing slashes
+        I64 len = strlen(base);
+        while (len > 1 && base[len - 1] == '/') {
+            len--;
+        }
+
+        // Remove suffix if specified
+        if (suffix && len > strlen(suffix)) {
+            I64 suf_len = strlen(suffix);
+            if (strcmp(&base[len - suf_len], suffix) == 0)
+                len -= suf_len;
+        }
+
+        // Print result
+        for (I64 i = 0; i < len; i++)
+            putchar(base[i]);
+
+        if (zero)
+            putchar(0);
+        else
+            putchar('\n');
+    };
+
+    if (!multiple && argc - start == 2 && !suffix) {
+        // Traditional: basename NAME SUFFIX
+        suffix = argv[start + 1];
+        do_basename(argv[start], suffix, zero_term);
+    } else {
+        // Process each argument
+        for (I64 i = start; i < argc; i++) {
+            do_basename(argv[i], suffix, zero_term);
+        }
+    }
+
+    return 0;
+}
+
+U0 GnuBasenameRegister()
+{
+    "GNU 'basename' utility loaded. Run: CRun(&basename_main, \"basename /path/to/file.txt .txt\");\n";
+}

@@ -1,0 +1,19 @@
+// MakeTLS.ZC - TLS module loader for ZealOS
+// Include this file to load TLS functionality
+
+Cd(__DIR__);;
+
+// Load crypto primitives first
+#include "../Crypto/MakeCrypto"
+
+// TLS definitions
+#include "TLS.HH"
+
+// TLS implementation
+#include "TLSRecord"
+#include "TLSHandshake"
+
+// Note: Certificate validation (X509) not implemented yet
+// This implementation trusts servers without cert verification
+
+NetLog("TLS module loaded.");

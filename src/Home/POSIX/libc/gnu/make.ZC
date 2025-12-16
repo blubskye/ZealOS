@@ -1,0 +1,880 @@
+// make.ZC - GNU Make compatible build utility for ZealOS
+// Part of the POSIX compatibility layer
+// Supports basic Makefile syntax for building software
+
+// ============================================================================
+// MAKE CONFIGURATION
+// ============================================================================
+
+#define MAKE_MAX_RULES      512
+#define MAKE_MAX_VARS       256
+#define MAKE_MAX_DEPS       64
+#define MAKE_MAX_CMDS       64
+#define MAKE_LINE_SIZE      4096
+#define MAKE_VAR_SIZE       4096
+#define MAKE_PATH_SIZE      512
+
+// ============================================================================
+// DATA STRUCTURES
+// ============================================================================
+
+// Variable
+class CMakeVar {
+    U8      *name;
+    U8      *value;
+    Bool    is_recursive;   // = vs :=
+    Bool    is_override;    // override directive
+};
+
+// Rule dependency
+class CMakeDep {
+    U8      *target;
+    Bool    is_order_only;  // After | in deps
+};
+
+// Build rule
+class CMakeRule {
+    U8      *target;
+    CMakeDep deps[MAKE_MAX_DEPS];
+    I64     dep_count;
+    U8      *commands[MAKE_MAX_CMDS];
+    I64     cmd_count;
+    Bool    is_phony;
+    Bool    is_precious;
+    Bool    is_pattern;     // Contains %
+    U8      *pattern_stem;  // The % match
+};
+
+// Make state
+class CMakeState {
+    // Variables
+    CMakeVar vars[MAKE_MAX_VARS];
+    I64     var_count;
+
+    // Rules
+    CMakeRule rules[MAKE_MAX_RULES];
+    I64     rule_count;
+
+    // Special rules
+    U8      *default_target;
+    U8      **phony_targets;
+    I64     phony_count;
+
+    // Options
+    Bool    dry_run;        // -n
+    Bool    always_make;    // -B
+    Bool    ignore_errors;  // -i
+    Bool    keep_going;     // -k
+    Bool    silent;         // -s
+    Bool    print_dir;      // -w
+    Bool    debug;          // -d
+    I64     jobs;           // -j
+
+    // State
+    U8      *makefile;
+    U8      *directory;
+    I64     exit_status;
+
+    // Built targets (for cycle detection)
+    U8      *built[MAKE_MAX_RULES];
+    I64     built_count;
+    U8      *building[MAKE_MAX_RULES];  // Currently building (cycle detect)
+    I64     building_count;
+};
+
+// ============================================================================
+// VARIABLE HANDLING
+// ============================================================================
+
+// Find a variable by name
+CMakeVar *MakeVarFind(CMakeState *state, U8 *name)
+{
+    for (I64 i = 0; i < state->var_count; i++) {
+        if (strcmp(state->vars[i].name, name) == 0)
+            return &state->vars[i];
+    }
+    return NULL;
+}
+
+// Set a variable
+U0 MakeVarSet(CMakeState *state, U8 *name, U8 *value, Bool recursive)
+{
+    CMakeVar *var = MakeVarFind(state, name);
+    if (var) {
+        if (var->value)
+            Free(var->value);
+        var->value = strdup(value);
+        var->is_recursive = recursive;
+        return;
+    }
+
+    if (state->var_count >= MAKE_MAX_VARS) {
+        fprintf(stderr, "make: too many variables\n");
+        return;
+    }
+
+    var = &state->vars[state->var_count++];
+    var->name = strdup(name);
+    var->value = strdup(value);
+    var->is_recursive = recursive;
+    var->is_override = FALSE;
+}
+
+// Get variable value
+U8 *MakeVarGet(CMakeState *state, U8 *name)
+{
+    CMakeVar *var = MakeVarFind(state, name);
+    if (var)
+        return var->value;
+    return NULL;
+}
+
+// Expand variables in a string
+U8 *MakeVarExpand(CMakeState *state, U8 *str, U8 *target, U8 *stem)
+{
+    static U8 buf[MAKE_VAR_SIZE];
+    I64 pos = 0;
+    U8 *p = str;
+
+    while (*p && pos < MAKE_VAR_SIZE - 1) {
+        if (*p == '$') {
+            p++;
+            if (*p == '$') {
+                // Escaped $
+                buf[pos++] = '$';
+                p++;
+            } else if (*p == '@') {
+                // $@ = target
+                if (target) {
+                    strcpy(buf + pos, target);
+                    pos += strlen(target);
+                }
+                p++;
+            } else if (*p == '<') {
+                // $< = first prerequisite (would need more context)
+                p++;
+            } else if (*p == '^') {
+                // $^ = all prerequisites (would need more context)
+                p++;
+            } else if (*p == '*') {
+                // $* = stem (pattern match)
+                if (stem) {
+                    strcpy(buf + pos, stem);
+                    pos += strlen(stem);
+                }
+                p++;
+            } else if (*p == '(' || *p == '{') {
+                // $(VAR) or ${VAR}
+                U8 close = (*p == '(') ? ')' : '}';
+                p++;
+                U8 varname[256];
+                I64 vi = 0;
+                while (*p && *p != close && vi < 255)
+                    varname[vi++] = *p++;
+                varname[vi] = 0;
+                if (*p == close)
+                    p++;
+
+                // Check for function calls
+                U8 *colon = strchr(varname, ':');
+                if (colon) {
+                    // Substitution: $(VAR:pattern=replacement)
+                    *colon = 0;
+                    U8 *value = MakeVarGet(state, varname);
+                    if (value) {
+                        // Simple passthrough for now
+                        strcpy(buf + pos, value);
+                        pos += strlen(value);
+                    }
+                } else {
+                    U8 *value = MakeVarGet(state, varname);
+                    if (value) {
+                        // Recursive expansion if needed
+                        if (strchr(value, '$')) {
+                            U8 *expanded = MakeVarExpand(state, value, target, stem);
+                            strcpy(buf + pos, expanded);
+                            pos += strlen(expanded);
+                        } else {
+                            strcpy(buf + pos, value);
+                            pos += strlen(value);
+                        }
+                    }
+                }
+            } else if (isalpha(*p) || *p == '_') {
+                // Single-char variable
+                U8 varname[2] = {*p, 0};
+                p++;
+                U8 *value = MakeVarGet(state, varname);
+                if (value) {
+                    strcpy(buf + pos, value);
+                    pos += strlen(value);
+                }
+            }
+        } else {
+            buf[pos++] = *p++;
+        }
+    }
+    buf[pos] = 0;
+    return buf;
+}
+
+// ============================================================================
+// RULE HANDLING
+// ============================================================================
+
+// Find a rule by target
+CMakeRule *MakeRuleFind(CMakeState *state, U8 *target)
+{
+    for (I64 i = 0; i < state->rule_count; i++) {
+        if (strcmp(state->rules[i].target, target) == 0)
+            return &state->rules[i];
+    }
+    return NULL;
+}
+
+// Find a pattern rule matching target
+CMakeRule *MakePatternFind(CMakeState *state, U8 *target, U8 *stem_out)
+{
+    for (I64 i = 0; i < state->rule_count; i++) {
+        CMakeRule *rule = &state->rules[i];
+        if (!rule->is_pattern)
+            continue;
+
+        // Find % in pattern
+        U8 *pct = strchr(rule->target, '%');
+        if (!pct)
+            continue;
+
+        I64 prefix_len = pct - rule->target;
+        I64 suffix_len = strlen(pct + 1);
+        I64 target_len = strlen(target);
+
+        if (target_len < prefix_len + suffix_len)
+            continue;
+
+        // Check prefix
+        if (prefix_len > 0 && strncmp(target, rule->target, prefix_len) != 0)
+            continue;
+
+        // Check suffix
+        if (suffix_len > 0 && strcmp(target + target_len - suffix_len, pct + 1) != 0)
+            continue;
+
+        // Extract stem
+        I64 stem_len = target_len - prefix_len - suffix_len;
+        strncpy(stem_out, target + prefix_len, stem_len);
+        stem_out[stem_len] = 0;
+
+        return rule;
+    }
+    return NULL;
+}
+
+// Add a new rule
+CMakeRule *MakeRuleAdd(CMakeState *state, U8 *target)
+{
+    if (state->rule_count >= MAKE_MAX_RULES) {
+        fprintf(stderr, "make: too many rules\n");
+        return NULL;
+    }
+
+    CMakeRule *rule = &state->rules[state->rule_count++];
+    MemSet(rule, 0, sizeof(CMakeRule));
+    rule->target = strdup(target);
+    rule->is_pattern = (strchr(target, '%') != NULL);
+
+    // First rule is default target
+    if (!state->default_target && target[0] != '.')
+        state->default_target = rule->target;
+
+    return rule;
+}
+
+// Add dependency to rule
+U0 MakeRuleAddDep(CMakeRule *rule, U8 *dep, Bool order_only)
+{
+    if (rule->dep_count >= MAKE_MAX_DEPS)
+        return;
+
+    rule->deps[rule->dep_count].target = strdup(dep);
+    rule->deps[rule->dep_count].is_order_only = order_only;
+    rule->dep_count++;
+}
+
+// Add command to rule
+U0 MakeRuleAddCmd(CMakeRule *rule, U8 *cmd)
+{
+    if (rule->cmd_count >= MAKE_MAX_CMDS)
+        return;
+
+    rule->commands[rule->cmd_count++] = strdup(cmd);
+}
+
+// ============================================================================
+// MAKEFILE PARSING
+// ============================================================================
+
+// Skip whitespace
+U8 *MakeSkipWS(U8 *p)
+{
+    while (*p == ' ' || *p == '\t')
+        p++;
+    return p;
+}
+
+// Read a word (stops at whitespace, :, =)
+U8 *MakeReadWord(U8 *p, U8 *buf, I64 bufsize)
+{
+    I64 i = 0;
+    while (*p && *p != ' ' && *p != '\t' && *p != ':' && *p != '=' &&
+           *p != '\n' && i < bufsize - 1) {
+        buf[i++] = *p++;
+    }
+    buf[i] = 0;
+    return p;
+}
+
+// Parse a Makefile line
+U0 MakeParseLine(CMakeState *state, U8 *line, CMakeRule **current_rule)
+{
+    U8 *p = line;
+
+    // Skip empty lines and comments
+    p = MakeSkipWS(p);
+    if (*p == 0 || *p == '#' || *p == '\n')
+        return;
+
+    // Recipe line (starts with tab)
+    if (line[0] == '\t') {
+        if (*current_rule) {
+            // Expand and add command
+            U8 *expanded = MakeVarExpand(state, p, (*current_rule)->target, NULL);
+            MakeRuleAddCmd(*current_rule, expanded);
+        }
+        return;
+    }
+
+    // Check for variable assignment
+    U8 *eq = strchr(line, '=');
+    U8 *colon = strchr(line, ':');
+
+    // Variable assignment (= or := or ?= or +=)
+    if (eq && (!colon || eq < colon)) {
+        U8 varname[256];
+        I64 i = 0;
+        p = line;
+
+        // Read variable name
+        while (*p && *p != '=' && *p != ':' && *p != '?' && *p != '+' &&
+               *p != ' ' && *p != '\t' && i < 255) {
+            varname[i++] = *p++;
+        }
+        varname[i] = 0;
+
+        p = MakeSkipWS(p);
+
+        Bool recursive = TRUE;
+        Bool append = FALSE;
+        Bool conditional = FALSE;
+
+        if (*p == ':' && p[1] == '=') {
+            recursive = FALSE;
+            p += 2;
+        } else if (*p == '+' && p[1] == '=') {
+            append = TRUE;
+            p += 2;
+        } else if (*p == '?' && p[1] == '=') {
+            conditional = TRUE;
+            p += 2;
+        } else if (*p == '=') {
+            p++;
+        }
+
+        p = MakeSkipWS(p);
+
+        // Remove trailing newline
+        I64 len = strlen(p);
+        if (len > 0 && p[len-1] == '\n')
+            p[len-1] = 0;
+
+        if (conditional) {
+            if (!MakeVarGet(state, varname))
+                MakeVarSet(state, varname, p, recursive);
+        } else if (append) {
+            U8 *old = MakeVarGet(state, varname);
+            if (old) {
+                U8 newval[MAKE_VAR_SIZE];
+                snprintf(newval, MAKE_VAR_SIZE, "%s %s", old, p);
+                MakeVarSet(state, varname, newval, recursive);
+            } else {
+                MakeVarSet(state, varname, p, recursive);
+            }
+        } else {
+            MakeVarSet(state, varname, p, recursive);
+        }
+
+        *current_rule = NULL;
+        return;
+    }
+
+    // Rule definition (target: deps)
+    if (colon) {
+        // Check for special targets
+        if (strncmp(line, ".PHONY:", 7) == 0) {
+            p = line + 7;
+            p = MakeSkipWS(p);
+            // Mark targets as phony
+            U8 word[256];
+            while (*p && *p != '\n') {
+                p = MakeSkipWS(p);
+                p = MakeReadWord(p, word, 256);
+                if (word[0]) {
+                    CMakeRule *rule = MakeRuleFind(state, word);
+                    if (!rule)
+                        rule = MakeRuleAdd(state, word);
+                    if (rule)
+                        rule->is_phony = TRUE;
+                }
+            }
+            *current_rule = NULL;
+            return;
+        }
+
+        // Parse target(s)
+        U8 target[256];
+        p = MakeReadWord(p, target, 256);
+
+        // Skip to colon
+        p = MakeSkipWS(p);
+        if (*p == ':')
+            p++;
+        // Handle ::
+        if (*p == ':')
+            p++;
+
+        // Find or create rule
+        CMakeRule *rule = MakeRuleFind(state, target);
+        if (!rule)
+            rule = MakeRuleAdd(state, target);
+
+        *current_rule = rule;
+
+        // Parse dependencies
+        Bool order_only = FALSE;
+        p = MakeSkipWS(p);
+
+        U8 dep[256];
+        while (*p && *p != '\n' && *p != '#') {
+            p = MakeSkipWS(p);
+
+            if (*p == '|') {
+                order_only = TRUE;
+                p++;
+                continue;
+            }
+
+            p = MakeReadWord(p, dep, 256);
+            if (dep[0]) {
+                // Expand variables in dependency
+                U8 *expanded = MakeVarExpand(state, dep, target, NULL);
+                MakeRuleAddDep(rule, expanded, order_only);
+            }
+        }
+
+        return;
+    }
+
+    // Include directive
+    if (strncmp(p, "include ", 8) == 0 || strncmp(p, "-include ", 9) == 0) {
+        Bool optional = (p[0] == '-');
+        p = p + (optional ? 9 : 8);
+        p = MakeSkipWS(p);
+
+        U8 filename[MAKE_PATH_SIZE];
+        I64 i = 0;
+        while (*p && *p != '\n' && *p != ' ' && i < MAKE_PATH_SIZE - 1)
+            filename[i++] = *p++;
+        filename[i] = 0;
+
+        // Recursively parse included file
+        // (Would need to implement file reading here)
+        if (!optional) {
+            fprintf(stderr, "make: include not fully implemented\n");
+        }
+        return;
+    }
+}
+
+// Parse a Makefile
+I64 MakeParseMakefile(CMakeState *state, U8 *filename)
+{
+    FILE *fp = fopen(filename, "r");
+    if (!fp) {
+        fprintf(stderr, "make: %s: No such file or directory\n", filename);
+        return -1;
+    }
+
+    U8 line[MAKE_LINE_SIZE];
+    CMakeRule *current_rule = NULL;
+
+    while (fgets(line, MAKE_LINE_SIZE, fp)) {
+        // Handle line continuation
+        I64 len = strlen(line);
+        while (len > 1 && line[len-2] == '\\' && line[len-1] == '\n') {
+            line[len-2] = ' ';
+            if (!fgets(line + len - 1, MAKE_LINE_SIZE - len + 1, fp))
+                break;
+            len = strlen(line);
+        }
+
+        MakeParseLine(state, line, &current_rule);
+    }
+
+    fclose(fp);
+    return 0;
+}
+
+// ============================================================================
+// BUILD EXECUTION
+// ============================================================================
+
+// Check if target is already built
+Bool MakeIsBuilt(CMakeState *state, U8 *target)
+{
+    for (I64 i = 0; i < state->built_count; i++) {
+        if (strcmp(state->built[i], target) == 0)
+            return TRUE;
+    }
+    return FALSE;
+}
+
+// Check if target is currently building (cycle detection)
+Bool MakeIsBuilding(CMakeState *state, U8 *target)
+{
+    for (I64 i = 0; i < state->building_count; i++) {
+        if (strcmp(state->building[i], target) == 0)
+            return TRUE;
+    }
+    return FALSE;
+}
+
+// Mark target as built
+U0 MakeMarkBuilt(CMakeState *state, U8 *target)
+{
+    if (state->built_count < MAKE_MAX_RULES)
+        state->built[state->built_count++] = strdup(target);
+}
+
+// Get file modification time (returns 0 if file doesn't exist)
+U64 MakeGetMtime(U8 *path)
+{
+    CPosixStat st;
+    if (PosixStat(path, &st) < 0)
+        return 0;
+    return st.st_mtime;
+}
+
+// Build a target
+I64 MakeBuild(CMakeState *state, U8 *target)
+{
+    // Check for cycles
+    if (MakeIsBuilding(state, target)) {
+        fprintf(stderr, "make: Circular %s <- %s dependency dropped\n",
+                target, target);
+        return 0;
+    }
+
+    // Already built?
+    if (!state->always_make && MakeIsBuilt(state, target))
+        return 0;
+
+    // Find rule
+    U8 stem[256] = "";
+    CMakeRule *rule = MakeRuleFind(state, target);
+    if (!rule) {
+        rule = MakePatternFind(state, target, stem);
+    }
+
+    // If no rule, check if file exists
+    if (!rule) {
+        if (MakeGetMtime(target) > 0) {
+            MakeMarkBuilt(state, target);
+            return 0;
+        }
+        fprintf(stderr, "make: *** No rule to make target '%s'.  Stop.\n", target);
+        return 2;
+    }
+
+    // Mark as building (cycle detection)
+    state->building[state->building_count++] = target;
+
+    // Build dependencies first
+    Bool need_rebuild = rule->is_phony || state->always_make;
+    U64 target_mtime = MakeGetMtime(target);
+
+    if (target_mtime == 0 && !rule->is_phony)
+        need_rebuild = TRUE;
+
+    for (I64 i = 0; i < rule->dep_count; i++) {
+        U8 *dep = rule->deps[i].target;
+
+        // Expand % in pattern rules
+        if (stem[0] && strchr(dep, '%')) {
+            static U8 expanded_dep[512];
+            U8 *pct = strchr(dep, '%');
+            I64 prefix_len = pct - dep;
+            strncpy(expanded_dep, dep, prefix_len);
+            strcpy(expanded_dep + prefix_len, stem);
+            strcat(expanded_dep, pct + 1);
+            dep = expanded_dep;
+        }
+
+        I64 ret = MakeBuild(state, dep);
+        if (ret != 0) {
+            state->building_count--;
+            if (!state->keep_going)
+                return ret;
+            state->exit_status = ret;
+        }
+
+        // Check if dependency is newer
+        if (!rule->deps[i].is_order_only) {
+            U64 dep_mtime = MakeGetMtime(dep);
+            if (dep_mtime > target_mtime)
+                need_rebuild = TRUE;
+        }
+    }
+
+    // Execute commands if needed
+    if (need_rebuild && rule->cmd_count > 0) {
+        for (I64 i = 0; i < rule->cmd_count; i++) {
+            U8 *cmd = rule->commands[i];
+            U8 *p = cmd;
+
+            // Handle prefix characters
+            Bool silent = state->silent;
+            Bool ignore = state->ignore_errors;
+
+            while (*p == '@' || *p == '-' || *p == '+') {
+                if (*p == '@')
+                    silent = TRUE;
+                else if (*p == '-')
+                    ignore = TRUE;
+                // + means run even in dry-run mode (not implemented)
+                p++;
+            }
+
+            // Expand variables
+            U8 *expanded = MakeVarExpand(state, p, target, stem);
+
+            // Print command
+            if (!silent) {
+                printf("%s\n", expanded);
+            }
+
+            // Execute
+            if (!state->dry_run) {
+                I64 ret = GnuRun(expanded);
+                if (ret != 0 && !ignore) {
+                    fprintf(stderr, "make: *** [%s] Error %d\n", target, ret);
+                    state->building_count--;
+                    if (!state->keep_going)
+                        return 2;
+                    state->exit_status = 2;
+                }
+            }
+        }
+    }
+
+    // Done building
+    state->building_count--;
+    MakeMarkBuilt(state, target);
+
+    return state->exit_status;
+}
+
+// ============================================================================
+// BUILT-IN VARIABLES AND RULES
+// ============================================================================
+
+U0 MakeSetupBuiltins(CMakeState *state)
+{
+    // Standard variables
+    MakeVarSet(state, "MAKE", "make", FALSE);
+    MakeVarSet(state, "CC", "cc", TRUE);
+    MakeVarSet(state, "CXX", "c++", TRUE);
+    MakeVarSet(state, "CPP", "cpp", TRUE);
+    MakeVarSet(state, "AS", "as", TRUE);
+    MakeVarSet(state, "AR", "ar", TRUE);
+    MakeVarSet(state, "LD", "ld", TRUE);
+    MakeVarSet(state, "RM", "rm -f", TRUE);
+
+    MakeVarSet(state, "CFLAGS", "", TRUE);
+    MakeVarSet(state, "CXXFLAGS", "", TRUE);
+    MakeVarSet(state, "CPPFLAGS", "", TRUE);
+    MakeVarSet(state, "LDFLAGS", "", TRUE);
+    MakeVarSet(state, "LDLIBS", "", TRUE);
+
+    // Suffix rules would go here
+    // %.o: %.c
+    // %.o: %.cpp
+    // etc.
+}
+
+// ============================================================================
+// MAIN
+// ============================================================================
+
+U0 make_usage()
+{
+    printf("Usage: make [options] [target] ...\n");
+    printf("Options:\n");
+    printf("  -B, --always-make     Unconditionally make all targets\n");
+    printf("  -C DIR                Change to DIR before doing anything\n");
+    printf("  -d                    Print debugging information\n");
+    printf("  -f FILE               Read FILE as a makefile\n");
+    printf("  -i, --ignore-errors   Ignore errors from commands\n");
+    printf("  -j [N]                Allow N jobs at once (not implemented)\n");
+    printf("  -k, --keep-going      Keep going when some targets can't be made\n");
+    printf("  -n, --dry-run         Don't actually run any commands\n");
+    printf("  -s, --silent          Don't echo commands\n");
+    printf("  -w                    Print working directory\n");
+    printf("  --help                Display this help\n");
+}
+
+I64 make_main(I64 argc, U8 **argv)
+{
+    CMakeState state;
+    MemSet(&state, 0, sizeof(CMakeState));
+
+    state.makefile = NULL;
+    state.jobs = 1;
+
+    // Targets to build
+    U8 *targets[64];
+    I64 target_count = 0;
+
+    // Parse options
+    for (I64 i = 1; i < argc; i++) {
+        U8 *arg = argv[i];
+
+        if (arg[0] == '-') {
+            if (strcmp(arg, "--help") == 0) {
+                make_usage();
+                return 0;
+            } else if (strcmp(arg, "-n") == 0 || strcmp(arg, "--dry-run") == 0) {
+                state.dry_run = TRUE;
+            } else if (strcmp(arg, "-B") == 0 || strcmp(arg, "--always-make") == 0) {
+                state.always_make = TRUE;
+            } else if (strcmp(arg, "-i") == 0 || strcmp(arg, "--ignore-errors") == 0) {
+                state.ignore_errors = TRUE;
+            } else if (strcmp(arg, "-k") == 0 || strcmp(arg, "--keep-going") == 0) {
+                state.keep_going = TRUE;
+            } else if (strcmp(arg, "-s") == 0 || strcmp(arg, "--silent") == 0) {
+                state.silent = TRUE;
+            } else if (strcmp(arg, "-w") == 0) {
+                state.print_dir = TRUE;
+            } else if (strcmp(arg, "-d") == 0) {
+                state.debug = TRUE;
+            } else if (arg[1] == 'f') {
+                if (arg[2])
+                    state.makefile = strdup(arg + 2);
+                else if (i + 1 < argc)
+                    state.makefile = strdup(argv[++i]);
+            } else if (arg[1] == 'C') {
+                U8 *dir = NULL;
+                if (arg[2])
+                    dir = arg + 2;
+                else if (i + 1 < argc)
+                    dir = argv[++i];
+                if (dir) {
+                    if (PosixChdir(dir) < 0) {
+                        fprintf(stderr, "make: chdir: %s: No such file or directory\n", dir);
+                        return 2;
+                    }
+                }
+            } else if (arg[1] == 'j') {
+                if (arg[2])
+                    state.jobs = atoi(arg + 2);
+                else if (i + 1 < argc && isdigit(argv[i+1][0]))
+                    state.jobs = atoi(argv[++i]);
+            } else if (strchr(arg, '=')) {
+                // Variable assignment on command line
+                U8 *eq = strchr(arg, '=');
+                *eq = 0;
+                MakeVarSet(&state, arg, eq + 1, FALSE);
+            }
+        } else if (strchr(arg, '=')) {
+            // Variable assignment
+            U8 *eq = strchr(arg, '=');
+            U8 name[256];
+            strncpy(name, arg, eq - arg);
+            name[eq - arg] = 0;
+            MakeVarSet(&state, name, eq + 1, FALSE);
+        } else {
+            // Target
+            if (target_count < 64)
+                targets[target_count++] = arg;
+        }
+    }
+
+    // Set up built-in variables
+    MakeSetupBuiltins(&state);
+
+    // Print directory if requested
+    if (state.print_dir) {
+        U8 cwd[MAKE_PATH_SIZE];
+        if (PosixGetcwd(cwd, MAKE_PATH_SIZE))
+            printf("make: Entering directory '%s'\n", cwd);
+    }
+
+    // Find makefile
+    if (!state.makefile) {
+        if (PosixAccess("GNUmakefile", 0) == 0)
+            state.makefile = "GNUmakefile";
+        else if (PosixAccess("makefile", 0) == 0)
+            state.makefile = "makefile";
+        else if (PosixAccess("Makefile", 0) == 0)
+            state.makefile = "Makefile";
+    }
+
+    if (!state.makefile) {
+        fprintf(stderr, "make: *** No targets specified and no makefile found.  Stop.\n");
+        return 2;
+    }
+
+    // Parse makefile
+    if (MakeParseMakefile(&state, state.makefile) < 0)
+        return 2;
+
+    // Build targets
+    if (target_count == 0) {
+        // Build default target
+        if (state.default_target) {
+            I64 ret = MakeBuild(&state, state.default_target);
+            if (ret != 0)
+                state.exit_status = ret;
+        } else {
+            fprintf(stderr, "make: *** No targets.  Stop.\n");
+            return 2;
+        }
+    } else {
+        for (I64 i = 0; i < target_count; i++) {
+            I64 ret = MakeBuild(&state, targets[i]);
+            if (ret != 0) {
+                state.exit_status = ret;
+                if (!state.keep_going)
+                    break;
+            }
+        }
+    }
+
+    // Print directory if requested
+    if (state.print_dir) {
+        U8 cwd[MAKE_PATH_SIZE];
+        if (PosixGetcwd(cwd, MAKE_PATH_SIZE))
+            printf("make: Leaving directory '%s'\n", cwd);
+    }
+
+    return state.exit_status;
+}

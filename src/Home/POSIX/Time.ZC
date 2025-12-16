@@ -1,0 +1,429 @@
+// Time.ZC - POSIX Time Functions for ZealOS
+// Part of ZealOS POSIX compatibility layer
+
+// ============================================================================
+// TIME FUNCTIONS
+// ============================================================================
+
+// Get current time
+I64 PosixTime(I64 *t)
+{
+	// ZealOS uses CDATE format internally
+	// We need to convert to Unix timestamp
+	I64 now = Now;  // ZealOS timestamp
+
+	// Convert from ZealOS time to Unix time
+	// ZealOS epoch is Jan 1, 0000
+	// Unix epoch is Jan 1, 1970
+	// Approximate conversion (not accounting for all leap years etc)
+	I64 unix_time = (now - CDATE_BASE_DAY * 24 * 3600 * CDATE_FREQ) / CDATE_FREQ;
+
+	if (t)
+		*t = unix_time;
+
+	return unix_time;
+}
+
+// Get time of day
+I64 PosixGetTimeOfDay(CPosixTimeVal *tv, U0 *tz)
+{
+	I64 now;
+
+	if (!tv)
+		return PosixSetErrno(EFAULT);
+
+	now = Now;
+
+	// Convert to seconds and microseconds
+	tv->tv_sec = (now - CDATE_BASE_DAY * 24 * 3600 * CDATE_FREQ) / CDATE_FREQ;
+	tv->tv_usec = ((now % CDATE_FREQ) * 1000000) / CDATE_FREQ;
+
+	// tz is obsolete and ignored
+
+	return 0;
+}
+
+// Sleep for seconds
+I64 PosixSleep(I64 seconds)
+{
+	I64 start, elapsed;
+
+	if (seconds <= 0)
+		return 0;
+
+	start = tS;
+
+	while (1) {
+		elapsed = tS - start;
+		if (elapsed >= seconds)
+			break;
+
+		// Check for signals
+		CPosixProcess *proc = PosixGetCurrent();
+		if (proc && (proc->sigpending.bits & ~proc->sigmask.bits)) {
+			PosixDeliverPendingSignals(proc);
+			// Return remaining time if interrupted
+			return seconds - elapsed;
+		}
+
+		Sleep(100);  // Sleep 100ms at a time
+	}
+
+	return 0;
+}
+
+// Sleep for microseconds
+I64 PosixUsleep(I64 usec)
+{
+	I64 ms;
+
+	if (usec <= 0)
+		return 0;
+
+	// Convert to milliseconds (minimum 1ms)
+	ms = (usec + 999) / 1000;
+	if (ms < 1)
+		ms = 1;
+
+	Sleep(ms);
+
+	return 0;
+}
+
+// High-resolution sleep
+I64 PosixNanosleep(CPosixTimeSpec *req, CPosixTimeSpec *rem)
+{
+	I64 total_ms;
+
+	if (!req)
+		return PosixSetErrno(EFAULT);
+
+	// Convert to milliseconds
+	total_ms = req->tv_sec * 1000 + req->tv_nsec / 1000000;
+	if (total_ms < 1 && (req->tv_sec > 0 || req->tv_nsec > 0))
+		total_ms = 1;
+
+	// Sleep
+	I64 start = tS * 1000;
+	Sleep(total_ms);
+	I64 elapsed = (tS * 1000) - start;
+
+	// Check if interrupted
+	CPosixProcess *proc = PosixGetCurrent();
+	if (proc && (proc->sigpending.bits & ~proc->sigmask.bits)) {
+		if (rem) {
+			I64 remaining = total_ms - elapsed;
+			if (remaining < 0)
+				remaining = 0;
+			rem->tv_sec = remaining / 1000;
+			rem->tv_nsec = (remaining % 1000) * 1000000;
+		}
+		PosixDeliverPendingSignals(proc);
+		return PosixSetErrno(EINTR);
+	}
+
+	return 0;
+}
+
+// ============================================================================
+// TERMINAL FUNCTIONS
+// ============================================================================
+
+// Check if fd is a terminal
+I64 PosixIsatty(I64 fd)
+{
+	CPosixProcess *proc = PosixGetCurrent();
+	CPosixFD *fdp;
+
+	if (!proc)
+		return 0;
+
+	fdp = PosixFDGet(proc, fd);
+	if (!fdp) {
+		posix_errno = EBADF;
+		return 0;
+	}
+
+	if (fdp->type == FD_TYPE_TTY)
+		return 1;
+
+	posix_errno = ENOTTY;
+	return 0;
+}
+
+// Get terminal name
+U8 *PosixTtyname(I64 fd)
+{
+	if (PosixIsatty(fd))
+		return "/dev/tty";
+	return NULL;
+}
+
+// Get foreground process group
+I64 PosixTcgetpgrp(I64 fd)
+{
+	CPosixProcess *proc = PosixGetCurrent();
+
+	if (!PosixIsatty(fd))
+		return PosixSetErrno(ENOTTY);
+
+	return proc ? proc->pgid : 0;
+}
+
+// Set foreground process group
+I64 PosixTcsetpgrp(I64 fd, I64 pgrp)
+{
+	if (!PosixIsatty(fd))
+		return PosixSetErrno(ENOTTY);
+
+	// In ZealOS, there's only one terminal, so this is a no-op
+	return 0;
+}
+
+// ============================================================================
+// FILE SYSTEM OPERATIONS
+// ============================================================================
+
+// Check file accessibility
+I64 PosixAccess(U8 *path, I64 mode)
+{
+	CPosixProcess *proc = PosixGetCurrent();
+	U8 *full_path;
+	Bool exists;
+
+	if (!path)
+		return PosixSetErrno(EFAULT);
+
+	full_path = PosixResolvePath(proc, path);
+	if (!full_path)
+		return PosixSetErrno(ENOMEM);
+
+	exists = FileFind(full_path) != NULL || IsDir(full_path);
+	Free(full_path);
+
+	if (!exists)
+		return PosixSetErrno(ENOENT);
+
+	// ZealOS doesn't have file permissions, so always accessible
+	return 0;
+}
+
+// Remove file
+I64 PosixUnlink(U8 *path)
+{
+	CPosixProcess *proc = PosixGetCurrent();
+	U8 *full_path;
+	Bool result;
+
+	if (!path)
+		return PosixSetErrno(EFAULT);
+
+	full_path = PosixResolvePath(proc, path);
+	if (!full_path)
+		return PosixSetErrno(ENOMEM);
+
+	if (IsDir(full_path)) {
+		Free(full_path);
+		return PosixSetErrno(EISDIR);
+	}
+
+	result = Del(full_path);
+	Free(full_path);
+
+	return result ? 0 : PosixSetErrno(ENOENT);
+}
+
+// Rename file
+I64 PosixRename(U8 *oldpath, U8 *newpath)
+{
+	CPosixProcess *proc = PosixGetCurrent();
+	U8 *old_full, *new_full;
+	Bool result;
+
+	if (!oldpath || !newpath)
+		return PosixSetErrno(EFAULT);
+
+	old_full = PosixResolvePath(proc, oldpath);
+	new_full = PosixResolvePath(proc, newpath);
+
+	if (!old_full || !new_full) {
+		if (old_full) Free(old_full);
+		if (new_full) Free(new_full);
+		return PosixSetErrno(ENOMEM);
+	}
+
+	result = Move(old_full, new_full);
+
+	Free(old_full);
+	Free(new_full);
+
+	return result ? 0 : PosixSetErrno(EIO);
+}
+
+// Create directory
+I64 PosixMkdir(U8 *path, I64 mode)
+{
+	CPosixProcess *proc = PosixGetCurrent();
+	U8 *full_path;
+	Bool result;
+
+	if (!path)
+		return PosixSetErrno(EFAULT);
+
+	full_path = PosixResolvePath(proc, path);
+	if (!full_path)
+		return PosixSetErrno(ENOMEM);
+
+	if (IsDir(full_path) || FileFind(full_path)) {
+		Free(full_path);
+		return PosixSetErrno(EEXIST);
+	}
+
+	result = DirMk(full_path);
+	Free(full_path);
+
+	return result ? 0 : PosixSetErrno(EIO);
+}
+
+// Remove directory
+I64 PosixRmdir(U8 *path)
+{
+	CPosixProcess *proc = PosixGetCurrent();
+	U8 *full_path;
+	Bool result;
+
+	if (!path)
+		return PosixSetErrno(EFAULT);
+
+	full_path = PosixResolvePath(proc, path);
+	if (!full_path)
+		return PosixSetErrno(ENOMEM);
+
+	if (!IsDir(full_path)) {
+		Free(full_path);
+		return PosixSetErrno(ENOTDIR);
+	}
+
+	// Check if directory is empty (simplified)
+	result = Del(full_path);
+	Free(full_path);
+
+	return result ? 0 : PosixSetErrno(ENOTEMPTY);
+}
+
+// ============================================================================
+// DIRECTORY READING
+// ============================================================================
+
+// Open directory for reading
+I64 PosixOpenDir(U8 *path)
+{
+	CPosixProcess *proc = PosixGetCurrent();
+	CPosixFD *fdp;
+	U8 *full_path;
+	I64 fd;
+	CDirEntry *entries;
+	I64 count;
+
+	if (!proc)
+		return PosixSetErrno(EINVAL);
+
+	if (!path)
+		return PosixSetErrno(EFAULT);
+
+	full_path = PosixResolvePath(proc, path);
+	if (!full_path)
+		return PosixSetErrno(ENOMEM);
+
+	if (!IsDir(full_path)) {
+		Free(full_path);
+		return PosixSetErrno(ENOTDIR);
+	}
+
+	// Read directory entries
+	entries = FilesFind(full_path, &count);
+
+	// Allocate file descriptor
+	fd = PosixFDAlloc(proc);
+	if (fd < 0) {
+		Free(full_path);
+		if (entries) Free(entries);
+		return -1;
+	}
+
+	fdp = proc->fd_table[fd];
+	fdp->type = FD_TYPE_DIR;
+	fdp->flags = O_RDONLY | O_DIRECTORY;
+	fdp->dir_path = full_path;
+	fdp->entries = entries;
+	fdp->entry_count = count;
+	fdp->entry_pos = 0;
+
+	return fd;
+}
+
+// Read directory entry
+CPosixDirent *PosixReadDir(I64 fd)
+{
+	CPosixProcess *proc = PosixGetCurrent();
+	CPosixFD *fdp;
+	static CPosixDirent dirent;
+	CDirEntry *de;
+
+	if (!proc) {
+		posix_errno = EINVAL;
+		return NULL;
+	}
+
+	fdp = PosixFDGet(proc, fd);
+	if (!fdp) {
+		return NULL;  // errno set by PosixFDGet
+	}
+
+	if (fdp->type != FD_TYPE_DIR) {
+		posix_errno = ENOTDIR;
+		return NULL;
+	}
+
+	if (fdp->entry_pos >= fdp->entry_count)
+		return NULL;  // End of directory
+
+	de = &fdp->entries[fdp->entry_pos++];
+
+	// Fill in dirent structure
+	dirent.d_ino = fdp->entry_pos;  // Fake inode
+	dirent.d_off = fdp->entry_pos;
+	dirent.d_reclen = sizeof(CPosixDirent);
+
+	if (de->attr & RS_ATTR_DIR)
+		dirent.d_type = DT_DIR;
+	else
+		dirent.d_type = DT_REG;
+
+	StrCpy(dirent.d_name, de->name);
+
+	return &dirent;
+}
+
+// Close directory
+I64 PosixCloseDir(I64 fd)
+{
+	return PosixClose(fd);
+}
+
+// Rewind directory
+U0 PosixRewindDir(I64 fd)
+{
+	CPosixProcess *proc = PosixGetCurrent();
+	CPosixFD *fdp;
+
+	if (!proc)
+		return;
+
+	fdp = PosixFDGet(proc, fd);
+	if (!fdp || fdp->type != FD_TYPE_DIR)
+		return;
+
+	fdp->entry_pos = 0;
+}
+

@@ -1,0 +1,70 @@
+// MakePOSIX.ZC - POSIX Compatibility Layer Loader for ZealOS
+// Include this file to load the POSIX compatibility layer
+//
+// This provides:
+// - File descriptor management (open, close, read, write, etc.)
+// - Environment variables (getenv, setenv, etc.)
+// - Pipes (pipe, pipe2)
+// - Signal emulation (signal, kill, raise, etc.)
+// - Process management (fork emulation, exec, wait, etc.)
+// - Time functions (time, sleep, usleep, etc.)
+// - Directory operations (opendir, readdir, etc.)
+//
+// Usage:
+//   #include "MakePOSIX"
+//   PosixInit();  // Initialize POSIX layer
+//   ... use POSIX functions ...
+//   PosixCleanup(PosixGetCurrent());  // Clean up
+
+Cd(__DIR__);;
+
+// POSIX definitions and structures
+#include "POSIX.HH"
+
+// Error handling
+#include "Errno"
+
+// File descriptor management
+#include "FileDesc"
+
+// Environment variables
+#include "Environ"
+
+// Pipe implementation
+#include "Pipe"
+
+// Signal emulation
+#include "Signal"
+
+// Process management
+#include "Process"
+
+// Enhanced fork implementation
+#include "Fork"
+
+// Time and misc utilities
+#include "Time"
+
+// Virtual Memory subsystem (for true fork with COW)
+#include "VM"
+
+// VM-integrated fork
+#include "VMFork"
+
+// ============================================================================
+// POSIX LAYER INITIALIZATION MESSAGE
+// ============================================================================
+
+"POSIX compatibility layer loaded.\n";
+"  - File descriptors: open, close, read, write, lseek, dup, dup2\n";
+"  - Pipes: pipe, pipe2\n";
+"  - Signals: signal, kill, raise, sigaction\n";
+"  - Processes: fork, vfork, exec, wait, waitpid, posix_spawn\n";
+"  - Environment: getenv, setenv, unsetenv\n";
+"  - Time: sleep, usleep, time, gettimeofday\n";
+"  - Directories: opendir, readdir, closedir\n";
+"  - Virtual Memory: mmap, munmap, brk, sbrk, COW fork\n";
+"\n";
+"Use PosixInit() to initialize the POSIX layer.\n";
+"Use VMInit() to initialize virtual memory (for full fork support).\n";
+

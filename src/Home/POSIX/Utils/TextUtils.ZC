@@ -1,0 +1,862 @@
+// TextUtils.ZC - Text Processing Utilities for ZealOS POSIX Layer
+// Part of ZealOS POSIX compatibility layer
+
+// ============================================================================
+// ECHO - Display a line of text
+// ============================================================================
+
+I64 UtilEcho(I64 argc, U8 **argv)
+{
+	I64 i = 1;
+	Bool newline = TRUE;
+	Bool interpret_escapes = FALSE;
+
+	// Handle options
+	while (i < argc && argv[i][0] == '-') {
+		U8 *opt = argv[i] + 1;
+		Bool valid = TRUE;
+		while (*opt) {
+			if (*opt == 'n')
+				newline = FALSE;
+			else if (*opt == 'e')
+				interpret_escapes = TRUE;
+			else if (*opt == 'E')
+				interpret_escapes = FALSE;
+			else {
+				valid = FALSE;
+				break;
+			}
+			opt++;
+		}
+		if (!valid)
+			break;
+		i++;
+	}
+
+	// Print arguments
+	Bool first = TRUE;
+	for (; i < argc; i++) {
+		if (!first)
+			" ";
+		first = FALSE;
+
+		if (interpret_escapes) {
+			U8 *p = argv[i];
+			while (*p) {
+				if (*p == '\\' && p[1]) {
+					p++;
+					switch (*p) {
+						case 'n': "\n"; break;
+						case 't': "\t"; break;
+						case 'r': "\r"; break;
+						case 'a': "\a"; break;
+						case 'b': "\b"; break;
+						case 'f': "\f"; break;
+						case 'v': "\v"; break;
+						case '\\': "\\"; break;
+						case 'c': goto done;
+						case '0': {
+							I64 val = 0;
+							p++;
+							for (I64 j = 0; j < 3 && *p >= '0' && *p <= '7'; j++) {
+								val = val * 8 + (*p - '0');
+								p++;
+							}
+							p--;
+							"%c", val;
+							break;
+						}
+						default:
+							"\\%c", *p;
+					}
+				} else {
+					"%c", *p;
+				}
+				p++;
+			}
+		} else {
+			"%s", argv[i];
+		}
+	}
+
+done:
+	if (newline)
+		"\n";
+
+	return 0;
+}
+
+// ============================================================================
+// PRINTF - Format and print data
+// ============================================================================
+
+I64 UtilPrintf(I64 argc, U8 **argv)
+{
+	if (argc < 2) {
+		"printf: missing format string\n";
+		return 1;
+	}
+
+	U8 *fmt = argv[1];
+	I64 arg_idx = 2;
+
+	while (*fmt) {
+		if (*fmt == '\\') {
+			fmt++;
+			switch (*fmt) {
+				case 'n': "\n"; break;
+				case 't': "\t"; break;
+				case 'r': "\r"; break;
+				case 'a': "\a"; break;
+				case 'b': "\b"; break;
+				case 'f': "\f"; break;
+				case 'v': "\v"; break;
+				case '\\': "\\"; break;
+				case '0': {
+					I64 val = 0;
+					fmt++;
+					for (I64 j = 0; j < 3 && *fmt >= '0' && *fmt <= '7'; j++) {
+						val = val * 8 + (*fmt - '0');
+						fmt++;
+					}
+					fmt--;
+					"%c", val;
+					break;
+				}
+				default:
+					if (*fmt)
+						"%c", *fmt;
+			}
+		} else if (*fmt == '%') {
+			fmt++;
+			// Parse width and precision
+			I64 width = 0;
+			I64 precision = -1;
+			Bool left_justify = FALSE;
+			Bool zero_pad = FALSE;
+
+			if (*fmt == '-') {
+				left_justify = TRUE;
+				fmt++;
+			}
+			if (*fmt == '0') {
+				zero_pad = TRUE;
+				fmt++;
+			}
+
+			while (*fmt >= '0' && *fmt <= '9') {
+				width = width * 10 + (*fmt - '0');
+				fmt++;
+			}
+
+			if (*fmt == '.') {
+				fmt++;
+				precision = 0;
+				while (*fmt >= '0' && *fmt <= '9') {
+					precision = precision * 10 + (*fmt - '0');
+					fmt++;
+				}
+			}
+
+			// Format specifier
+			switch (*fmt) {
+				case 's':
+					if (arg_idx < argc) {
+						U8 *s = argv[arg_idx++];
+						if (precision >= 0 && StrLen(s) > precision) {
+							for (I64 j = 0; j < precision; j++)
+								"%c", s[j];
+						} else {
+							"%s", s;
+						}
+					}
+					break;
+				case 'd':
+				case 'i':
+					if (arg_idx < argc) {
+						I64 val = Str2I64(argv[arg_idx++]);
+						if (width > 0) {
+							if (zero_pad)
+								"%0*d", width, val;
+							else
+								"%*d", width, val;
+						} else {
+							"%d", val;
+						}
+					}
+					break;
+				case 'x':
+					if (arg_idx < argc) {
+						I64 val = Str2I64(argv[arg_idx++]);
+						"%x", val;
+					}
+					break;
+				case 'X':
+					if (arg_idx < argc) {
+						I64 val = Str2I64(argv[arg_idx++]);
+						"%X", val;
+					}
+					break;
+				case 'o':
+					if (arg_idx < argc) {
+						I64 val = Str2I64(argv[arg_idx++]);
+						"%o", val;
+					}
+					break;
+				case 'c':
+					if (arg_idx < argc) {
+						"%c", argv[arg_idx++][0];
+					}
+					break;
+				case '%':
+					"%%";
+					break;
+				default:
+					if (*fmt)
+						"%c", *fmt;
+			}
+		} else {
+			"%c", *fmt;
+		}
+		if (*fmt)
+			fmt++;
+	}
+
+	return 0;
+}
+
+// ============================================================================
+// CUT - Remove sections from each line
+// ============================================================================
+
+I64 UtilCut(I64 argc, U8 **argv)
+{
+	U8 delim = '\t';
+	U8 *fields = NULL;
+	U8 *chars = NULL;
+	I64 arg_start = 1;
+
+	// Parse options
+	for (I64 i = 1; i < argc && argv[i][0] == '-'; i++) {
+		if (argv[i][1] == 'd' && argv[i][2]) {
+			delim = argv[i][2];
+			arg_start = i + 1;
+		} else if (argv[i][1] == 'd') {
+			if (i + 1 < argc) {
+				delim = argv[++i][0];
+				arg_start = i + 1;
+			}
+		} else if (argv[i][1] == 'f' && argv[i][2]) {
+			fields = argv[i] + 2;
+			arg_start = i + 1;
+		} else if (argv[i][1] == 'f') {
+			if (i + 1 < argc) {
+				fields = argv[++i];
+				arg_start = i + 1;
+			}
+		} else if (argv[i][1] == 'c' && argv[i][2]) {
+			chars = argv[i] + 2;
+			arg_start = i + 1;
+		} else if (argv[i][1] == 'c') {
+			if (i + 1 < argc) {
+				chars = argv[++i];
+				arg_start = i + 1;
+			}
+		} else {
+			arg_start = i + 1;
+		}
+	}
+
+	if (!fields && !chars) {
+		"cut: you must specify a list of fields or characters\n";
+		return 1;
+	}
+
+	// Parse field/char specification (simplified - just handles single number for now)
+	I64 field_start = 1, field_end = 1;
+	if (fields) {
+		field_start = Str2I64(fields);
+		U8 *dash = StrFirstOcc(fields, "-");
+		if (dash)
+			field_end = Str2I64(dash + 1);
+		else
+			field_end = field_start;
+	}
+	if (chars) {
+		field_start = Str2I64(chars);
+		U8 *dash = StrFirstOcc(chars, "-");
+		if (dash)
+			field_end = Str2I64(dash + 1);
+		else
+			field_end = field_start;
+	}
+
+	// Process files or stdin
+	I64 fd;
+	U8 line[4096];
+
+	if (arg_start >= argc) {
+		argv[arg_start] = "-";
+		argc = arg_start + 1;
+	}
+
+	for (I64 i = arg_start; i < argc; i++) {
+		if (!StrCmp(argv[i], "-")) {
+			fd = 0;
+		} else {
+			fd = PosixOpen(argv[i], O_RDONLY, 0);
+			if (fd < 0) {
+				"cut: %s: %s\n", argv[i], PosixStrerror(posix_errno);
+				continue;
+			}
+		}
+
+		// Read line by line
+		I64 line_pos = 0;
+		U8 buf[4096];
+		I64 n;
+
+		while ((n = PosixRead(fd, buf, sizeof(buf))) > 0) {
+			for (I64 j = 0; j < n; j++) {
+				if (buf[j] == '\n') {
+					line[line_pos] = 0;
+
+					if (chars) {
+						// Character mode
+						for (I64 k = field_start - 1; k < field_end && k < line_pos; k++)
+							"%c", line[k];
+					} else {
+						// Field mode
+						I64 field = 1;
+						U8 *p = line;
+						U8 *field_start_ptr = line;
+
+						while (*p && field < field_start) {
+							if (*p == delim) {
+								field++;
+								field_start_ptr = p + 1;
+							}
+							p++;
+						}
+
+						// Output fields
+						Bool first = TRUE;
+						while (field <= field_end) {
+							if (!first)
+								"%c", delim;
+							first = FALSE;
+
+							// Find end of field
+							U8 *end = field_start_ptr;
+							while (*end && *end != delim)
+								end++;
+
+							// Output field
+							while (field_start_ptr < end)
+								"%c", *field_start_ptr++;
+
+							if (*end)
+								field_start_ptr = end + 1;
+							else
+								break;
+							field++;
+						}
+					}
+					"\n";
+					line_pos = 0;
+				} else {
+					if (line_pos < sizeof(line) - 1)
+						line[line_pos++] = buf[j];
+				}
+			}
+		}
+
+		if (fd != 0)
+			PosixClose(fd);
+	}
+
+	return 0;
+}
+
+// ============================================================================
+// TR - Translate or delete characters
+// ============================================================================
+
+I64 UtilTr(I64 argc, U8 **argv)
+{
+	Bool delete_chars = FALSE;
+	Bool squeeze = FALSE;
+	I64 arg_start = 1;
+
+	// Parse options
+	for (I64 i = 1; i < argc && argv[i][0] == '-'; i++) {
+		U8 *opt = argv[i] + 1;
+		while (*opt) {
+			switch (*opt) {
+				case 'd': delete_chars = TRUE; break;
+				case 's': squeeze = TRUE; break;
+				default:
+					"tr: invalid option -- '%c'\n", *opt;
+					return 1;
+			}
+			opt++;
+		}
+		arg_start = i + 1;
+	}
+
+	if (arg_start >= argc) {
+		"tr: missing operand\n";
+		return 1;
+	}
+
+	U8 *set1 = argv[arg_start];
+	U8 *set2 = (arg_start + 1 < argc) ? argv[arg_start + 1] : NULL;
+
+	// Build translation table
+	U8 trans[256];
+	Bool del[256];
+	MemSet(del, 0, sizeof(del));
+
+	for (I64 i = 0; i < 256; i++)
+		trans[i] = i;
+
+	if (delete_chars) {
+		for (U8 *p = set1; *p; p++)
+			del[*p] = TRUE;
+	} else if (set2) {
+		U8 *p1 = set1;
+		U8 *p2 = set2;
+		while (*p1) {
+			trans[*p1] = *p2 ? *p2 : p2[-1];
+			p1++;
+			if (*p2)
+				p2++;
+		}
+	}
+
+	// Process stdin
+	U8 buf[4096];
+	I64 n;
+	U8 last_char = 0;
+
+	while ((n = PosixRead(0, buf, sizeof(buf))) > 0) {
+		for (I64 j = 0; j < n; j++) {
+			U8 c = buf[j];
+
+			if (delete_chars && del[c])
+				continue;
+
+			c = trans[c];
+
+			if (squeeze && c == last_char)
+				continue;
+
+			"%c", c;
+			last_char = c;
+		}
+	}
+
+	return 0;
+}
+
+// ============================================================================
+// SORT - Sort lines (simplified)
+// ============================================================================
+
+I64 UtilSort(I64 argc, U8 **argv)
+{
+	Bool reverse = FALSE;
+	Bool numeric = FALSE;
+	Bool unique = FALSE;
+	I64 arg_start = 1;
+
+	// Parse options
+	for (I64 i = 1; i < argc && argv[i][0] == '-'; i++) {
+		U8 *opt = argv[i] + 1;
+		while (*opt) {
+			switch (*opt) {
+				case 'r': reverse = TRUE; break;
+				case 'n': numeric = TRUE; break;
+				case 'u': unique = TRUE; break;
+				default:
+					"sort: invalid option -- '%c'\n", *opt;
+					return 1;
+			}
+			opt++;
+		}
+		arg_start = i + 1;
+	}
+
+	// Read all lines into memory
+	#define MAX_LINES 10000
+	U8 **lines = MAlloc(MAX_LINES * sizeof(U8*));
+	I64 line_count = 0;
+	U8 line[4096];
+	I64 line_pos = 0;
+	U8 buf[4096];
+	I64 n;
+	I64 fd;
+
+	if (arg_start >= argc) {
+		fd = 0;
+	} else {
+		fd = PosixOpen(argv[arg_start], O_RDONLY, 0);
+		if (fd < 0) {
+			"sort: %s: %s\n", argv[arg_start], PosixStrerror(posix_errno);
+			Free(lines);
+			return 1;
+		}
+	}
+
+	while ((n = PosixRead(fd, buf, sizeof(buf))) > 0) {
+		for (I64 j = 0; j < n; j++) {
+			if (buf[j] == '\n') {
+				line[line_pos] = 0;
+				if (line_count < MAX_LINES)
+					lines[line_count++] = StrNew(line);
+				line_pos = 0;
+			} else {
+				if (line_pos < sizeof(line) - 1)
+					line[line_pos++] = buf[j];
+			}
+		}
+	}
+
+	// Handle last line without newline
+	if (line_pos > 0) {
+		line[line_pos] = 0;
+		if (line_count < MAX_LINES)
+			lines[line_count++] = StrNew(line);
+	}
+
+	if (fd != 0)
+		PosixClose(fd);
+
+	// Simple bubble sort
+	for (I64 i = 0; i < line_count - 1; i++) {
+		for (I64 j = 0; j < line_count - i - 1; j++) {
+			I64 cmp;
+			if (numeric)
+				cmp = Str2I64(lines[j]) - Str2I64(lines[j + 1]);
+			else
+				cmp = StrCmp(lines[j], lines[j + 1]);
+
+			if (reverse)
+				cmp = -cmp;
+
+			if (cmp > 0) {
+				U8 *temp = lines[j];
+				lines[j] = lines[j + 1];
+				lines[j + 1] = temp;
+			}
+		}
+	}
+
+	// Output
+	U8 *last = NULL;
+	for (I64 i = 0; i < line_count; i++) {
+		if (unique && last && !StrCmp(lines[i], last))
+			continue;
+		"%s\n", lines[i];
+		last = lines[i];
+	}
+
+	// Cleanup
+	for (I64 i = 0; i < line_count; i++)
+		Free(lines[i]);
+	Free(lines);
+
+	return 0;
+}
+
+// ============================================================================
+// UNIQ - Report or omit repeated lines
+// ============================================================================
+
+I64 UtilUniq(I64 argc, U8 **argv)
+{
+	Bool count = FALSE;
+	Bool repeated = FALSE;
+	Bool unique_only = FALSE;
+	I64 arg_start = 1;
+
+	// Parse options
+	for (I64 i = 1; i < argc && argv[i][0] == '-'; i++) {
+		U8 *opt = argv[i] + 1;
+		while (*opt) {
+			switch (*opt) {
+				case 'c': count = TRUE; break;
+				case 'd': repeated = TRUE; break;
+				case 'u': unique_only = TRUE; break;
+				default:
+					"uniq: invalid option -- '%c'\n", *opt;
+					return 1;
+			}
+			opt++;
+		}
+		arg_start = i + 1;
+	}
+
+	I64 fd;
+	if (arg_start >= argc) {
+		fd = 0;
+	} else {
+		fd = PosixOpen(argv[arg_start], O_RDONLY, 0);
+		if (fd < 0) {
+			"uniq: %s: %s\n", argv[arg_start], PosixStrerror(posix_errno);
+			return 1;
+		}
+	}
+
+	U8 line[4096];
+	U8 prev_line[4096];
+	I64 line_pos = 0;
+	I64 repeat_count = 0;
+	Bool have_prev = FALSE;
+	U8 buf[4096];
+	I64 n;
+
+	while ((n = PosixRead(fd, buf, sizeof(buf))) > 0) {
+		for (I64 j = 0; j < n; j++) {
+			if (buf[j] == '\n') {
+				line[line_pos] = 0;
+
+				if (!have_prev) {
+					StrCpy(prev_line, line);
+					repeat_count = 1;
+					have_prev = TRUE;
+				} else if (!StrCmp(line, prev_line)) {
+					repeat_count++;
+				} else {
+					// Output previous line
+					Bool should_print = TRUE;
+					if (repeated && repeat_count == 1)
+						should_print = FALSE;
+					if (unique_only && repeat_count > 1)
+						should_print = FALSE;
+
+					if (should_print) {
+						if (count)
+							"%7d ", repeat_count;
+						"%s\n", prev_line;
+					}
+
+					StrCpy(prev_line, line);
+					repeat_count = 1;
+				}
+
+				line_pos = 0;
+			} else {
+				if (line_pos < sizeof(line) - 1)
+					line[line_pos++] = buf[j];
+			}
+		}
+	}
+
+	// Output last line
+	if (have_prev) {
+		Bool should_print = TRUE;
+		if (repeated && repeat_count == 1)
+			should_print = FALSE;
+		if (unique_only && repeat_count > 1)
+			should_print = FALSE;
+
+		if (should_print) {
+			if (count)
+				"%7d ", repeat_count;
+			"%s\n", prev_line;
+		}
+	}
+
+	if (fd != 0)
+		PosixClose(fd);
+
+	return 0;
+}
+
+// ============================================================================
+// GREP - Search for patterns (simplified)
+// ============================================================================
+
+I64 UtilGrep(I64 argc, U8 **argv)
+{
+	Bool invert = FALSE;
+	Bool count_only = FALSE;
+	Bool line_numbers = FALSE;
+	Bool ignore_case = FALSE;
+	Bool files_with_matches = FALSE;
+	I64 arg_start = 1;
+
+	// Parse options
+	for (I64 i = 1; i < argc && argv[i][0] == '-'; i++) {
+		U8 *opt = argv[i] + 1;
+		while (*opt) {
+			switch (*opt) {
+				case 'v': invert = TRUE; break;
+				case 'c': count_only = TRUE; break;
+				case 'n': line_numbers = TRUE; break;
+				case 'i': ignore_case = TRUE; break;
+				case 'l': files_with_matches = TRUE; break;
+				default:
+					"grep: invalid option -- '%c'\n", *opt;
+					return 1;
+			}
+			opt++;
+		}
+		arg_start = i + 1;
+	}
+
+	if (arg_start >= argc) {
+		"grep: missing pattern\n";
+		return 1;
+	}
+
+	U8 *pattern = argv[arg_start++];
+	Bool found_any = FALSE;
+
+	// Process files
+	if (arg_start >= argc) {
+		argv[arg_start] = "-";
+		argc = arg_start + 1;
+	}
+
+	Bool multiple_files = (argc - arg_start) > 1;
+
+	for (I64 i = arg_start; i < argc; i++) {
+		I64 fd;
+		if (!StrCmp(argv[i], "-")) {
+			fd = 0;
+		} else {
+			fd = PosixOpen(argv[i], O_RDONLY, 0);
+			if (fd < 0) {
+				"grep: %s: %s\n", argv[i], PosixStrerror(posix_errno);
+				continue;
+			}
+		}
+
+		U8 line[4096];
+		I64 line_pos = 0;
+		I64 line_num = 0;
+		I64 match_count = 0;
+		U8 buf[4096];
+		I64 n;
+
+		while ((n = PosixRead(fd, buf, sizeof(buf))) > 0) {
+			for (I64 j = 0; j < n; j++) {
+				if (buf[j] == '\n') {
+					line[line_pos] = 0;
+					line_num++;
+
+					// Check for match
+					Bool match;
+					if (ignore_case)
+						match = StrIMatch(pattern, line) != NULL;
+					else
+						match = StrMatch(pattern, line) != NULL;
+
+					if (invert)
+						match = !match;
+
+					if (match) {
+						match_count++;
+						found_any = TRUE;
+
+						if (files_with_matches) {
+							"%s\n", argv[i];
+							goto next_file;
+						}
+
+						if (!count_only) {
+							if (multiple_files)
+								"%s:", argv[i];
+							if (line_numbers)
+								"%d:", line_num;
+							"%s\n", line;
+						}
+					}
+
+					line_pos = 0;
+				} else {
+					if (line_pos < sizeof(line) - 1)
+						line[line_pos++] = buf[j];
+				}
+			}
+		}
+
+		if (count_only) {
+			if (multiple_files)
+				"%s:", argv[i];
+			"%d\n", match_count;
+		}
+
+next_file:
+		if (fd != 0)
+			PosixClose(fd);
+	}
+
+	return found_any ? 0 : 1;
+}
+
+// ============================================================================
+// TEE - Read from stdin and write to stdout and files
+// ============================================================================
+
+I64 UtilTee(I64 argc, U8 **argv)
+{
+	Bool append = FALSE;
+	I64 arg_start = 1;
+	I64 *fds = NULL;
+	I64 fd_count = 0;
+
+	// Parse options
+	for (I64 i = 1; i < argc && argv[i][0] == '-'; i++) {
+		if (!StrCmp(argv[i], "-a"))
+			append = TRUE;
+		arg_start = i + 1;
+	}
+
+	// Open output files
+	fd_count = argc - arg_start;
+	if (fd_count > 0) {
+		fds = MAlloc(fd_count * sizeof(I64));
+		for (I64 i = 0; i < fd_count; i++) {
+			I64 flags = O_WRONLY | O_CREAT;
+			if (append)
+				flags |= O_APPEND;
+			else
+				flags |= O_TRUNC;
+
+			fds[i] = PosixOpen(argv[arg_start + i], flags, 0644);
+			if (fds[i] < 0) {
+				"tee: %s: %s\n", argv[arg_start + i], PosixStrerror(posix_errno);
+				fds[i] = -1;
+			}
+		}
+	}
+
+	// Read stdin, write to stdout and files
+	U8 buf[4096];
+	I64 n;
+
+	while ((n = PosixRead(0, buf, sizeof(buf))) > 0) {
+		// Write to stdout
+		PosixWrite(1, buf, n);
+
+		// Write to files
+		for (I64 i = 0; i < fd_count; i++) {
+			if (fds[i] >= 0)
+				PosixWrite(fds[i], buf, n);
+		}
+	}
+
+	// Close files
+	for (I64 i = 0; i < fd_count; i++) {
+		if (fds[i] >= 0)
+			PosixClose(fds[i]);
+	}
+
+	if (fds)
+		Free(fds);
+
+	return 0;
+}

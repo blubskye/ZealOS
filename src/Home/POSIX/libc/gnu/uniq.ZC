@@ -1,0 +1,303 @@
+// uniq.ZC - GNU coreutils 'uniq' implementation
+// Report or omit repeated lines
+
+#define UNIQ_LINE_SIZE 4096
+
+// C-style main function
+I64 uniq_main(I64 argc, U8 **argv)
+{
+    Bool count = FALSE;          // -c
+    Bool repeated = FALSE;       // -d
+    Bool unique = FALSE;         // -u
+    Bool ignore_case = FALSE;    // -i
+    I64 skip_fields = 0;         // -f
+    I64 skip_chars = 0;          // -s
+    I64 check_chars = 0;         // -w (0 = all)
+    Bool all_repeated = FALSE;   // -D
+    Bool zero_terminated = FALSE; // -z
+    I64 start = 1;
+
+    // Parse options
+    while (start < argc && argv[start][0] == '-' && argv[start][1]) {
+        U8 *arg = argv[start];
+
+        if (strcmp(arg, "--help") == 0) {
+            printf("Usage: uniq [OPTION]... [INPUT [OUTPUT]]\n");
+            printf("Filter adjacent matching lines from INPUT (or stdin),\n");
+            printf("writing to OUTPUT (or stdout).\n\n");
+            printf("  -c, --count           prefix lines by the number of occurrences\n");
+            printf("  -d, --repeated        only print duplicate lines, one for each group\n");
+            printf("  -D                    print all duplicate lines\n");
+            printf("  -f, --skip-fields=N   avoid comparing the first N fields\n");
+            printf("  -i, --ignore-case     ignore differences in case when comparing\n");
+            printf("  -s, --skip-chars=N    avoid comparing the first N characters\n");
+            printf("  -u, --unique          only print unique lines\n");
+            printf("  -w, --check-chars=N   compare no more than N characters in lines\n");
+            printf("  -z, --zero-terminated line delimiter is NUL, not newline\n");
+            printf("      --help            display this help and exit\n");
+            printf("      --version         output version information and exit\n");
+            return 0;
+        }
+
+        if (strcmp(arg, "--version") == 0) {
+            printf("uniq (ZealOS coreutils) 1.0\n");
+            return 0;
+        }
+
+        if (strcmp(arg, "-c") == 0 || strcmp(arg, "--count") == 0) {
+            count = TRUE; start++; continue;
+        }
+        if (strcmp(arg, "-d") == 0 || strcmp(arg, "--repeated") == 0) {
+            repeated = TRUE; start++; continue;
+        }
+        if (strcmp(arg, "-D") == 0) {
+            all_repeated = TRUE; start++; continue;
+        }
+        if (strcmp(arg, "-u") == 0 || strcmp(arg, "--unique") == 0) {
+            unique = TRUE; start++; continue;
+        }
+        if (strcmp(arg, "-i") == 0 || strcmp(arg, "--ignore-case") == 0) {
+            ignore_case = TRUE; start++; continue;
+        }
+        if (strcmp(arg, "-z") == 0 || strcmp(arg, "--zero-terminated") == 0) {
+            zero_terminated = TRUE; start++; continue;
+        }
+
+        if (strncmp(arg, "-f", 2) == 0) {
+            U8 *num = &arg[2];
+            if (!*num && start + 1 < argc) {
+                start++;
+                num = argv[start];
+            }
+            skip_fields = atoi(num);
+            start++;
+            continue;
+        }
+
+        if (strncmp(arg, "-s", 2) == 0) {
+            U8 *num = &arg[2];
+            if (!*num && start + 1 < argc) {
+                start++;
+                num = argv[start];
+            }
+            skip_chars = atoi(num);
+            start++;
+            continue;
+        }
+
+        if (strncmp(arg, "-w", 2) == 0) {
+            U8 *num = &arg[2];
+            if (!*num && start + 1 < argc) {
+                start++;
+                num = argv[start];
+            }
+            check_chars = atoi(num);
+            start++;
+            continue;
+        }
+
+        if (strncmp(arg, "--skip-fields=", 14) == 0) {
+            skip_fields = atoi(&arg[14]);
+            start++;
+            continue;
+        }
+
+        if (strncmp(arg, "--skip-chars=", 13) == 0) {
+            skip_chars = atoi(&arg[13]);
+            start++;
+            continue;
+        }
+
+        if (strncmp(arg, "--check-chars=", 14) == 0) {
+            check_chars = atoi(&arg[14]);
+            start++;
+            continue;
+        }
+
+        // Combined short options (limited support)
+        if (arg[0] == '-' && arg[1] != '-') {
+            for (I64 i = 1; arg[i]; i++) {
+                switch (arg[i]) {
+                    case 'c': count = TRUE; break;
+                    case 'd': repeated = TRUE; break;
+                    case 'D': all_repeated = TRUE; break;
+                    case 'u': unique = TRUE; break;
+                    case 'i': ignore_case = TRUE; break;
+                    case 'z': zero_terminated = TRUE; break;
+                    default:
+                        fprintf(stderr, "uniq: invalid option -- '%c'\n", arg[i]);
+                        return 1;
+                }
+            }
+            start++;
+            continue;
+        }
+
+        if (strcmp(arg, "--") == 0) {
+            start++;
+            break;
+        }
+
+        break;
+    }
+
+    // Get comparison start position in line
+    auto get_compare_start = [](U8 *line, I64 skip_fields, I64 skip_chars) -> U8* {
+        U8 *p = line;
+
+        // Skip fields
+        for (I64 f = 0; f < skip_fields && *p; f++) {
+            // Skip leading blanks
+            while (*p == ' ' || *p == '\t') p++;
+            // Skip non-blanks
+            while (*p && *p != ' ' && *p != '\t') p++;
+        }
+
+        // Skip leading blanks after fields
+        while (*p == ' ' || *p == '\t') p++;
+
+        // Skip characters
+        for (I64 c = 0; c < skip_chars && *p; c++) p++;
+
+        return p;
+    };
+
+    // Compare two lines
+    auto compare_lines = [&](U8 *a, U8 *b) -> Bool {
+        U8 *pa = get_compare_start(a, skip_fields, skip_chars);
+        U8 *pb = get_compare_start(b, skip_fields, skip_chars);
+
+        I64 i = 0;
+        while (*pa && *pb) {
+            if (check_chars > 0 && i >= check_chars)
+                break;
+
+            U8 ca = *pa;
+            U8 cb = *pb;
+
+            if (ignore_case) {
+                ca = toupper(ca);
+                cb = toupper(cb);
+            }
+
+            if (ca != cb) return FALSE;
+
+            pa++;
+            pb++;
+            i++;
+        }
+
+        if (check_chars > 0 && i >= check_chars)
+            return TRUE;
+
+        return (*pa == *pb);  // Both at end
+    };
+
+    // Open input file
+    FILE *in_fp;
+    U8 *input_file = NULL;
+    U8 *output_file = NULL;
+
+    if (start < argc) {
+        input_file = argv[start];
+        start++;
+    }
+    if (start < argc) {
+        output_file = argv[start];
+    }
+
+    if (!input_file || strcmp(input_file, "-") == 0) {
+        in_fp = stdin;
+    } else {
+        in_fp = fopen(input_file, "r");
+        if (!in_fp) {
+            fprintf(stderr, "uniq: cannot open '%s': %s\n", input_file, strerror(errno));
+            return 1;
+        }
+    }
+
+    // Open output file
+    FILE *out_fp;
+    if (!output_file || strcmp(output_file, "-") == 0) {
+        out_fp = stdout;
+    } else {
+        out_fp = fopen(output_file, "w");
+        if (!out_fp) {
+            fprintf(stderr, "uniq: cannot create '%s': %s\n", output_file, strerror(errno));
+            if (in_fp != stdin) fclose(in_fp);
+            return 1;
+        }
+    }
+
+    U8 *current = MAlloc(UNIQ_LINE_SIZE);
+    U8 *previous = MAlloc(UNIQ_LINE_SIZE);
+    previous[0] = 0;
+    I64 occurrence_count = 0;
+    Bool first_line = TRUE;
+    U8 delim = zero_terminated ? 0 : '\n';
+
+    // Output a line with count
+    auto output_line = [&](U8 *line, I64 cnt) -> U0 {
+        if (unique && cnt > 1) return;
+        if (repeated && cnt == 1) return;
+
+        if (count) {
+            fprintf(out_fp, "%7ld %s", cnt, line);
+        } else {
+            fprintf(out_fp, "%s", line);
+        }
+        if (zero_terminated) {
+            fputc(0, out_fp);
+        } else {
+            fputc('\n', out_fp);
+        }
+    };
+
+    while (fgets(current, UNIQ_LINE_SIZE, in_fp)) {
+        // Remove trailing newline/null
+        I64 len = strlen(current);
+        if (len > 0 && (current[len-1] == '\n' || current[len-1] == 0))
+            current[len-1] = 0;
+
+        if (first_line) {
+            strcpy(previous, current);
+            occurrence_count = 1;
+            first_line = FALSE;
+        } else if (compare_lines(current, previous)) {
+            occurrence_count++;
+            if (all_repeated) {
+                // Print each duplicate
+                if (occurrence_count == 2) {
+                    // Print first one we skipped
+                    output_line(previous, 1);
+                }
+                output_line(current, 1);
+            }
+        } else {
+            // Different line - output previous
+            if (!all_repeated) {
+                output_line(previous, occurrence_count);
+            }
+            strcpy(previous, current);
+            occurrence_count = 1;
+        }
+    }
+
+    // Output last line
+    if (!first_line && !all_repeated) {
+        output_line(previous, occurrence_count);
+    }
+
+    Free(current);
+    Free(previous);
+
+    if (in_fp != stdin) fclose(in_fp);
+    if (out_fp != stdout) fclose(out_fp);
+
+    return 0;
+}
+
+U0 GnuUniqRegister()
+{
+    "GNU 'uniq' utility loaded.\n";
+}

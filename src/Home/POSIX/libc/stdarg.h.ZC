@@ -1,0 +1,30 @@
+// stdarg.h - Variable argument handling for ZealOS libc
+// Uses ZealOS's built-in support for variable arguments
+
+#ifndef _STDARG_H
+#define _STDARG_H
+
+// ZealOS HolyC has built-in support for variable arguments
+// The ... in function parameters and argc/argv pattern works directly
+
+// va_list is a pointer to the argument list
+typedef U8 *va_list;
+
+// va_start initializes va_list to point after the last fixed parameter
+// In ZealOS/HolyC, arguments are pushed right-to-left on the stack
+// Each argument is 8 bytes (64-bit)
+#define va_start(ap, last) (ap = (va_list)(&(last) + 1))
+
+// va_arg retrieves the next argument and advances the pointer
+#define va_arg(ap, type) (*(type *)((ap += 8) - 8))
+
+// va_end is a no-op but included for compatibility
+#define va_end(ap) (ap = NULL)
+
+// va_copy makes a copy of the va_list
+#define va_copy(dest, src) (dest = src)
+
+// GNU extension - va_list that can be modified
+typedef va_list __gnuc_va_list;
+
+#endif // _STDARG_H

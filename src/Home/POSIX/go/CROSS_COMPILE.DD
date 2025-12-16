@@ -1,0 +1,140 @@
+$WW,1$$FG,5,0$Go Cross-Compilation Guide for ZealOS$FG$
+
+$TR,"Overview"$
+ZealOS supports running Go programs through cross-compilation.
+Since the full Go compiler requires significant system resources,
+we recommend compiling Go programs on a host system (Linux, macOS,
+or Windows) and then running the resulting binaries on ZealOS.
+
+$TR,"Requirements"$
+- Host system with Go 1.18 or later installed
+- ZealOS with the POSIX layer loaded
+
+$TR,"Cross-Compilation Steps"$
+
+$FG,2$1. On your host system (Linux/macOS/Windows):$FG$
+
+   For static Linux binary (recommended):
+   $FG,4$GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -o myprogram myprogram.go$FG$
+
+   This produces a statically-linked ELF binary that ZealOS can load.
+
+$FG,2$2. Transfer the binary to ZealOS:$FG$
+
+   Copy the binary to your ZealOS disk, for example:
+   - Mount the ZealOS disk on your host
+   - Copy to /Home/POSIX/go/bin/ or any accessible location
+
+$FG,2$3. On ZealOS, run the binary:$FG$
+
+   $FG,4$go run /path/to/myprogram$FG$
+
+   Or directly through the ELF loader:
+   $FG,4$ELFRun("/path/to/myprogram", argc, argv);$FG$
+
+$TR,"Example Programs"$
+
+$FG,2$Hello World (hello.go):$FG$
+$FG,4$
+package main
+
+import "fmt"
+
+func main() {
+    fmt.Println("Hello from Go on ZealOS!")
+}
+$FG$
+
+Compile: $FG,4$GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -o hello hello.go$FG$
+
+$FG,2$Goroutines (goroutines.go):$FG$
+$FG,4$
+package main
+
+import (
+    "fmt"
+    "time"
+)
+
+func worker(id int) {
+    fmt.Printf("Worker %d starting\n", id)
+    time.Sleep(time.Second)
+    fmt.Printf("Worker %d done\n", id)
+}
+
+func main() {
+    for i := 1; i <= 5; i++ {
+        go worker(i)
+    }
+    time.Sleep(2 * time.Second)
+    fmt.Println("All workers complete")
+}
+$FG$
+
+$TR,"Supported Features"$
+
+$FG,2$Working:$FG$
+- Goroutines (cooperative scheduling)
+- Channels
+- Standard library (most packages)
+- File I/O
+- Networking (with POSIX layer)
+- Time functions
+- Synchronization primitives
+
+$FG,2$Limitations:$FG$
+- CGO is not supported (CGO_ENABLED=0 required)
+- Some syscalls may behave differently
+- Memory mapped I/O simplified
+- Signal handling simplified
+- Single-threaded execution (GOMAXPROCS=1)
+
+$TR,"Troubleshooting"$
+
+$FG,2$"exec format error":$FG$
+   Ensure you compiled with GOOS=linux GOARCH=amd64
+
+$FG,2$"syscall not implemented":$FG$
+   Some advanced syscalls are not available. Try:
+   - Using simpler alternatives in your code
+   - Checking if the syscall is in GoSyscall.ZC
+
+$FG,2$"out of memory":$FG$
+   Go programs can be memory-intensive. Ensure enough
+   free memory on ZealOS before running.
+
+$FG,2$Program hangs:$FG$
+   Check for blocking syscalls or infinite loops.
+   ZealOS uses cooperative multitasking - ensure your
+   program yields occasionally.
+
+$TR,"Advanced: Adding New Syscalls"$
+
+If your Go program needs a syscall that's not implemented:
+
+1. Find the syscall number in GoSyscall.ZC
+2. Add a case handler that maps to your POSIX function
+3. Test with a simple Go program that uses that syscall
+
+Example adding a new syscall:
+$FG,4$
+case SYS_NEWSYSCALL:
+    ret = my_posix_function(a1, a2, a3);
+    break;
+$FG$
+
+$TR,"Performance Tips"$
+
+- Use CGO_ENABLED=0 for smallest, most compatible binaries
+- Avoid excessive goroutine creation
+- Use buffered channels where possible
+- Minimize file I/O operations
+- Consider GOMAXPROCS=1 behavior in your design
+
+$TR,"Files"$
+
+$FG,4$/Home/POSIX/go/Go.HH$FG$ - Go runtime definitions
+$FG,4$/Home/POSIX/go/Futex.ZC$FG$ - Futex synchronization
+$FG,4$/Home/POSIX/go/runtime/GoRuntime.ZC$FG$ - M-P-G scheduler
+$FG,4$/Home/POSIX/go/runtime/GoSyscall.ZC$FG$ - Syscall implementations
+$FG,4$/Home/POSIX/go/MakeGo.ZC$FG$ - Main loader

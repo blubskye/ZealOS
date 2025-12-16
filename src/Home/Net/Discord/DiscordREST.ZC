@@ -1,0 +1,742 @@
+// DiscordREST.ZC - Extended Discord REST API for ZealOS
+// Part of ZealOS Discord implementation
+// Provides comprehensive REST API coverage for channels, guilds, reactions, etc.
+
+// ============================================================================
+// CHANNEL ENDPOINTS
+// ============================================================================
+
+// Get channel information
+CJSONValue *DiscordGetChannel(CDiscordClient *client, CDiscordSnowflake channel_id)
+{
+	U8 endpoint[64];
+	CHTTPResponse *resp;
+
+	StrPrint(endpoint, "/channels/%llu", channel_id);
+
+	resp = DiscordAPIRequest(client, HTTP_METHOD_GET, endpoint, NULL);
+	if (!resp) return NULL;
+
+	CJSONValue *result = NULL;
+	if (resp->status_code == 200 && resp->body) {
+		result = JSONParse(resp->body);
+	}
+
+	HTTPResponseFree(resp);
+	return result;
+}
+
+// Modify channel
+I64 DiscordModifyChannel(CDiscordClient *client, CDiscordSnowflake channel_id,
+                         U8 *name, U8 *topic)
+{
+	U8 endpoint[64];
+	CJSONBuilder json;
+	CHTTPResponse *resp;
+
+	StrPrint(endpoint, "/channels/%llu", channel_id);
+
+	JSONBuilderInit(&json, 256);
+	JSONBeginObject(&json);
+	if (name) {
+		JSONKeyString(&json, "name", name);
+	}
+	if (topic) {
+		JSONKeyString(&json, "topic", topic);
+	}
+	JSONEndObject(&json);
+
+	resp = DiscordAPIRequest(client, HTTP_METHOD_PATCH, endpoint, JSONBuilderGet(&json));
+	JSONBuilderFree(&json);
+
+	if (!resp) return DISCORD_ERR_API_ERROR;
+
+	I64 status = resp->status_code;
+	HTTPResponseFree(resp);
+
+	return (status == 200) ? DISCORD_OK : DISCORD_ERR_API_ERROR;
+}
+
+// Delete channel
+I64 DiscordDeleteChannel(CDiscordClient *client, CDiscordSnowflake channel_id)
+{
+	U8 endpoint[64];
+	CHTTPResponse *resp;
+
+	StrPrint(endpoint, "/channels/%llu", channel_id);
+
+	resp = DiscordAPIRequest(client, HTTP_METHOD_DELETE, endpoint, NULL);
+	if (!resp) return DISCORD_ERR_API_ERROR;
+
+	I64 status = resp->status_code;
+	HTTPResponseFree(resp);
+
+	return (status == 200) ? DISCORD_OK : DISCORD_ERR_API_ERROR;
+}
+
+// Get messages from channel
+// Returns JSON array of messages, caller must free with JSONValueFree
+CJSONValue *DiscordGetMessages(CDiscordClient *client, CDiscordSnowflake channel_id,
+                               I64 limit, CDiscordSnowflake before, CDiscordSnowflake after)
+{
+	U8 endpoint[128];
+	CHTTPResponse *resp;
+	I64 offset = 0;
+
+	offset += StrPrint(endpoint + offset, "/channels/%llu/messages?", channel_id);
+
+	if (limit > 0) {
+		offset += StrPrint(endpoint + offset, "limit=%d", limit);
+	}
+	if (before > 0) {
+		if (limit > 0) offset += StrPrint(endpoint + offset, "&");
+		offset += StrPrint(endpoint + offset, "before=%llu", before);
+	}
+	if (after > 0) {
+		if (limit > 0 || before > 0) offset += StrPrint(endpoint + offset, "&");
+		offset += StrPrint(endpoint + offset, "after=%llu", after);
+	}
+
+	resp = DiscordAPIRequest(client, HTTP_METHOD_GET, endpoint, NULL);
+	if (!resp) return NULL;
+
+	CJSONValue *result = NULL;
+	if (resp->status_code == 200 && resp->body) {
+		result = JSONParse(resp->body);
+	}
+
+	HTTPResponseFree(resp);
+	return result;
+}
+
+// Get single message
+CJSONValue *DiscordGetMessage(CDiscordClient *client, CDiscordSnowflake channel_id,
+                              CDiscordSnowflake message_id)
+{
+	U8 endpoint[128];
+	CHTTPResponse *resp;
+
+	StrPrint(endpoint, "/channels/%llu/messages/%llu", channel_id, message_id);
+
+	resp = DiscordAPIRequest(client, HTTP_METHOD_GET, endpoint, NULL);
+	if (!resp) return NULL;
+
+	CJSONValue *result = NULL;
+	if (resp->status_code == 200 && resp->body) {
+		result = JSONParse(resp->body);
+	}
+
+	HTTPResponseFree(resp);
+	return result;
+}
+
+// Edit message
+I64 DiscordEditMessage(CDiscordClient *client, CDiscordSnowflake channel_id,
+                       CDiscordSnowflake message_id, U8 *content)
+{
+	U8 endpoint[128];
+	CJSONBuilder json;
+	CHTTPResponse *resp;
+
+	StrPrint(endpoint, "/channels/%llu/messages/%llu", channel_id, message_id);
+
+	JSONBuilderInit(&json, 256);
+	JSONBeginObject(&json);
+	JSONKeyString(&json, "content", content);
+	JSONEndObject(&json);
+
+	resp = DiscordAPIRequest(client, HTTP_METHOD_PATCH, endpoint, JSONBuilderGet(&json));
+	JSONBuilderFree(&json);
+
+	if (!resp) return DISCORD_ERR_API_ERROR;
+
+	I64 status = resp->status_code;
+	HTTPResponseFree(resp);
+
+	return (status == 200) ? DISCORD_OK : DISCORD_ERR_API_ERROR;
+}
+
+// Delete message
+I64 DiscordDeleteMessage(CDiscordClient *client, CDiscordSnowflake channel_id,
+                         CDiscordSnowflake message_id)
+{
+	U8 endpoint[128];
+	CHTTPResponse *resp;
+
+	StrPrint(endpoint, "/channels/%llu/messages/%llu", channel_id, message_id);
+
+	resp = DiscordAPIRequest(client, HTTP_METHOD_DELETE, endpoint, NULL);
+	if (!resp) return DISCORD_ERR_API_ERROR;
+
+	I64 status = resp->status_code;
+	HTTPResponseFree(resp);
+
+	return (status == 204) ? DISCORD_OK : DISCORD_ERR_API_ERROR;
+}
+
+// Bulk delete messages (2-100 messages, not older than 2 weeks)
+I64 DiscordBulkDeleteMessages(CDiscordClient *client, CDiscordSnowflake channel_id,
+                              CDiscordSnowflake *message_ids, I64 count)
+{
+	U8 endpoint[128];
+	CJSONBuilder json;
+	CHTTPResponse *resp;
+	I64 i;
+
+	if (count < 2 || count > 100) return DISCORD_ERR_API_ERROR;
+
+	StrPrint(endpoint, "/channels/%llu/messages/bulk-delete", channel_id);
+
+	JSONBuilderInit(&json, 512);
+	JSONBeginObject(&json);
+	JSONKeyArray(&json, "messages");
+	for (i = 0; i < count; i++) {
+		U8 id_str[32];
+		StrPrint(id_str, "%llu", message_ids[i]);
+		JSONString(&json, id_str);
+	}
+	JSONEndArray(&json);
+	JSONEndObject(&json);
+
+	resp = DiscordAPIRequest(client, HTTP_METHOD_POST, endpoint, JSONBuilderGet(&json));
+	JSONBuilderFree(&json);
+
+	if (!resp) return DISCORD_ERR_API_ERROR;
+
+	I64 status = resp->status_code;
+	HTTPResponseFree(resp);
+
+	return (status == 204) ? DISCORD_OK : DISCORD_ERR_API_ERROR;
+}
+
+// Trigger typing indicator
+I64 DiscordTriggerTyping(CDiscordClient *client, CDiscordSnowflake channel_id)
+{
+	U8 endpoint[64];
+	CHTTPResponse *resp;
+
+	StrPrint(endpoint, "/channels/%llu/typing", channel_id);
+
+	resp = DiscordAPIRequest(client, HTTP_METHOD_POST, endpoint, NULL);
+	if (!resp) return DISCORD_ERR_API_ERROR;
+
+	I64 status = resp->status_code;
+	HTTPResponseFree(resp);
+
+	return (status == 204) ? DISCORD_OK : DISCORD_ERR_API_ERROR;
+}
+
+// Pin message
+I64 DiscordPinMessage(CDiscordClient *client, CDiscordSnowflake channel_id,
+                      CDiscordSnowflake message_id)
+{
+	U8 endpoint[128];
+	CHTTPResponse *resp;
+
+	StrPrint(endpoint, "/channels/%llu/pins/%llu", channel_id, message_id);
+
+	resp = DiscordAPIRequest(client, HTTP_METHOD_PUT, endpoint, NULL);
+	if (!resp) return DISCORD_ERR_API_ERROR;
+
+	I64 status = resp->status_code;
+	HTTPResponseFree(resp);
+
+	return (status == 204) ? DISCORD_OK : DISCORD_ERR_API_ERROR;
+}
+
+// Unpin message
+I64 DiscordUnpinMessage(CDiscordClient *client, CDiscordSnowflake channel_id,
+                        CDiscordSnowflake message_id)
+{
+	U8 endpoint[128];
+	CHTTPResponse *resp;
+
+	StrPrint(endpoint, "/channels/%llu/pins/%llu", channel_id, message_id);
+
+	resp = DiscordAPIRequest(client, HTTP_METHOD_DELETE, endpoint, NULL);
+	if (!resp) return DISCORD_ERR_API_ERROR;
+
+	I64 status = resp->status_code;
+	HTTPResponseFree(resp);
+
+	return (status == 204) ? DISCORD_OK : DISCORD_ERR_API_ERROR;
+}
+
+// ============================================================================
+// REACTION ENDPOINTS
+// ============================================================================
+
+// URL encode emoji for reactions
+// Unicode emoji: URL encode as-is
+// Custom emoji: name:id format
+U0 DiscordEncodeEmoji(U8 *emoji_str, U8 *encoded, CDiscordSnowflake custom_id)
+{
+	if (custom_id > 0) {
+		// Custom emoji: name:id
+		StrPrint(encoded, "%s:%llu", emoji_str, custom_id);
+	} else {
+		// Unicode emoji - URL encode
+		// For simplicity, we just copy it (most emojis work directly)
+		StrCpy(encoded, emoji_str);
+	}
+}
+
+// Add reaction to message
+I64 DiscordAddReaction(CDiscordClient *client, CDiscordSnowflake channel_id,
+                       CDiscordSnowflake message_id, U8 *emoji, CDiscordSnowflake custom_id)
+{
+	U8 endpoint[192];
+	U8 encoded_emoji[64];
+	CHTTPResponse *resp;
+
+	DiscordEncodeEmoji(emoji, encoded_emoji, custom_id);
+	StrPrint(endpoint, "/channels/%llu/messages/%llu/reactions/%s/@me",
+	         channel_id, message_id, encoded_emoji);
+
+	resp = DiscordAPIRequest(client, HTTP_METHOD_PUT, endpoint, NULL);
+	if (!resp) return DISCORD_ERR_API_ERROR;
+
+	I64 status = resp->status_code;
+	HTTPResponseFree(resp);
+
+	return (status == 204) ? DISCORD_OK : DISCORD_ERR_API_ERROR;
+}
+
+// Remove own reaction
+I64 DiscordRemoveOwnReaction(CDiscordClient *client, CDiscordSnowflake channel_id,
+                             CDiscordSnowflake message_id, U8 *emoji, CDiscordSnowflake custom_id)
+{
+	U8 endpoint[192];
+	U8 encoded_emoji[64];
+	CHTTPResponse *resp;
+
+	DiscordEncodeEmoji(emoji, encoded_emoji, custom_id);
+	StrPrint(endpoint, "/channels/%llu/messages/%llu/reactions/%s/@me",
+	         channel_id, message_id, encoded_emoji);
+
+	resp = DiscordAPIRequest(client, HTTP_METHOD_DELETE, endpoint, NULL);
+	if (!resp) return DISCORD_ERR_API_ERROR;
+
+	I64 status = resp->status_code;
+	HTTPResponseFree(resp);
+
+	return (status == 204) ? DISCORD_OK : DISCORD_ERR_API_ERROR;
+}
+
+// Remove user's reaction
+I64 DiscordRemoveUserReaction(CDiscordClient *client, CDiscordSnowflake channel_id,
+                              CDiscordSnowflake message_id, U8 *emoji,
+                              CDiscordSnowflake custom_id, CDiscordSnowflake user_id)
+{
+	U8 endpoint[192];
+	U8 encoded_emoji[64];
+	CHTTPResponse *resp;
+
+	DiscordEncodeEmoji(emoji, encoded_emoji, custom_id);
+	StrPrint(endpoint, "/channels/%llu/messages/%llu/reactions/%s/%llu",
+	         channel_id, message_id, encoded_emoji, user_id);
+
+	resp = DiscordAPIRequest(client, HTTP_METHOD_DELETE, endpoint, NULL);
+	if (!resp) return DISCORD_ERR_API_ERROR;
+
+	I64 status = resp->status_code;
+	HTTPResponseFree(resp);
+
+	return (status == 204) ? DISCORD_OK : DISCORD_ERR_API_ERROR;
+}
+
+// Get users who reacted with emoji
+CJSONValue *DiscordGetReactions(CDiscordClient *client, CDiscordSnowflake channel_id,
+                                CDiscordSnowflake message_id, U8 *emoji,
+                                CDiscordSnowflake custom_id, I64 limit)
+{
+	U8 endpoint[192];
+	U8 encoded_emoji[64];
+	CHTTPResponse *resp;
+
+	DiscordEncodeEmoji(emoji, encoded_emoji, custom_id);
+
+	if (limit > 0) {
+		StrPrint(endpoint, "/channels/%llu/messages/%llu/reactions/%s?limit=%d",
+		         channel_id, message_id, encoded_emoji, limit);
+	} else {
+		StrPrint(endpoint, "/channels/%llu/messages/%llu/reactions/%s",
+		         channel_id, message_id, encoded_emoji);
+	}
+
+	resp = DiscordAPIRequest(client, HTTP_METHOD_GET, endpoint, NULL);
+	if (!resp) return NULL;
+
+	CJSONValue *result = NULL;
+	if (resp->status_code == 200 && resp->body) {
+		result = JSONParse(resp->body);
+	}
+
+	HTTPResponseFree(resp);
+	return result;
+}
+
+// Delete all reactions
+I64 DiscordDeleteAllReactions(CDiscordClient *client, CDiscordSnowflake channel_id,
+                              CDiscordSnowflake message_id)
+{
+	U8 endpoint[128];
+	CHTTPResponse *resp;
+
+	StrPrint(endpoint, "/channels/%llu/messages/%llu/reactions", channel_id, message_id);
+
+	resp = DiscordAPIRequest(client, HTTP_METHOD_DELETE, endpoint, NULL);
+	if (!resp) return DISCORD_ERR_API_ERROR;
+
+	I64 status = resp->status_code;
+	HTTPResponseFree(resp);
+
+	return (status == 204) ? DISCORD_OK : DISCORD_ERR_API_ERROR;
+}
+
+// Delete all reactions for emoji
+I64 DiscordDeleteEmojiReactions(CDiscordClient *client, CDiscordSnowflake channel_id,
+                                CDiscordSnowflake message_id, U8 *emoji,
+                                CDiscordSnowflake custom_id)
+{
+	U8 endpoint[192];
+	U8 encoded_emoji[64];
+	CHTTPResponse *resp;
+
+	DiscordEncodeEmoji(emoji, encoded_emoji, custom_id);
+	StrPrint(endpoint, "/channels/%llu/messages/%llu/reactions/%s",
+	         channel_id, message_id, encoded_emoji);
+
+	resp = DiscordAPIRequest(client, HTTP_METHOD_DELETE, endpoint, NULL);
+	if (!resp) return DISCORD_ERR_API_ERROR;
+
+	I64 status = resp->status_code;
+	HTTPResponseFree(resp);
+
+	return (status == 204) ? DISCORD_OK : DISCORD_ERR_API_ERROR;
+}
+
+// ============================================================================
+// GUILD ENDPOINTS
+// ============================================================================
+
+// Get guild information
+CJSONValue *DiscordGetGuild(CDiscordClient *client, CDiscordSnowflake guild_id)
+{
+	U8 endpoint[64];
+	CHTTPResponse *resp;
+
+	StrPrint(endpoint, "/guilds/%llu", guild_id);
+
+	resp = DiscordAPIRequest(client, HTTP_METHOD_GET, endpoint, NULL);
+	if (!resp) return NULL;
+
+	CJSONValue *result = NULL;
+	if (resp->status_code == 200 && resp->body) {
+		result = JSONParse(resp->body);
+	}
+
+	HTTPResponseFree(resp);
+	return result;
+}
+
+// Get guild member
+CJSONValue *DiscordGetGuildMember(CDiscordClient *client, CDiscordSnowflake guild_id,
+                                  CDiscordSnowflake user_id)
+{
+	U8 endpoint[128];
+	CHTTPResponse *resp;
+
+	StrPrint(endpoint, "/guilds/%llu/members/%llu", guild_id, user_id);
+
+	resp = DiscordAPIRequest(client, HTTP_METHOD_GET, endpoint, NULL);
+	if (!resp) return NULL;
+
+	CJSONValue *result = NULL;
+	if (resp->status_code == 200 && resp->body) {
+		result = JSONParse(resp->body);
+	}
+
+	HTTPResponseFree(resp);
+	return result;
+}
+
+// List guild members
+CJSONValue *DiscordListGuildMembers(CDiscordClient *client, CDiscordSnowflake guild_id,
+                                    I64 limit, CDiscordSnowflake after)
+{
+	U8 endpoint[128];
+	CHTTPResponse *resp;
+
+	if (limit > 0 && after > 0) {
+		StrPrint(endpoint, "/guilds/%llu/members?limit=%d&after=%llu", guild_id, limit, after);
+	} else if (limit > 0) {
+		StrPrint(endpoint, "/guilds/%llu/members?limit=%d", guild_id, limit);
+	} else if (after > 0) {
+		StrPrint(endpoint, "/guilds/%llu/members?after=%llu", guild_id, after);
+	} else {
+		StrPrint(endpoint, "/guilds/%llu/members", guild_id);
+	}
+
+	resp = DiscordAPIRequest(client, HTTP_METHOD_GET, endpoint, NULL);
+	if (!resp) return NULL;
+
+	CJSONValue *result = NULL;
+	if (resp->status_code == 200 && resp->body) {
+		result = JSONParse(resp->body);
+	}
+
+	HTTPResponseFree(resp);
+	return result;
+}
+
+// Modify guild member
+I64 DiscordModifyGuildMember(CDiscordClient *client, CDiscordSnowflake guild_id,
+                             CDiscordSnowflake user_id, U8 *nick,
+                             CDiscordSnowflake *role_ids, I64 role_count)
+{
+	U8 endpoint[128];
+	CJSONBuilder json;
+	CHTTPResponse *resp;
+	I64 i;
+
+	StrPrint(endpoint, "/guilds/%llu/members/%llu", guild_id, user_id);
+
+	JSONBuilderInit(&json, 512);
+	JSONBeginObject(&json);
+
+	if (nick) {
+		JSONKeyString(&json, "nick", nick);
+	}
+
+	if (role_ids && role_count > 0) {
+		JSONKeyArray(&json, "roles");
+		for (i = 0; i < role_count; i++) {
+			U8 id_str[32];
+			StrPrint(id_str, "%llu", role_ids[i]);
+			JSONString(&json, id_str);
+		}
+		JSONEndArray(&json);
+	}
+
+	JSONEndObject(&json);
+
+	resp = DiscordAPIRequest(client, HTTP_METHOD_PATCH, endpoint, JSONBuilderGet(&json));
+	JSONBuilderFree(&json);
+
+	if (!resp) return DISCORD_ERR_API_ERROR;
+
+	I64 status = resp->status_code;
+	HTTPResponseFree(resp);
+
+	return (status == 200 || status == 204) ? DISCORD_OK : DISCORD_ERR_API_ERROR;
+}
+
+// Add role to member
+I64 DiscordAddMemberRole(CDiscordClient *client, CDiscordSnowflake guild_id,
+                         CDiscordSnowflake user_id, CDiscordSnowflake role_id)
+{
+	U8 endpoint[192];
+	CHTTPResponse *resp;
+
+	StrPrint(endpoint, "/guilds/%llu/members/%llu/roles/%llu", guild_id, user_id, role_id);
+
+	resp = DiscordAPIRequest(client, HTTP_METHOD_PUT, endpoint, NULL);
+	if (!resp) return DISCORD_ERR_API_ERROR;
+
+	I64 status = resp->status_code;
+	HTTPResponseFree(resp);
+
+	return (status == 204) ? DISCORD_OK : DISCORD_ERR_API_ERROR;
+}
+
+// Remove role from member
+I64 DiscordRemoveMemberRole(CDiscordClient *client, CDiscordSnowflake guild_id,
+                            CDiscordSnowflake user_id, CDiscordSnowflake role_id)
+{
+	U8 endpoint[192];
+	CHTTPResponse *resp;
+
+	StrPrint(endpoint, "/guilds/%llu/members/%llu/roles/%llu", guild_id, user_id, role_id);
+
+	resp = DiscordAPIRequest(client, HTTP_METHOD_DELETE, endpoint, NULL);
+	if (!resp) return DISCORD_ERR_API_ERROR;
+
+	I64 status = resp->status_code;
+	HTTPResponseFree(resp);
+
+	return (status == 204) ? DISCORD_OK : DISCORD_ERR_API_ERROR;
+}
+
+// Kick member
+I64 DiscordKickMember(CDiscordClient *client, CDiscordSnowflake guild_id,
+                      CDiscordSnowflake user_id)
+{
+	U8 endpoint[128];
+	CHTTPResponse *resp;
+
+	StrPrint(endpoint, "/guilds/%llu/members/%llu", guild_id, user_id);
+
+	resp = DiscordAPIRequest(client, HTTP_METHOD_DELETE, endpoint, NULL);
+	if (!resp) return DISCORD_ERR_API_ERROR;
+
+	I64 status = resp->status_code;
+	HTTPResponseFree(resp);
+
+	return (status == 204) ? DISCORD_OK : DISCORD_ERR_API_ERROR;
+}
+
+// Ban member
+I64 DiscordBanMember(CDiscordClient *client, CDiscordSnowflake guild_id,
+                     CDiscordSnowflake user_id, I64 delete_message_days)
+{
+	U8 endpoint[128];
+	CJSONBuilder json;
+	CHTTPResponse *resp;
+
+	StrPrint(endpoint, "/guilds/%llu/bans/%llu", guild_id, user_id);
+
+	JSONBuilderInit(&json, 64);
+	JSONBeginObject(&json);
+	if (delete_message_days > 0 && delete_message_days <= 7) {
+		JSONKeyInt(&json, "delete_message_days", delete_message_days);
+	}
+	JSONEndObject(&json);
+
+	resp = DiscordAPIRequest(client, HTTP_METHOD_PUT, endpoint, JSONBuilderGet(&json));
+	JSONBuilderFree(&json);
+
+	if (!resp) return DISCORD_ERR_API_ERROR;
+
+	I64 status = resp->status_code;
+	HTTPResponseFree(resp);
+
+	return (status == 204) ? DISCORD_OK : DISCORD_ERR_API_ERROR;
+}
+
+// Unban member
+I64 DiscordUnbanMember(CDiscordClient *client, CDiscordSnowflake guild_id,
+                       CDiscordSnowflake user_id)
+{
+	U8 endpoint[128];
+	CHTTPResponse *resp;
+
+	StrPrint(endpoint, "/guilds/%llu/bans/%llu", guild_id, user_id);
+
+	resp = DiscordAPIRequest(client, HTTP_METHOD_DELETE, endpoint, NULL);
+	if (!resp) return DISCORD_ERR_API_ERROR;
+
+	I64 status = resp->status_code;
+	HTTPResponseFree(resp);
+
+	return (status == 204) ? DISCORD_OK : DISCORD_ERR_API_ERROR;
+}
+
+// Get guild roles
+CJSONValue *DiscordGetGuildRoles(CDiscordClient *client, CDiscordSnowflake guild_id)
+{
+	U8 endpoint[64];
+	CHTTPResponse *resp;
+
+	StrPrint(endpoint, "/guilds/%llu/roles", guild_id);
+
+	resp = DiscordAPIRequest(client, HTTP_METHOD_GET, endpoint, NULL);
+	if (!resp) return NULL;
+
+	CJSONValue *result = NULL;
+	if (resp->status_code == 200 && resp->body) {
+		result = JSONParse(resp->body);
+	}
+
+	HTTPResponseFree(resp);
+	return result;
+}
+
+// Get guild channels
+CJSONValue *DiscordGetGuildChannels(CDiscordClient *client, CDiscordSnowflake guild_id)
+{
+	U8 endpoint[64];
+	CHTTPResponse *resp;
+
+	StrPrint(endpoint, "/guilds/%llu/channels", guild_id);
+
+	resp = DiscordAPIRequest(client, HTTP_METHOD_GET, endpoint, NULL);
+	if (!resp) return NULL;
+
+	CJSONValue *result = NULL;
+	if (resp->status_code == 200 && resp->body) {
+		result = JSONParse(resp->body);
+	}
+
+	HTTPResponseFree(resp);
+	return result;
+}
+
+// ============================================================================
+// USER ENDPOINTS
+// ============================================================================
+
+// Get current user
+CJSONValue *DiscordGetCurrentUser(CDiscordClient *client)
+{
+	CHTTPResponse *resp;
+
+	resp = DiscordAPIRequest(client, HTTP_METHOD_GET, "/users/@me", NULL);
+	if (!resp) return NULL;
+
+	CJSONValue *result = NULL;
+	if (resp->status_code == 200 && resp->body) {
+		result = JSONParse(resp->body);
+	}
+
+	HTTPResponseFree(resp);
+	return result;
+}
+
+// Get user
+CJSONValue *DiscordGetUser(CDiscordClient *client, CDiscordSnowflake user_id)
+{
+	U8 endpoint[64];
+	CHTTPResponse *resp;
+
+	StrPrint(endpoint, "/users/%llu", user_id);
+
+	resp = DiscordAPIRequest(client, HTTP_METHOD_GET, endpoint, NULL);
+	if (!resp) return NULL;
+
+	CJSONValue *result = NULL;
+	if (resp->status_code == 200 && resp->body) {
+		result = JSONParse(resp->body);
+	}
+
+	HTTPResponseFree(resp);
+	return result;
+}
+
+// Create DM channel
+CJSONValue *DiscordCreateDM(CDiscordClient *client, CDiscordSnowflake user_id)
+{
+	CJSONBuilder json;
+	CHTTPResponse *resp;
+	U8 id_str[32];
+
+	JSONBuilderInit(&json, 64);
+	JSONBeginObject(&json);
+	StrPrint(id_str, "%llu", user_id);
+	JSONKeyString(&json, "recipient_id", id_str);
+	JSONEndObject(&json);
+
+	resp = DiscordAPIRequest(client, HTTP_METHOD_POST, "/users/@me/channels", JSONBuilderGet(&json));
+	JSONBuilderFree(&json);
+
+	if (!resp) return NULL;
+
+	CJSONValue *result = NULL;
+	if (resp->status_code == 200 && resp->body) {
+		result = JSONParse(resp->body);
+	}
+
+	HTTPResponseFree(resp);
+	return result;
+}
+

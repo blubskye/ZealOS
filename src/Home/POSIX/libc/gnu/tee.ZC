@@ -1,0 +1,113 @@
+// tee.ZC - GNU coreutils 'tee' implementation
+// Copy standard input to each FILE, and also to standard output
+
+#define TEE_MAX_FILES 64
+
+// C-style main function
+I64 tee_main(I64 argc, U8 **argv)
+{
+    Bool append = FALSE;
+    Bool ignore_int = FALSE;
+    I64 start = 1;
+
+    // Parse options
+    while (start < argc && argv[start][0] == '-' && argv[start][1]) {
+        U8 *arg = argv[start];
+
+        if (strcmp(arg, "--help") == 0) {
+            printf("Usage: tee [OPTION]... [FILE]...\n");
+            printf("Copy standard input to each FILE, and also to standard output.\n\n");
+            printf("  -a, --append             append to the given FILEs, do not overwrite\n");
+            printf("  -i, --ignore-interrupts  ignore interrupt signals\n");
+            printf("      --help               display this help and exit\n");
+            printf("      --version            output version information and exit\n");
+            return 0;
+        }
+
+        if (strcmp(arg, "--version") == 0) {
+            printf("tee (ZealOS coreutils) 1.0\n");
+            return 0;
+        }
+
+        if (strcmp(arg, "-a") == 0 || strcmp(arg, "--append") == 0) {
+            append = TRUE;
+            start++;
+            continue;
+        }
+
+        if (strcmp(arg, "-i") == 0 || strcmp(arg, "--ignore-interrupts") == 0) {
+            ignore_int = TRUE;
+            start++;
+            continue;
+        }
+
+        // Short options combined
+        if (arg[0] == '-' && arg[1] != '-') {
+            for (I64 i = 1; arg[i]; i++) {
+                switch (arg[i]) {
+                    case 'a': append = TRUE; break;
+                    case 'i': ignore_int = TRUE; break;
+                    default:
+                        fprintf(stderr, "tee: invalid option -- '%c'\n", arg[i]);
+                        return 1;
+                }
+            }
+            start++;
+            continue;
+        }
+
+        if (strcmp(arg, "--") == 0) {
+            start++;
+            break;
+        }
+
+        break;
+    }
+
+    // Open output files
+    FILE *files[TEE_MAX_FILES];
+    I64 file_count = 0;
+    I64 exit_status = 0;
+
+    for (I64 i = start; i < argc && file_count < TEE_MAX_FILES; i++) {
+        U8 *mode = append ? "a" : "w";
+        files[file_count] = fopen(argv[i], mode);
+        if (!files[file_count]) {
+            fprintf(stderr, "tee: %s: %s\n", argv[i], strerror(errno));
+            exit_status = 1;
+        } else {
+            file_count++;
+        }
+    }
+
+    // Copy stdin to stdout and all files
+    I64 c;
+    while ((c = fgetc(stdin)) != EOF) {
+        // Write to stdout
+        if (fputc(c, stdout) == EOF) {
+            perror("tee: standard output");
+            exit_status = 1;
+        }
+
+        // Write to each file
+        for (I64 i = 0; i < file_count; i++) {
+            if (files[i] && fputc(c, files[i]) == EOF) {
+                perror("tee");
+                exit_status = 1;
+            }
+        }
+    }
+
+    // Close all files
+    for (I64 i = 0; i < file_count; i++) {
+        if (files[i])
+            fclose(files[i]);
+    }
+
+    return exit_status;
+}
+
+U0 GnuTeeRegister()
+{
+    "GNU 'tee' utility loaded. Run: CRun(&tee_main, \"tee output.txt\");\n";
+}

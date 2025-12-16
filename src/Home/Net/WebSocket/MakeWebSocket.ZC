@@ -1,0 +1,15 @@
+// MakeWebSocket.ZC - WebSocket module loader for ZealOS
+// Include this file to load WebSocket functionality
+
+Cd(__DIR__);;
+
+// Load HTTP first (includes TLS and crypto)
+#include "../HTTP/MakeHTTP"
+
+// WebSocket definitions
+#include "WebSocket.HH"
+
+// WebSocket implementation
+#include "WebSocketClient"
+
+NetLog("WebSocket module loaded.");

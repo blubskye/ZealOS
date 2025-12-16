@@ -1,0 +1,1217 @@
+// pthread.ZC - POSIX Threads implementation for ZealOS
+// Part of the POSIX compatibility layer
+//
+// ZealOS is single-core but supports cooperative multitasking via tasks.
+// This implementation maps pthreads to ZealOS tasks where possible,
+// with simplified synchronization primitives.
+
+// ============================================================================
+// PTHREAD TYPES
+// ============================================================================
+
+#define PTHREAD_THREADS_MAX     256
+#define PTHREAD_KEYS_MAX        128
+#define PTHREAD_STACK_MIN       16384
+#define PTHREAD_STACK_DEFAULT   65536
+
+// Thread states
+#define PTHREAD_STATE_NONE      0
+#define PTHREAD_STATE_RUNNING   1
+#define PTHREAD_STATE_EXITED    2
+#define PTHREAD_STATE_DETACHED  3
+#define PTHREAD_STATE_JOINED    4
+
+// Mutex types
+#define PTHREAD_MUTEX_NORMAL        0
+#define PTHREAD_MUTEX_RECURSIVE     1
+#define PTHREAD_MUTEX_ERRORCHECK    2
+#define PTHREAD_MUTEX_DEFAULT       PTHREAD_MUTEX_NORMAL
+
+// Mutex states
+#define PTHREAD_MUTEX_UNLOCKED  0
+#define PTHREAD_MUTEX_LOCKED    1
+
+// Once states
+#define PTHREAD_ONCE_INIT       0
+#define PTHREAD_ONCE_DONE       1
+
+// Condition variable
+#define PTHREAD_COND_INIT       {0, 0}
+
+// Thread cancel states
+#define PTHREAD_CANCEL_ENABLE   0
+#define PTHREAD_CANCEL_DISABLE  1
+
+#define PTHREAD_CANCEL_DEFERRED     0
+#define PTHREAD_CANCEL_ASYNCHRONOUS 1
+
+#define PTHREAD_CANCELED        ((void*)-1)
+
+// ============================================================================
+// PTHREAD STRUCTURES
+// ============================================================================
+
+// Forward declarations
+class CPthread;
+class CPthreadMutex;
+class CPthreadCond;
+class CPthreadKey;
+
+// Thread handle (opaque pointer)
+typedef CPthread *pthread_t;
+
+// Thread attributes
+class pthread_attr_t {
+    I64     stacksize;
+    I64     detachstate;
+    I64     schedpolicy;
+    I64     priority;
+    Bool    valid;
+};
+
+// Mutex
+class CPthreadMutex {
+    I64     state;          // UNLOCKED or LOCKED
+    I64     type;           // NORMAL, RECURSIVE, ERRORCHECK
+    pthread_t owner;        // Owning thread (for recursive)
+    I64     count;          // Lock count (for recursive)
+    I64     waiters;        // Number of waiting threads
+};
+
+typedef CPthreadMutex pthread_mutex_t;
+
+// Mutex attributes
+class pthread_mutexattr_t {
+    I64     type;
+    Bool    valid;
+};
+
+// Condition variable
+class CPthreadCond {
+    I64     waiters;        // Number of waiting threads
+    I64     signals;        // Pending signals
+    I64     broadcasts;     // Broadcast generation
+};
+
+typedef CPthreadCond pthread_cond_t;
+
+// Condition attributes
+class pthread_condattr_t {
+    Bool    valid;
+};
+
+// Read-write lock
+class CPthreadRWLock {
+    I64     readers;        // Number of readers
+    I64     writer;         // Writer flag
+    pthread_t writer_tid;   // Writer thread
+    I64     waiting_writers;
+    I64     waiting_readers;
+};
+
+typedef CPthreadRWLock pthread_rwlock_t;
+
+// Read-write lock attributes
+class pthread_rwlockattr_t {
+    Bool    valid;
+};
+
+// Thread-specific data key
+class CPthreadKey {
+    Bool    in_use;
+    void    (*destructor)(void*);
+};
+
+typedef I64 pthread_key_t;
+
+// Once control
+typedef I64 pthread_once_t;
+
+// Spinlock
+typedef I64 pthread_spinlock_t;
+
+// Barrier
+class CPthreadBarrier {
+    I64     count;          // Required count
+    I64     waiting;        // Currently waiting
+    I64     generation;     // Barrier generation
+};
+
+typedef CPthreadBarrier pthread_barrier_t;
+
+class pthread_barrierattr_t {
+    Bool    valid;
+};
+
+#define PTHREAD_BARRIER_SERIAL_THREAD   (-1)
+
+// ============================================================================
+// THREAD STRUCTURE
+// ============================================================================
+
+class CPthread {
+    I64         id;                     // Thread ID
+    I64         state;                  // Thread state
+    CTask       *task;                  // ZealOS task
+    void        *(*start_routine)(void*); // Entry function
+    void        *arg;                   // Argument
+    void        *retval;                // Return value
+    Bool        detached;               // Detached state
+    Bool        cancel_pending;         // Cancellation pending
+    I64         cancel_state;           // ENABLE/DISABLE
+    I64         cancel_type;            // DEFERRED/ASYNCHRONOUS
+
+    // Thread-local storage
+    void        *tls[PTHREAD_KEYS_MAX];
+
+    // Cleanup handlers
+    void        (*cleanup_handlers[16])(void*);
+    void        *cleanup_args[16];
+    I64         cleanup_count;
+
+    // Join synchronization
+    Bool        joined;
+    pthread_t   joiner;
+};
+
+// ============================================================================
+// GLOBAL STATE
+// ============================================================================
+
+// Thread table
+CPthread *pthread_threads[PTHREAD_THREADS_MAX];
+I64 pthread_thread_count = 0;
+I64 pthread_next_id = 1;
+
+// TLS keys
+CPthreadKey pthread_keys[PTHREAD_KEYS_MAX];
+I64 pthread_key_count = 0;
+
+// Main thread (created on init)
+CPthread pthread_main_thread;
+Bool pthread_initialized = FALSE;
+
+// ============================================================================
+// INITIALIZATION
+// ============================================================================
+
+U0 PthreadInit()
+{
+    if (pthread_initialized)
+        return;
+
+    // Initialize thread table
+    MemSet(pthread_threads, 0, sizeof(pthread_threads));
+
+    // Initialize keys
+    MemSet(pthread_keys, 0, sizeof(pthread_keys));
+
+    // Set up main thread
+    MemSet(&pthread_main_thread, 0, sizeof(CPthread));
+    pthread_main_thread.id = pthread_next_id++;
+    pthread_main_thread.state = PTHREAD_STATE_RUNNING;
+    pthread_main_thread.task = Fs;
+    pthread_main_thread.cancel_state = PTHREAD_CANCEL_ENABLE;
+    pthread_main_thread.cancel_type = PTHREAD_CANCEL_DEFERRED;
+
+    pthread_threads[0] = &pthread_main_thread;
+    pthread_thread_count = 1;
+
+    pthread_initialized = TRUE;
+}
+
+// Get current thread
+pthread_t pthread_self()
+{
+    PthreadInit();
+
+    // Find thread matching current task
+    CTask *current = Fs;
+    for (I64 i = 0; i < PTHREAD_THREADS_MAX; i++) {
+        if (pthread_threads[i] && pthread_threads[i]->task == current)
+            return pthread_threads[i];
+    }
+
+    // Return main thread as fallback
+    return &pthread_main_thread;
+}
+
+// ============================================================================
+// THREAD CREATION AND MANAGEMENT
+// ============================================================================
+
+// Thread entry wrapper (called by ZealOS task)
+U0 PthreadEntry(CPthread *thread)
+{
+    void *retval = NULL;
+
+    // Call thread function
+    if (thread->start_routine) {
+        retval = thread->start_routine(thread->arg);
+    }
+
+    // Store return value
+    thread->retval = retval;
+    thread->state = PTHREAD_STATE_EXITED;
+
+    // Run TLS destructors
+    for (I64 i = 0; i < PTHREAD_KEYS_MAX; i++) {
+        if (pthread_keys[i].in_use && pthread_keys[i].destructor &&
+            thread->tls[i]) {
+            pthread_keys[i].destructor(thread->tls[i]);
+            thread->tls[i] = NULL;
+        }
+    }
+
+    // Run cleanup handlers (in reverse order)
+    while (thread->cleanup_count > 0) {
+        thread->cleanup_count--;
+        I64 idx = thread->cleanup_count;
+        if (thread->cleanup_handlers[idx])
+            thread->cleanup_handlers[idx](thread->cleanup_args[idx]);
+    }
+
+    // If detached, clean up immediately
+    if (thread->detached) {
+        thread->state = PTHREAD_STATE_DETACHED;
+        // Note: actual cleanup would happen later
+    }
+}
+
+// Create a new thread
+I64 pthread_create(pthread_t *thread, pthread_attr_t *attr,
+                   void *(*start_routine)(void*), void *arg)
+{
+    PthreadInit();
+
+    // Find free slot
+    I64 slot = -1;
+    for (I64 i = 0; i < PTHREAD_THREADS_MAX; i++) {
+        if (!pthread_threads[i]) {
+            slot = i;
+            break;
+        }
+    }
+
+    if (slot < 0)
+        return EAGAIN;  // Too many threads
+
+    // Allocate thread structure
+    CPthread *t = MAlloc(sizeof(CPthread));
+    MemSet(t, 0, sizeof(CPthread));
+
+    t->id = pthread_next_id++;
+    t->state = PTHREAD_STATE_RUNNING;
+    t->start_routine = start_routine;
+    t->arg = arg;
+    t->cancel_state = PTHREAD_CANCEL_ENABLE;
+    t->cancel_type = PTHREAD_CANCEL_DEFERRED;
+
+    // Handle attributes
+    if (attr && attr->valid) {
+        t->detached = (attr->detachstate == 1);  // PTHREAD_CREATE_DETACHED
+    }
+
+    // Create ZealOS task
+    // Note: ZealOS Spawn() creates a task running a function
+    // We wrap our entry point
+    t->task = Spawn(&PthreadEntry, t, "pthread");
+
+    if (!t->task) {
+        Free(t);
+        return EAGAIN;
+    }
+
+    pthread_threads[slot] = t;
+    pthread_thread_count++;
+
+    *thread = t;
+    return 0;
+}
+
+// Wait for thread to finish
+I64 pthread_join(pthread_t thread, void **retval)
+{
+    if (!thread)
+        return EINVAL;
+
+    if (thread->detached)
+        return EINVAL;
+
+    if (thread == pthread_self())
+        return EDEADLK;
+
+    // Wait for thread to exit
+    while (thread->state == PTHREAD_STATE_RUNNING) {
+        Yield;
+    }
+
+    // Get return value
+    if (retval)
+        *retval = thread->retval;
+
+    // Mark as joined
+    thread->state = PTHREAD_STATE_JOINED;
+
+    // Remove from table
+    for (I64 i = 0; i < PTHREAD_THREADS_MAX; i++) {
+        if (pthread_threads[i] == thread) {
+            pthread_threads[i] = NULL;
+            pthread_thread_count--;
+            break;
+        }
+    }
+
+    // Free thread structure
+    Free(thread);
+
+    return 0;
+}
+
+// Detach thread
+I64 pthread_detach(pthread_t thread)
+{
+    if (!thread)
+        return EINVAL;
+
+    if (thread->detached)
+        return EINVAL;
+
+    thread->detached = TRUE;
+
+    // If already exited, clean up now
+    if (thread->state == PTHREAD_STATE_EXITED) {
+        thread->state = PTHREAD_STATE_DETACHED;
+
+        for (I64 i = 0; i < PTHREAD_THREADS_MAX; i++) {
+            if (pthread_threads[i] == thread) {
+                pthread_threads[i] = NULL;
+                pthread_thread_count--;
+                break;
+            }
+        }
+        Free(thread);
+    }
+
+    return 0;
+}
+
+// Compare thread IDs
+I64 pthread_equal(pthread_t t1, pthread_t t2)
+{
+    return t1 == t2;
+}
+
+// Exit current thread
+U0 pthread_exit(void *retval)
+{
+    pthread_t self = pthread_self();
+
+    if (self == &pthread_main_thread) {
+        // Main thread - exit process
+        exit(0);
+    }
+
+    self->retval = retval;
+    self->state = PTHREAD_STATE_EXITED;
+
+    // Kill the task
+    if (self->task && self->task != Fs)
+        Kill(self->task);
+
+    // If we are the task, we need to stop
+    // This is simplified - in reality we'd need proper task termination
+}
+
+// ============================================================================
+// THREAD ATTRIBUTES
+// ============================================================================
+
+I64 pthread_attr_init(pthread_attr_t *attr)
+{
+    if (!attr)
+        return EINVAL;
+
+    attr->stacksize = PTHREAD_STACK_DEFAULT;
+    attr->detachstate = 0;  // PTHREAD_CREATE_JOINABLE
+    attr->schedpolicy = 0;
+    attr->priority = 0;
+    attr->valid = TRUE;
+
+    return 0;
+}
+
+I64 pthread_attr_destroy(pthread_attr_t *attr)
+{
+    if (!attr || !attr->valid)
+        return EINVAL;
+
+    attr->valid = FALSE;
+    return 0;
+}
+
+I64 pthread_attr_setdetachstate(pthread_attr_t *attr, I64 detachstate)
+{
+    if (!attr || !attr->valid)
+        return EINVAL;
+
+    attr->detachstate = detachstate;
+    return 0;
+}
+
+I64 pthread_attr_getdetachstate(pthread_attr_t *attr, I64 *detachstate)
+{
+    if (!attr || !attr->valid || !detachstate)
+        return EINVAL;
+
+    *detachstate = attr->detachstate;
+    return 0;
+}
+
+I64 pthread_attr_setstacksize(pthread_attr_t *attr, I64 stacksize)
+{
+    if (!attr || !attr->valid)
+        return EINVAL;
+
+    if (stacksize < PTHREAD_STACK_MIN)
+        return EINVAL;
+
+    attr->stacksize = stacksize;
+    return 0;
+}
+
+I64 pthread_attr_getstacksize(pthread_attr_t *attr, I64 *stacksize)
+{
+    if (!attr || !attr->valid || !stacksize)
+        return EINVAL;
+
+    *stacksize = attr->stacksize;
+    return 0;
+}
+
+// ============================================================================
+// MUTEXES
+// ============================================================================
+
+I64 pthread_mutex_init(pthread_mutex_t *mutex, pthread_mutexattr_t *attr)
+{
+    if (!mutex)
+        return EINVAL;
+
+    mutex->state = PTHREAD_MUTEX_UNLOCKED;
+    mutex->type = attr ? attr->type : PTHREAD_MUTEX_DEFAULT;
+    mutex->owner = NULL;
+    mutex->count = 0;
+    mutex->waiters = 0;
+
+    return 0;
+}
+
+I64 pthread_mutex_destroy(pthread_mutex_t *mutex)
+{
+    if (!mutex)
+        return EINVAL;
+
+    if (mutex->state == PTHREAD_MUTEX_LOCKED)
+        return EBUSY;
+
+    mutex->state = PTHREAD_MUTEX_UNLOCKED;
+    return 0;
+}
+
+I64 pthread_mutex_lock(pthread_mutex_t *mutex)
+{
+    pthread_t self;
+
+    if (!mutex)
+        return EINVAL;
+
+    self = pthread_self();
+
+    // Handle recursive mutex
+    if (mutex->type == PTHREAD_MUTEX_RECURSIVE) {
+        if (mutex->owner == self) {
+            mutex->count++;
+            return 0;
+        }
+    }
+
+    // Handle error-checking mutex
+    if (mutex->type == PTHREAD_MUTEX_ERRORCHECK) {
+        if (mutex->owner == self)
+            return EDEADLK;
+    }
+
+    // Spin-wait for lock (ZealOS is cooperative, so we yield)
+    mutex->waiters++;
+    while (mutex->state == PTHREAD_MUTEX_LOCKED) {
+        Yield;
+    }
+    mutex->waiters--;
+
+    // Acquire lock
+    mutex->state = PTHREAD_MUTEX_LOCKED;
+    mutex->owner = self;
+    mutex->count = 1;
+
+    return 0;
+}
+
+I64 pthread_mutex_trylock(pthread_mutex_t *mutex)
+{
+    pthread_t self;
+
+    if (!mutex)
+        return EINVAL;
+
+    self = pthread_self();
+
+    // Handle recursive mutex
+    if (mutex->type == PTHREAD_MUTEX_RECURSIVE) {
+        if (mutex->owner == self) {
+            mutex->count++;
+            return 0;
+        }
+    }
+
+    // Try to acquire
+    if (mutex->state == PTHREAD_MUTEX_LOCKED)
+        return EBUSY;
+
+    mutex->state = PTHREAD_MUTEX_LOCKED;
+    mutex->owner = self;
+    mutex->count = 1;
+
+    return 0;
+}
+
+I64 pthread_mutex_unlock(pthread_mutex_t *mutex)
+{
+    pthread_t self;
+
+    if (!mutex)
+        return EINVAL;
+
+    self = pthread_self();
+
+    // Check ownership
+    if (mutex->type == PTHREAD_MUTEX_ERRORCHECK ||
+        mutex->type == PTHREAD_MUTEX_RECURSIVE) {
+        if (mutex->owner != self)
+            return EPERM;
+    }
+
+    // Handle recursive mutex
+    if (mutex->type == PTHREAD_MUTEX_RECURSIVE) {
+        if (--mutex->count > 0)
+            return 0;
+    }
+
+    // Release lock
+    mutex->state = PTHREAD_MUTEX_UNLOCKED;
+    mutex->owner = NULL;
+    mutex->count = 0;
+
+    // Yield to let waiters run
+    if (mutex->waiters > 0)
+        Yield;
+
+    return 0;
+}
+
+// ============================================================================
+// MUTEX ATTRIBUTES
+// ============================================================================
+
+I64 pthread_mutexattr_init(pthread_mutexattr_t *attr)
+{
+    if (!attr)
+        return EINVAL;
+
+    attr->type = PTHREAD_MUTEX_DEFAULT;
+    attr->valid = TRUE;
+    return 0;
+}
+
+I64 pthread_mutexattr_destroy(pthread_mutexattr_t *attr)
+{
+    if (!attr || !attr->valid)
+        return EINVAL;
+
+    attr->valid = FALSE;
+    return 0;
+}
+
+I64 pthread_mutexattr_settype(pthread_mutexattr_t *attr, I64 type)
+{
+    if (!attr || !attr->valid)
+        return EINVAL;
+
+    if (type < 0 || type > PTHREAD_MUTEX_ERRORCHECK)
+        return EINVAL;
+
+    attr->type = type;
+    return 0;
+}
+
+I64 pthread_mutexattr_gettype(pthread_mutexattr_t *attr, I64 *type)
+{
+    if (!attr || !attr->valid || !type)
+        return EINVAL;
+
+    *type = attr->type;
+    return 0;
+}
+
+// ============================================================================
+// CONDITION VARIABLES
+// ============================================================================
+
+I64 pthread_cond_init(pthread_cond_t *cond, pthread_condattr_t *attr)
+{
+    if (!cond)
+        return EINVAL;
+
+    cond->waiters = 0;
+    cond->signals = 0;
+    cond->broadcasts = 0;
+
+    return 0;
+}
+
+I64 pthread_cond_destroy(pthread_cond_t *cond)
+{
+    if (!cond)
+        return EINVAL;
+
+    if (cond->waiters > 0)
+        return EBUSY;
+
+    return 0;
+}
+
+I64 pthread_cond_wait(pthread_cond_t *cond, pthread_mutex_t *mutex)
+{
+    I64 gen;
+
+    if (!cond || !mutex)
+        return EINVAL;
+
+    gen = cond->broadcasts;
+
+    // Release mutex
+    pthread_mutex_unlock(mutex);
+
+    // Wait for signal or broadcast
+    cond->waiters++;
+    while (cond->signals == 0 && cond->broadcasts == gen) {
+        Yield;
+    }
+
+    if (cond->signals > 0)
+        cond->signals--;
+
+    cond->waiters--;
+
+    // Reacquire mutex
+    pthread_mutex_lock(mutex);
+
+    return 0;
+}
+
+I64 pthread_cond_timedwait(pthread_cond_t *cond, pthread_mutex_t *mutex,
+                           CPosixTimeSpec *abstime)
+{
+    I64 gen;
+    U64 deadline, now;
+
+    if (!cond || !mutex)
+        return EINVAL;
+
+    // Calculate deadline
+    if (abstime) {
+        deadline = abstime->tv_sec * 1000000 + abstime->tv_nsec / 1000;
+    } else {
+        deadline = 0xFFFFFFFFFFFFFFFF;  // No timeout
+    }
+
+    gen = cond->broadcasts;
+
+    pthread_mutex_unlock(mutex);
+
+    cond->waiters++;
+    while (cond->signals == 0 && cond->broadcasts == gen) {
+        now = tS * 1000000;
+        if (now >= deadline) {
+            cond->waiters--;
+            pthread_mutex_lock(mutex);
+            return ETIMEDOUT;
+        }
+        Yield;
+    }
+
+    if (cond->signals > 0)
+        cond->signals--;
+
+    cond->waiters--;
+
+    pthread_mutex_lock(mutex);
+
+    return 0;
+}
+
+I64 pthread_cond_signal(pthread_cond_t *cond)
+{
+    if (!cond)
+        return EINVAL;
+
+    if (cond->waiters > 0)
+        cond->signals++;
+
+    return 0;
+}
+
+I64 pthread_cond_broadcast(pthread_cond_t *cond)
+{
+    if (!cond)
+        return EINVAL;
+
+    cond->broadcasts++;
+
+    return 0;
+}
+
+// ============================================================================
+// READ-WRITE LOCKS
+// ============================================================================
+
+I64 pthread_rwlock_init(pthread_rwlock_t *rwlock, pthread_rwlockattr_t *attr)
+{
+    if (!rwlock)
+        return EINVAL;
+
+    rwlock->readers = 0;
+    rwlock->writer = 0;
+    rwlock->writer_tid = NULL;
+    rwlock->waiting_writers = 0;
+    rwlock->waiting_readers = 0;
+
+    return 0;
+}
+
+I64 pthread_rwlock_destroy(pthread_rwlock_t *rwlock)
+{
+    if (!rwlock)
+        return EINVAL;
+
+    if (rwlock->readers > 0 || rwlock->writer)
+        return EBUSY;
+
+    return 0;
+}
+
+I64 pthread_rwlock_rdlock(pthread_rwlock_t *rwlock)
+{
+    if (!rwlock)
+        return EINVAL;
+
+    rwlock->waiting_readers++;
+    while (rwlock->writer || rwlock->waiting_writers > 0) {
+        Yield;
+    }
+    rwlock->waiting_readers--;
+    rwlock->readers++;
+
+    return 0;
+}
+
+I64 pthread_rwlock_tryrdlock(pthread_rwlock_t *rwlock)
+{
+    if (!rwlock)
+        return EINVAL;
+
+    if (rwlock->writer || rwlock->waiting_writers > 0)
+        return EBUSY;
+
+    rwlock->readers++;
+    return 0;
+}
+
+I64 pthread_rwlock_wrlock(pthread_rwlock_t *rwlock)
+{
+    if (!rwlock)
+        return EINVAL;
+
+    rwlock->waiting_writers++;
+    while (rwlock->readers > 0 || rwlock->writer) {
+        Yield;
+    }
+    rwlock->waiting_writers--;
+    rwlock->writer = 1;
+    rwlock->writer_tid = pthread_self();
+
+    return 0;
+}
+
+I64 pthread_rwlock_trywrlock(pthread_rwlock_t *rwlock)
+{
+    if (!rwlock)
+        return EINVAL;
+
+    if (rwlock->readers > 0 || rwlock->writer)
+        return EBUSY;
+
+    rwlock->writer = 1;
+    rwlock->writer_tid = pthread_self();
+    return 0;
+}
+
+I64 pthread_rwlock_unlock(pthread_rwlock_t *rwlock)
+{
+    if (!rwlock)
+        return EINVAL;
+
+    if (rwlock->writer) {
+        rwlock->writer = 0;
+        rwlock->writer_tid = NULL;
+    } else if (rwlock->readers > 0) {
+        rwlock->readers--;
+    }
+
+    return 0;
+}
+
+// ============================================================================
+// THREAD-LOCAL STORAGE
+// ============================================================================
+
+I64 pthread_key_create(pthread_key_t *key, void (*destructor)(void*))
+{
+    PthreadInit();
+
+    if (!key)
+        return EINVAL;
+
+    // Find free key
+    for (I64 i = 0; i < PTHREAD_KEYS_MAX; i++) {
+        if (!pthread_keys[i].in_use) {
+            pthread_keys[i].in_use = TRUE;
+            pthread_keys[i].destructor = destructor;
+            *key = i;
+            return 0;
+        }
+    }
+
+    return EAGAIN;
+}
+
+I64 pthread_key_delete(pthread_key_t key)
+{
+    if (key < 0 || key >= PTHREAD_KEYS_MAX)
+        return EINVAL;
+
+    if (!pthread_keys[key].in_use)
+        return EINVAL;
+
+    pthread_keys[key].in_use = FALSE;
+    pthread_keys[key].destructor = NULL;
+
+    // Clear value in all threads
+    for (I64 i = 0; i < PTHREAD_THREADS_MAX; i++) {
+        if (pthread_threads[i])
+            pthread_threads[i]->tls[key] = NULL;
+    }
+
+    return 0;
+}
+
+void *pthread_getspecific(pthread_key_t key)
+{
+    pthread_t self;
+
+    if (key < 0 || key >= PTHREAD_KEYS_MAX)
+        return NULL;
+
+    if (!pthread_keys[key].in_use)
+        return NULL;
+
+    self = pthread_self();
+    return self->tls[key];
+}
+
+I64 pthread_setspecific(pthread_key_t key, void *value)
+{
+    pthread_t self;
+
+    if (key < 0 || key >= PTHREAD_KEYS_MAX)
+        return EINVAL;
+
+    if (!pthread_keys[key].in_use)
+        return EINVAL;
+
+    self = pthread_self();
+    self->tls[key] = value;
+
+    return 0;
+}
+
+// ============================================================================
+// ONCE INITIALIZATION
+// ============================================================================
+
+I64 pthread_once(pthread_once_t *once_control, void (*init_routine)(void))
+{
+    if (!once_control || !init_routine)
+        return EINVAL;
+
+    // Simple spinlock-based implementation
+    if (*once_control == PTHREAD_ONCE_INIT) {
+        // Try to claim it
+        if (*once_control == PTHREAD_ONCE_INIT) {
+            *once_control = 2;  // In progress
+            init_routine();
+            *once_control = PTHREAD_ONCE_DONE;
+        }
+    }
+
+    // Wait if another thread is initializing
+    while (*once_control == 2)
+        Yield;
+
+    return 0;
+}
+
+// ============================================================================
+// CANCELLATION
+// ============================================================================
+
+I64 pthread_setcancelstate(I64 state, I64 *oldstate)
+{
+    pthread_t self = pthread_self();
+
+    if (state != PTHREAD_CANCEL_ENABLE && state != PTHREAD_CANCEL_DISABLE)
+        return EINVAL;
+
+    if (oldstate)
+        *oldstate = self->cancel_state;
+
+    self->cancel_state = state;
+
+    // Check for pending cancellation
+    if (state == PTHREAD_CANCEL_ENABLE && self->cancel_pending) {
+        pthread_exit(PTHREAD_CANCELED);
+    }
+
+    return 0;
+}
+
+I64 pthread_setcanceltype(I64 type, I64 *oldtype)
+{
+    pthread_t self = pthread_self();
+
+    if (type != PTHREAD_CANCEL_DEFERRED && type != PTHREAD_CANCEL_ASYNCHRONOUS)
+        return EINVAL;
+
+    if (oldtype)
+        *oldtype = self->cancel_type;
+
+    self->cancel_type = type;
+
+    return 0;
+}
+
+I64 pthread_cancel(pthread_t thread)
+{
+    if (!thread)
+        return EINVAL;
+
+    thread->cancel_pending = TRUE;
+
+    // If asynchronous cancellation, terminate immediately
+    if (thread->cancel_state == PTHREAD_CANCEL_ENABLE &&
+        thread->cancel_type == PTHREAD_CANCEL_ASYNCHRONOUS) {
+        thread->retval = PTHREAD_CANCELED;
+        thread->state = PTHREAD_STATE_EXITED;
+        if (thread->task)
+            Kill(thread->task);
+    }
+
+    return 0;
+}
+
+U0 pthread_testcancel()
+{
+    pthread_t self = pthread_self();
+
+    if (self->cancel_state == PTHREAD_CANCEL_ENABLE && self->cancel_pending) {
+        pthread_exit(PTHREAD_CANCELED);
+    }
+}
+
+// ============================================================================
+// CLEANUP HANDLERS
+// ============================================================================
+
+U0 pthread_cleanup_push_impl(pthread_t self, void (*routine)(void*), void *arg)
+{
+    if (self->cleanup_count < 16) {
+        self->cleanup_handlers[self->cleanup_count] = routine;
+        self->cleanup_args[self->cleanup_count] = arg;
+        self->cleanup_count++;
+    }
+}
+
+U0 pthread_cleanup_pop_impl(pthread_t self, I64 execute)
+{
+    if (self->cleanup_count > 0) {
+        self->cleanup_count--;
+        if (execute && self->cleanup_handlers[self->cleanup_count]) {
+            self->cleanup_handlers[self->cleanup_count](
+                self->cleanup_args[self->cleanup_count]);
+        }
+    }
+}
+
+// Macro versions
+#define pthread_cleanup_push(routine, arg) \
+    pthread_cleanup_push_impl(pthread_self(), routine, arg)
+
+#define pthread_cleanup_pop(execute) \
+    pthread_cleanup_pop_impl(pthread_self(), execute)
+
+// ============================================================================
+// SPINLOCKS
+// ============================================================================
+
+I64 pthread_spin_init(pthread_spinlock_t *lock, I64 pshared)
+{
+    if (!lock)
+        return EINVAL;
+
+    *lock = 0;
+    return 0;
+}
+
+I64 pthread_spin_destroy(pthread_spinlock_t *lock)
+{
+    if (!lock)
+        return EINVAL;
+
+    return 0;
+}
+
+I64 pthread_spin_lock(pthread_spinlock_t *lock)
+{
+    if (!lock)
+        return EINVAL;
+
+    while (*lock) {
+        Yield;  // Cooperative, so yield instead of spin
+    }
+    *lock = 1;
+
+    return 0;
+}
+
+I64 pthread_spin_trylock(pthread_spinlock_t *lock)
+{
+    if (!lock)
+        return EINVAL;
+
+    if (*lock)
+        return EBUSY;
+
+    *lock = 1;
+    return 0;
+}
+
+I64 pthread_spin_unlock(pthread_spinlock_t *lock)
+{
+    if (!lock)
+        return EINVAL;
+
+    *lock = 0;
+    return 0;
+}
+
+// ============================================================================
+// BARRIERS
+// ============================================================================
+
+I64 pthread_barrier_init(pthread_barrier_t *barrier, pthread_barrierattr_t *attr,
+                         U32 count)
+{
+    if (!barrier || count == 0)
+        return EINVAL;
+
+    barrier->count = count;
+    barrier->waiting = 0;
+    barrier->generation = 0;
+
+    return 0;
+}
+
+I64 pthread_barrier_destroy(pthread_barrier_t *barrier)
+{
+    if (!barrier)
+        return EINVAL;
+
+    if (barrier->waiting > 0)
+        return EBUSY;
+
+    return 0;
+}
+
+I64 pthread_barrier_wait(pthread_barrier_t *barrier)
+{
+    I64 gen;
+    I64 ret = 0;
+
+    if (!barrier)
+        return EINVAL;
+
+    gen = barrier->generation;
+    barrier->waiting++;
+
+    if (barrier->waiting == barrier->count) {
+        // Last thread - release all
+        barrier->waiting = 0;
+        barrier->generation++;
+        ret = PTHREAD_BARRIER_SERIAL_THREAD;
+    } else {
+        // Wait for others
+        while (barrier->generation == gen) {
+            Yield;
+        }
+    }
+
+    return ret;
+}
+
+// ============================================================================
+// SCHEDULING (stubs - ZealOS doesn't have real-time scheduling)
+// ============================================================================
+
+I64 pthread_setschedparam(pthread_t thread, I64 policy, void *param)
+{
+    return 0;  // Ignored
+}
+
+I64 pthread_getschedparam(pthread_t thread, I64 *policy, void *param)
+{
+    if (policy)
+        *policy = 0;
+    return 0;
+}
+
+I64 sched_yield()
+{
+    Yield;
+    return 0;
+}
+
+// ============================================================================
+// INITIALIZATION MESSAGE
+// ============================================================================
+
+"pthreads loaded - POSIX threads for ZealOS\n";

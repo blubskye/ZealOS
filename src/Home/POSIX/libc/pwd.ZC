@@ -1,0 +1,403 @@
+// pwd.ZC - Password/User Database for ZealOS
+// Part of the POSIX compatibility layer
+//
+// Provides getpwuid, getpwnam, etc. for user information
+
+// ============================================================================
+// PASSWORD STRUCTURE
+// ============================================================================
+
+class passwd {
+    U8 *pw_name;      // Username
+    U8 *pw_passwd;    // Password (usually "x" or "*")
+    U32 pw_uid;       // User ID
+    U32 pw_gid;       // Group ID
+    U8 *pw_gecos;     // User info (full name)
+    U8 *pw_dir;       // Home directory
+    U8 *pw_shell;     // Login shell
+};
+
+// ============================================================================
+// STATIC DATA
+// ============================================================================
+
+// ZealOS single-user system defaults
+static passwd g_passwd_entry;
+static U8 g_pw_name[64] = "user";
+static U8 g_pw_passwd[4] = "*";
+static U8 g_pw_gecos[64] = "ZealOS User";
+static U8 g_pw_dir[256] = "/Home";
+static U8 g_pw_shell[64] = "/bin/sh";
+
+static Bool g_passwd_initialized = FALSE;
+static I64 g_passwd_index = 0;
+
+// ============================================================================
+// INITIALIZATION
+// ============================================================================
+
+U0 passwd_init()
+{
+    if (g_passwd_initialized) return;
+
+    // Set up the single user entry
+    g_passwd_entry.pw_name = g_pw_name;
+    g_passwd_entry.pw_passwd = g_pw_passwd;
+    g_passwd_entry.pw_uid = 1000;  // Default UID
+    g_passwd_entry.pw_gid = 1000;  // Default GID
+    g_passwd_entry.pw_gecos = g_pw_gecos;
+    g_passwd_entry.pw_dir = g_pw_dir;
+    g_passwd_entry.pw_shell = g_pw_shell;
+
+    // Try to get username from environment
+    U8 *user = getenv("USER");
+    if (user && StrLen(user) < 64) {
+        StrCpy(g_pw_name, user);
+    }
+
+    // Try to get home from environment
+    U8 *home = getenv("HOME");
+    if (home && StrLen(home) < 256) {
+        StrCpy(g_pw_dir, home);
+    }
+
+    g_passwd_initialized = TRUE;
+}
+
+// ============================================================================
+// PASSWORD DATABASE FUNCTIONS
+// ============================================================================
+
+// Get password entry by UID
+passwd *getpwuid(U32 uid)
+{
+    passwd_init();
+
+    // In ZealOS, we have a single user
+    // Accept UID 0 (root) or 1000 (default user)
+    if (uid == 0 || uid == 1000 || uid == g_passwd_entry.pw_uid) {
+        return &g_passwd_entry;
+    }
+
+    return NULL;
+}
+
+// Get password entry by name
+passwd *getpwnam(U8 *name)
+{
+    if (!name) return NULL;
+
+    passwd_init();
+
+    // Check if name matches our single user
+    if (StrCmp(name, g_passwd_entry.pw_name) == 0 ||
+        StrCmp(name, "root") == 0) {
+        return &g_passwd_entry;
+    }
+
+    return NULL;
+}
+
+// Rewind password database
+U0 setpwent()
+{
+    passwd_init();
+    g_passwd_index = 0;
+}
+
+// Close password database
+U0 endpwent()
+{
+    g_passwd_index = 0;
+}
+
+// Get next password entry
+passwd *getpwent()
+{
+    passwd_init();
+
+    // We only have one entry
+    if (g_passwd_index == 0) {
+        g_passwd_index++;
+        return &g_passwd_entry;
+    }
+
+    return NULL;
+}
+
+// ============================================================================
+// REENTRANT VERSIONS (simplified - not truly reentrant)
+// ============================================================================
+
+I64 getpwuid_r(U32 uid, passwd *pwd, U8 *buf, I64 buflen, passwd **result)
+{
+    if (!pwd || !buf || !result) {
+        return EINVAL;
+    }
+
+    passwd *p = getpwuid(uid);
+    if (!p) {
+        *result = NULL;
+        return ENOENT;
+    }
+
+    // Copy data to provided buffer
+    I64 offset = 0;
+
+    pwd->pw_uid = p->pw_uid;
+    pwd->pw_gid = p->pw_gid;
+
+    // Copy strings
+    I64 len = StrLen(p->pw_name) + 1;
+    if (offset + len > buflen) return ERANGE;
+    StrCpy(&buf[offset], p->pw_name);
+    pwd->pw_name = &buf[offset];
+    offset += len;
+
+    len = StrLen(p->pw_passwd) + 1;
+    if (offset + len > buflen) return ERANGE;
+    StrCpy(&buf[offset], p->pw_passwd);
+    pwd->pw_passwd = &buf[offset];
+    offset += len;
+
+    len = StrLen(p->pw_gecos) + 1;
+    if (offset + len > buflen) return ERANGE;
+    StrCpy(&buf[offset], p->pw_gecos);
+    pwd->pw_gecos = &buf[offset];
+    offset += len;
+
+    len = StrLen(p->pw_dir) + 1;
+    if (offset + len > buflen) return ERANGE;
+    StrCpy(&buf[offset], p->pw_dir);
+    pwd->pw_dir = &buf[offset];
+    offset += len;
+
+    len = StrLen(p->pw_shell) + 1;
+    if (offset + len > buflen) return ERANGE;
+    StrCpy(&buf[offset], p->pw_shell);
+    pwd->pw_shell = &buf[offset];
+
+    *result = pwd;
+    return 0;
+}
+
+I64 getpwnam_r(U8 *name, passwd *pwd, U8 *buf, I64 buflen, passwd **result)
+{
+    if (!name || !pwd || !buf || !result) {
+        return EINVAL;
+    }
+
+    passwd *p = getpwnam(name);
+    if (!p) {
+        *result = NULL;
+        return ENOENT;
+    }
+
+    // Use getpwuid_r to copy
+    return getpwuid_r(p->pw_uid, pwd, buf, buflen, result);
+}
+
+// ============================================================================
+// LOGIN NAME FUNCTIONS
+// ============================================================================
+
+// Get login name
+U8 *getlogin()
+{
+    passwd_init();
+    return g_passwd_entry.pw_name;
+}
+
+// Get login name (reentrant)
+I64 getlogin_r(U8 *buf, I64 bufsize)
+{
+    if (!buf || bufsize <= 0) {
+        return EINVAL;
+    }
+
+    U8 *name = getlogin();
+    if (!name) {
+        return ENOENT;
+    }
+
+    I64 len = StrLen(name);
+    if (len >= bufsize) {
+        return ERANGE;
+    }
+
+    StrCpy(buf, name);
+    return 0;
+}
+
+// ============================================================================
+// GROUP STRUCTURE AND FUNCTIONS
+// ============================================================================
+
+class group {
+    U8 *gr_name;      // Group name
+    U8 *gr_passwd;    // Group password
+    U32 gr_gid;       // Group ID
+    U8 **gr_mem;      // Group members
+};
+
+static group g_group_entry;
+static U8 g_gr_name[64] = "users";
+static U8 g_gr_passwd[4] = "*";
+static U8 *g_gr_members[2] = {NULL, NULL};
+static Bool g_group_initialized = FALSE;
+static I64 g_group_index = 0;
+
+U0 group_init()
+{
+    if (g_group_initialized) return;
+
+    passwd_init();
+
+    g_group_entry.gr_name = g_gr_name;
+    g_group_entry.gr_passwd = g_gr_passwd;
+    g_group_entry.gr_gid = 1000;
+    g_gr_members[0] = g_passwd_entry.pw_name;
+    g_gr_members[1] = NULL;
+    g_group_entry.gr_mem = g_gr_members;
+
+    g_group_initialized = TRUE;
+}
+
+// Get group by GID
+group *getgrgid(U32 gid)
+{
+    group_init();
+
+    if (gid == 0 || gid == 1000 || gid == g_group_entry.gr_gid) {
+        return &g_group_entry;
+    }
+
+    return NULL;
+}
+
+// Get group by name
+group *getgrnam(U8 *name)
+{
+    if (!name) return NULL;
+
+    group_init();
+
+    if (StrCmp(name, g_group_entry.gr_name) == 0 ||
+        StrCmp(name, "root") == 0 ||
+        StrCmp(name, "wheel") == 0) {
+        return &g_group_entry;
+    }
+
+    return NULL;
+}
+
+// Rewind group database
+U0 setgrent()
+{
+    group_init();
+    g_group_index = 0;
+}
+
+// Close group database
+U0 endgrent()
+{
+    g_group_index = 0;
+}
+
+// Get next group entry
+group *getgrent()
+{
+    group_init();
+
+    if (g_group_index == 0) {
+        g_group_index++;
+        return &g_group_entry;
+    }
+
+    return NULL;
+}
+
+// ============================================================================
+// SUPPLEMENTARY GROUPS
+// ============================================================================
+
+// Get supplementary group list
+I64 getgroups(I64 size, U32 *list)
+{
+    if (size < 0) {
+        errno = EINVAL;
+        return -1;
+    }
+
+    // ZealOS: single group
+    if (size == 0) {
+        return 1;  // Return count
+    }
+
+    if (list) {
+        list[0] = 1000;  // Default GID
+    }
+
+    return 1;
+}
+
+// Set supplementary groups (no-op on ZealOS)
+I64 setgroups(I64 size, U32 *list)
+{
+    // Not supported in ZealOS
+    return 0;
+}
+
+// Initialize supplementary groups (no-op)
+I64 initgroups(U8 *user, U32 group)
+{
+    return 0;
+}
+
+// ============================================================================
+// UTILITY FUNCTIONS
+// ============================================================================
+
+// Set user/group name for this session
+U0 posix_set_user(U8 *username, U8 *fullname)
+{
+    passwd_init();
+
+    if (username && StrLen(username) < 64) {
+        StrCpy(g_pw_name, username);
+    }
+
+    if (fullname && StrLen(fullname) < 64) {
+        StrCpy(g_pw_gecos, fullname);
+    }
+}
+
+// Set home directory for this session
+U0 posix_set_home(U8 *home)
+{
+    passwd_init();
+
+    if (home && StrLen(home) < 256) {
+        StrCpy(g_pw_dir, home);
+        setenv("HOME", home, 1);
+    }
+}
+
+// Set UID/GID for this session
+U0 posix_set_ids(U32 uid, U32 gid)
+{
+    passwd_init();
+    group_init();
+
+    g_passwd_entry.pw_uid = uid;
+    g_passwd_entry.pw_gid = gid;
+    g_group_entry.gr_gid = gid;
+}
+
+// ============================================================================
+// INITIALIZATION MESSAGE
+// ============================================================================
+
+"ZealOS pwd/grp library loaded.\n";
+"  - User database: getpwuid, getpwnam, getlogin\n";
+"  - Group database: getgrgid, getgrnam, getgroups\n";

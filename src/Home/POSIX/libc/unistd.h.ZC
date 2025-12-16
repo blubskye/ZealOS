@@ -1,0 +1,511 @@
+// unistd.h - POSIX operating system API for ZealOS libc
+
+#ifndef _UNISTD_H
+#define _UNISTD_H
+
+#include "stddef.h"
+#include "sys_types.h"
+
+// Standard file descriptors
+#define STDIN_FILENO    0
+#define STDOUT_FILENO   1
+#define STDERR_FILENO   2
+
+// Access mode constants for access()
+#define F_OK    0   // File exists
+#define X_OK    1   // Execute permission
+#define W_OK    2   // Write permission
+#define R_OK    4   // Read permission
+
+// Seek constants
+#define SEEK_SET    0
+#define SEEK_CUR    1
+#define SEEK_END    2
+
+// Pathconf/sysconf constants
+#define _PC_PATH_MAX        1
+#define _PC_NAME_MAX        2
+#define _PC_PIPE_BUF        3
+#define _SC_CLK_TCK         1
+#define _SC_PAGE_SIZE       2
+#define _SC_PAGESIZE        _SC_PAGE_SIZE
+#define _SC_OPEN_MAX        3
+#define _SC_NPROCESSORS_ONLN 4
+
+// ============================================================================
+// FILE I/O
+// ============================================================================
+
+ssize_t read(I64 fd, U0 *buf, size_t count)
+{
+    return PosixRead(fd, buf, count);
+}
+
+ssize_t write(I64 fd, U0 *buf, size_t count)
+{
+    return PosixWrite(fd, buf, count);
+}
+
+I64 close(I64 fd)
+{
+    return PosixClose(fd);
+}
+
+off_t lseek(I64 fd, off_t offset, I64 whence)
+{
+    return PosixLseek(fd, offset, whence);
+}
+
+I64 dup(I64 oldfd)
+{
+    return PosixFDDup(posix_current, oldfd);
+}
+
+I64 dup2(I64 oldfd, I64 newfd)
+{
+    return PosixFDDup2(posix_current, oldfd, newfd);
+}
+
+I64 pipe(I64 *pipefd)
+{
+    return PosixPipe(pipefd);
+}
+
+// ============================================================================
+// FILE/DIRECTORY OPERATIONS
+// ============================================================================
+
+I64 access(U8 *path, I64 mode)
+{
+    return PosixAccess(path, mode);
+}
+
+I64 unlink(U8 *path)
+{
+    return PosixUnlink(path);
+}
+
+I64 rmdir(U8 *path)
+{
+    return PosixRmdir(path);
+}
+
+I64 link(U8 *oldpath, U8 *newpath)
+{
+    // ZealOS doesn't have hard links
+    errno = ENOSYS;
+    return -1;
+}
+
+I64 symlink(U8 *target, U8 *linkpath)
+{
+    // ZealOS doesn't have symlinks
+    errno = ENOSYS;
+    return -1;
+}
+
+ssize_t readlink(U8 *path, U8 *buf, size_t bufsiz)
+{
+    errno = EINVAL;  // Not a symlink
+    return -1;
+}
+
+I64 chdir(U8 *path)
+{
+    return PosixChdir(path);
+}
+
+I64 fchdir(I64 fd)
+{
+    CPosixFD *pfd = PosixFDGet(posix_current, fd);
+    if (!pfd || pfd->type != FD_TYPE_DIR) {
+        errno = ENOTDIR;
+        return -1;
+    }
+    return PosixChdir(pfd->dir_path);
+}
+
+U8 *getcwd(U8 *buf, size_t size)
+{
+    return PosixGetcwd(buf, size);
+}
+
+I64 chown(U8 *path, uid_t owner, gid_t group)
+{
+    // ZealOS doesn't have ownership
+    return 0;
+}
+
+I64 fchown(I64 fd, uid_t owner, gid_t group)
+{
+    return 0;
+}
+
+I64 lchown(U8 *path, uid_t owner, gid_t group)
+{
+    return 0;
+}
+
+I64 chmod(U8 *path, mode_t mode)
+{
+    // ZealOS doesn't have permissions
+    return 0;
+}
+
+I64 fchmod(I64 fd, mode_t mode)
+{
+    return 0;
+}
+
+I64 truncate(U8 *path, off_t length)
+{
+    I64 fd = PosixOpen(path, O_WRONLY, 0);
+    if (fd < 0)
+        return -1;
+    I64 result = ftruncate(fd, length);
+    PosixClose(fd);
+    return result;
+}
+
+I64 ftruncate(I64 fd, off_t length)
+{
+    // Simplified - seek and write
+    CPosixFD *pfd = PosixFDGet(posix_current, fd);
+    if (!pfd) {
+        errno = EBADF;
+        return -1;
+    }
+    // TODO: Proper truncation
+    return 0;
+}
+
+// ============================================================================
+// PROCESS CONTROL
+// ============================================================================
+
+pid_t getpid()
+{
+    return PosixGetPid();
+}
+
+pid_t getppid()
+{
+    return PosixGetPPid();
+}
+
+uid_t getuid()
+{
+    return PosixGetUid();
+}
+
+uid_t geteuid()
+{
+    return PosixGetUid();
+}
+
+gid_t getgid()
+{
+    return PosixGetGid();
+}
+
+gid_t getegid()
+{
+    return PosixGetGid();
+}
+
+pid_t getpgrp()
+{
+    return posix_current ? posix_current->pgid : 0;
+}
+
+pid_t getpgid(pid_t pid)
+{
+    // Simplified
+    return getpgrp();
+}
+
+I64 setpgid(pid_t pid, pid_t pgid)
+{
+    // Simplified
+    if (posix_current)
+        posix_current->pgid = pgid ? pgid : posix_current->pid;
+    return 0;
+}
+
+pid_t setsid()
+{
+    if (posix_current) {
+        posix_current->sid = posix_current->pid;
+        posix_current->pgid = posix_current->pid;
+        return posix_current->sid;
+    }
+    errno = EPERM;
+    return -1;
+}
+
+pid_t getsid(pid_t pid)
+{
+    return posix_current ? posix_current->sid : 0;
+}
+
+I64 setuid(uid_t uid)
+{
+    return 0;  // Always succeeds (no security)
+}
+
+I64 setgid(gid_t gid)
+{
+    return 0;
+}
+
+I64 seteuid(uid_t uid)
+{
+    return 0;
+}
+
+I64 setegid(gid_t gid)
+{
+    return 0;
+}
+
+// ============================================================================
+// FORK/EXEC
+// ============================================================================
+
+pid_t fork()
+{
+    return PosixFork();
+}
+
+pid_t vfork()
+{
+    return PosixVfork();
+}
+
+I64 execve(U8 *path, U8 **argv, U8 **envp)
+{
+    return PosixExecve(path, argv, envp);
+}
+
+I64 execv(U8 *path, U8 **argv)
+{
+    return execve(path, argv, posix_current ? posix_current->environ : NULL);
+}
+
+I64 execvp(U8 *file, U8 **argv)
+{
+    return PosixExecvp(file, argv);
+}
+
+I64 execvpe(U8 *file, U8 **argv, U8 **envp)
+{
+    // TODO: Search PATH with custom environment
+    return execve(file, argv, envp);
+}
+
+I64 execl(U8 *path, U8 *arg0, ...)
+{
+    // Count arguments
+    va_list ap;
+    va_start(ap, arg0);
+    I64 argc = 1;
+    while (va_arg(ap, U8 *))
+        argc++;
+    va_end(ap);
+
+    // Build argv array
+    U8 **argv = MAlloc((argc + 1) * sizeof(U8 *));
+    argv[0] = arg0;
+    va_start(ap, arg0);
+    for (I64 i = 1; i < argc; i++)
+        argv[i] = va_arg(ap, U8 *);
+    argv[argc] = NULL;
+    va_end(ap);
+
+    I64 result = execv(path, argv);
+    Free(argv);
+    return result;
+}
+
+I64 execlp(U8 *file, U8 *arg0, ...)
+{
+    va_list ap;
+    va_start(ap, arg0);
+    I64 argc = 1;
+    while (va_arg(ap, U8 *))
+        argc++;
+    va_end(ap);
+
+    U8 **argv = MAlloc((argc + 1) * sizeof(U8 *));
+    argv[0] = arg0;
+    va_start(ap, arg0);
+    for (I64 i = 1; i < argc; i++)
+        argv[i] = va_arg(ap, U8 *);
+    argv[argc] = NULL;
+    va_end(ap);
+
+    I64 result = execvp(file, argv);
+    Free(argv);
+    return result;
+}
+
+I64 execle(U8 *path, U8 *arg0, ... /* , U8 **envp */)
+{
+    va_list ap;
+    va_start(ap, arg0);
+    I64 argc = 1;
+    U8 *arg;
+    while ((arg = va_arg(ap, U8 *)))
+        argc++;
+    U8 **envp = va_arg(ap, U8 **);
+    va_end(ap);
+
+    U8 **argv = MAlloc((argc + 1) * sizeof(U8 *));
+    argv[0] = arg0;
+    va_start(ap, arg0);
+    for (I64 i = 1; i < argc; i++)
+        argv[i] = va_arg(ap, U8 *);
+    argv[argc] = NULL;
+    va_end(ap);
+
+    I64 result = execve(path, argv, envp);
+    Free(argv);
+    return result;
+}
+
+U0 _exit(I64 status);
+
+// ============================================================================
+// SLEEP
+// ============================================================================
+
+U32 sleep(U32 seconds)
+{
+    PosixSleep(seconds);
+    return 0;
+}
+
+I64 usleep(useconds_t usec)
+{
+    PosixUSleep(usec);
+    return 0;
+}
+
+// ============================================================================
+// MISCELLANEOUS
+// ============================================================================
+
+I64 isatty(I64 fd)
+{
+    CPosixFD *pfd = PosixFDGet(posix_current, fd);
+    if (!pfd) {
+        errno = EBADF;
+        return 0;
+    }
+    return pfd->type == FD_TYPE_TTY;
+}
+
+U8 *ttyname(I64 fd)
+{
+    if (!isatty(fd))
+        return NULL;
+    return "/dev/tty";
+}
+
+I64 ttyname_r(I64 fd, U8 *buf, size_t buflen)
+{
+    if (!isatty(fd))
+        return ENOTTY;
+    if (buflen < 9)
+        return ERANGE;
+    StrCpy(buf, "/dev/tty");
+    return 0;
+}
+
+I64 getlogin_r(U8 *buf, size_t buflen)
+{
+    if (buflen < 5)
+        return ERANGE;
+    StrCpy(buf, "root");
+    return 0;
+}
+
+U8 *getlogin()
+{
+    return "root";
+}
+
+I64 gethostname(U8 *name, size_t len)
+{
+    U8 *hostname = "zealos";
+    if (len < StrLen(hostname) + 1) {
+        errno = ENAMETOOLONG;
+        return -1;
+    }
+    StrCpy(name, hostname);
+    return 0;
+}
+
+I64 sethostname(U8 *name, size_t len)
+{
+    return 0;  // Ignore
+}
+
+I64 getpagesize()
+{
+    return 4096;
+}
+
+I64 sysconf(I64 name)
+{
+    switch (name) {
+        case _SC_CLK_TCK:
+            return 1000;  // Jiffy rate
+        case _SC_PAGE_SIZE:
+            return 4096;
+        case _SC_OPEN_MAX:
+            return POSIX_OPEN_MAX;
+        case _SC_NPROCESSORS_ONLN:
+            return mp_count;  // ZealOS multiprocessor count
+        default:
+            errno = EINVAL;
+            return -1;
+    }
+}
+
+I64 pathconf(U8 *path, I64 name)
+{
+    switch (name) {
+        case _PC_PATH_MAX:
+            return PATH_MAX;
+        case _PC_NAME_MAX:
+            return NAME_MAX;
+        case _PC_PIPE_BUF:
+            return PIPE_BUF;
+        default:
+            errno = EINVAL;
+            return -1;
+    }
+}
+
+I64 fpathconf(I64 fd, I64 name)
+{
+    return pathconf("/", name);
+}
+
+I64 fsync(I64 fd)
+{
+    return 0;  // ZealOS doesn't buffer at OS level
+}
+
+I64 fdatasync(I64 fd)
+{
+    return fsync(fd);
+}
+
+U0 sync()
+{
+    // Nothing to sync
+}
+
+#endif // _UNISTD_H

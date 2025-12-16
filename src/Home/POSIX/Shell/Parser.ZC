@@ -1,0 +1,1384 @@
+// Parser.ZC - POSIX Shell Parser for ZealOS
+// Part of ZealOS POSIX compatibility layer
+//
+// Recursive descent parser building AST from tokens
+// Grammar based on POSIX shell specification
+
+// ============================================================================
+// PARSER INITIALIZATION
+// ============================================================================
+
+U0 ShellParserInit(CShellParser *parser, U8 *input)
+{
+	if (!parser || !input)
+		return;
+
+	MemSet(parser, 0, sizeof(CShellParser));
+	ShellLexerInit(&parser->lexer, input);
+	parser->error = FALSE;
+	parser->error_msg = NULL;
+	parser->error_line = 0;
+
+	// Prime the parser with first token
+	ShellLexerNext(&parser->lexer);
+}
+
+U0 ShellParserFree(CShellParser *parser)
+{
+	if (!parser)
+		return;
+
+	ShellLexerFree(&parser->lexer);
+	if (parser->error_msg)
+		Free(parser->error_msg);
+}
+
+// ============================================================================
+// ERROR HANDLING
+// ============================================================================
+
+U0 ShellParserError(CShellParser *parser, U8 *msg)
+{
+	if (parser->error)
+		return;  // Only report first error
+
+	parser->error = TRUE;
+	parser->error_line = parser->lexer.line;
+
+	if (parser->error_msg)
+		Free(parser->error_msg);
+
+	parser->error_msg = StrNew(msg);
+}
+
+// ============================================================================
+// TOKEN HELPERS
+// ============================================================================
+
+I64 ShellParserCurrentToken(CShellParser *parser)
+{
+	return parser->lexer.current.type;
+}
+
+U8 *ShellParserCurrentValue(CShellParser *parser)
+{
+	return parser->lexer.current.value;
+}
+
+Bool ShellParserAccept(CShellParser *parser, I64 token_type)
+{
+	if (ShellParserCurrentToken(parser) == token_type) {
+		ShellLexerNext(&parser->lexer);
+		return TRUE;
+	}
+	return FALSE;
+}
+
+Bool ShellParserExpect(CShellParser *parser, I64 token_type, U8 *expected_name)
+{
+	if (ShellParserAccept(parser, token_type))
+		return TRUE;
+
+	U8 buf[256];
+	StrPrint(buf, "expected '%s'", expected_name);
+	ShellParserError(parser, buf);
+	return FALSE;
+}
+
+// Skip newlines (used in compound commands)
+U0 ShellParserSkipNewlines(CShellParser *parser)
+{
+	while (ShellParserCurrentToken(parser) == TOK_NEWLINE)
+		ShellLexerNext(&parser->lexer);
+}
+
+// ============================================================================
+// AST NODE ALLOCATION
+// ============================================================================
+
+CShellCommand *ShellCommandNew(I64 type)
+{
+	CShellCommand *cmd = MAlloc(sizeof(CShellCommand));
+	MemSet(cmd, 0, sizeof(CShellCommand));
+	cmd->type = type;
+	return cmd;
+}
+
+CShellWord *ShellWordNew(U8 *text)
+{
+	CShellWord *word = MAlloc(sizeof(CShellWord));
+	word->text = StrNew(text);
+	word->next = NULL;
+	return word;
+}
+
+CShellRedir *ShellRedirNew(I64 type, I64 fd, U8 *target)
+{
+	CShellRedir *redir = MAlloc(sizeof(CShellRedir));
+	redir->type = type;
+	redir->fd = fd;
+	redir->target = StrNew(target);
+	redir->next = NULL;
+	return redir;
+}
+
+// ============================================================================
+// AST NODE FREEING
+// ============================================================================
+
+U0 ShellWordFree(CShellWord *word)
+{
+	CShellWord *next;
+	while (word) {
+		next = word->next;
+		if (word->text)
+			Free(word->text);
+		Free(word);
+		word = next;
+	}
+}
+
+U0 ShellRedirFree(CShellRedir *redir)
+{
+	CShellRedir *next;
+	while (redir) {
+		next = redir->next;
+		if (redir->target)
+			Free(redir->target);
+		Free(redir);
+		redir = next;
+	}
+}
+
+U0 ShellCaseItemFree(CShellCaseItem *item)
+{
+	CShellCaseItem *next;
+	while (item) {
+		next = item->next;
+		ShellWordFree(item->patterns);
+		if (item->body)
+			ShellCommandFree(item->body);
+		Free(item);
+		item = next;
+	}
+}
+
+U0 ShellCommandFree(CShellCommand *cmd)
+{
+	I64 i;
+
+	if (!cmd)
+		return;
+
+	switch (cmd->type) {
+		case NODE_COMMAND:
+			ShellWordFree(cmd->simple.words);
+			ShellWordFree(cmd->simple.assignments);
+			ShellRedirFree(cmd->simple.redirects);
+			break;
+
+		case NODE_PIPELINE:
+			for (i = 0; i < cmd->pipeline.command_count; i++)
+				ShellCommandFree(cmd->pipeline.commands[i]);
+			if (cmd->pipeline.commands)
+				Free(cmd->pipeline.commands);
+			break;
+
+		case NODE_AND:
+		case NODE_OR:
+		case NODE_SEMI:
+		case NODE_BACKGROUND:
+			ShellCommandFree(cmd->left);
+			ShellCommandFree(cmd->right);
+			break;
+
+		case NODE_SUBSHELL:
+		case NODE_BRACE:
+		case NODE_BANG:
+			ShellCommandFree(cmd->child);
+			break;
+
+		case NODE_IF:
+			ShellCommandFree(cmd->if_cmd.condition);
+			ShellCommandFree(cmd->if_cmd.then_part);
+			ShellCommandFree(cmd->if_cmd.else_part);
+			break;
+
+		case NODE_WHILE:
+		case NODE_UNTIL:
+			ShellCommandFree(cmd->loop.condition);
+			ShellCommandFree(cmd->loop.body);
+			break;
+
+		case NODE_FOR:
+			if (cmd->for_cmd.variable)
+				Free(cmd->for_cmd.variable);
+			ShellWordFree(cmd->for_cmd.words);
+			ShellCommandFree(cmd->for_cmd.body);
+			break;
+
+		case NODE_CASE:
+			ShellWordFree(cmd->case_cmd.word);
+			ShellCaseItemFree(cmd->case_cmd.items);
+			break;
+
+		case NODE_FUNCTION:
+			if (cmd->function.name)
+				Free(cmd->function.name);
+			ShellCommandFree(cmd->function.body);
+			break;
+	}
+
+	ShellRedirFree(cmd->redirects);
+	Free(cmd);
+}
+
+// ============================================================================
+// FORWARD DECLARATIONS
+// ============================================================================
+
+CShellCommand *ShellParseCompoundList(CShellParser *parser);
+CShellCommand *ShellParseAndOr(CShellParser *parser);
+CShellCommand *ShellParsePipeline(CShellParser *parser);
+CShellCommand *ShellParseCommand(CShellParser *parser);
+CShellCommand *ShellParseSimpleCommand(CShellParser *parser);
+CShellCommand *ShellParseCompoundCommand(CShellParser *parser);
+
+// ============================================================================
+// REDIRECTION PARSING
+// ============================================================================
+
+// Get default fd for redirection type
+I64 ShellRedirDefaultFD(I64 token_type)
+{
+	switch (token_type) {
+		case TOK_LESS:
+		case TOK_DLESS:
+		case TOK_DLESSDASH:
+		case TOK_LESSAND:
+		case TOK_LESSGREAT:
+			return 0;  // stdin
+
+		case TOK_GREAT:
+		case TOK_DGREAT:
+		case TOK_GREATAND:
+		case TOK_CLOBBER:
+			return 1;  // stdout
+
+		default:
+			return -1;
+	}
+}
+
+// Convert token type to redirection type
+I64 ShellRedirType(I64 token_type)
+{
+	switch (token_type) {
+		case TOK_LESS:       return REDIR_INPUT;
+		case TOK_GREAT:      return REDIR_OUTPUT;
+		case TOK_DGREAT:     return REDIR_APPEND;
+		case TOK_DLESS:      return REDIR_HEREDOC;
+		case TOK_DLESSDASH:  return REDIR_HEREDOC_STRIP;
+		case TOK_LESSAND:    return REDIR_DUP_INPUT;
+		case TOK_GREATAND:   return REDIR_DUP_OUTPUT;
+		case TOK_LESSGREAT:  return REDIR_RDWR;
+		case TOK_CLOBBER:    return REDIR_CLOBBER;
+		default:             return -1;
+	}
+}
+
+// Check if current token is a redirection operator
+Bool ShellIsRedirToken(I64 token_type)
+{
+	return token_type >= TOK_LESS && token_type <= TOK_DLESSDASH;
+}
+
+// Parse a single redirection
+CShellRedir *ShellParseRedir(CShellParser *parser, I64 fd_override)
+{
+	I64 token_type = ShellParserCurrentToken(parser);
+	I64 redir_type = ShellRedirType(token_type);
+	I64 fd;
+	U8 *target;
+
+	if (redir_type < 0)
+		return NULL;
+
+	fd = (fd_override >= 0) ? fd_override : ShellRedirDefaultFD(token_type);
+
+	// Consume the redirection operator
+	ShellLexerNext(&parser->lexer);
+
+	// Get the target (filename or fd number)
+	if (ShellParserCurrentToken(parser) != TOK_WORD) {
+		ShellParserError(parser, "expected word after redirection operator");
+		return NULL;
+	}
+
+	target = ShellParserCurrentValue(parser);
+	ShellLexerNext(&parser->lexer);
+
+	return ShellRedirNew(redir_type, fd, target);
+}
+
+// ============================================================================
+// SIMPLE COMMAND PARSING
+// ============================================================================
+
+// Check if token starts a command (word, assignment, or redirection)
+Bool ShellIsCommandStart(I64 token_type)
+{
+	return token_type == TOK_WORD ||
+	       token_type == TOK_ASSIGNMENT ||
+	       ShellIsRedirToken(token_type);
+}
+
+CShellCommand *ShellParseSimpleCommand(CShellParser *parser)
+{
+	CShellCommand *cmd;
+	CShellWord **word_tail;
+	CShellWord **assign_tail;
+	CShellRedir **redir_tail;
+	I64 token_type;
+	I64 fd_num;
+	Bool saw_word = FALSE;
+
+	cmd = ShellCommandNew(NODE_COMMAND);
+	word_tail = &cmd->simple.words;
+	assign_tail = &cmd->simple.assignments;
+	redir_tail = &cmd->simple.redirects;
+
+	while (!parser->error) {
+		token_type = ShellParserCurrentToken(parser);
+
+		// Assignment word (only valid before command word)
+		if (token_type == TOK_ASSIGNMENT && !saw_word) {
+			*assign_tail = ShellWordNew(ShellParserCurrentValue(parser));
+			assign_tail = &(*assign_tail)->next;
+			ShellLexerNext(&parser->lexer);
+			continue;
+		}
+
+		// IO number followed by redirection
+		if (token_type == TOK_WORD) {
+			U8 *val = ShellParserCurrentValue(parser);
+			I64 len = StrLen(val);
+			Bool all_digits = TRUE;
+
+			// Check if it's a number
+			for (I64 i = 0; i < len; i++) {
+				if (val[i] < '0' || val[i] > '9') {
+					all_digits = FALSE;
+					break;
+				}
+			}
+
+			// Peek at next token
+			if (all_digits && len <= 2) {
+				// Save position and check next token
+				I64 saved_pos = parser->lexer.pos;
+				I64 saved_type = token_type;
+				ShellLexerNext(&parser->lexer);
+
+				if (ShellIsRedirToken(ShellParserCurrentToken(parser))) {
+					// It's fd N followed by redirection
+					fd_num = Str2I64(val);
+					CShellRedir *redir = ShellParseRedir(parser, fd_num);
+					if (redir) {
+						*redir_tail = redir;
+						redir_tail = &redir->next;
+					}
+					continue;
+				}
+
+				// Not a redirection, restore and treat as word
+				parser->lexer.pos = saved_pos;
+				parser->lexer.current.type = saved_type;
+				parser->lexer.current.value = val;
+			}
+		}
+
+		// Redirection without fd number
+		if (ShellIsRedirToken(token_type)) {
+			CShellRedir *redir = ShellParseRedir(parser, -1);
+			if (redir) {
+				*redir_tail = redir;
+				redir_tail = &redir->next;
+			}
+			continue;
+		}
+
+		// Regular word (command or argument)
+		if (token_type == TOK_WORD) {
+			*word_tail = ShellWordNew(ShellParserCurrentValue(parser));
+			word_tail = &(*word_tail)->next;
+			saw_word = TRUE;
+			ShellLexerNext(&parser->lexer);
+			continue;
+		}
+
+		// End of simple command
+		break;
+	}
+
+	// Must have at least one word or assignment
+	if (!cmd->simple.words && !cmd->simple.assignments) {
+		ShellCommandFree(cmd);
+		return NULL;
+	}
+
+	return cmd;
+}
+
+// ============================================================================
+// COMPOUND COMMAND PARSING
+// ============================================================================
+
+// Parse if-then-else-fi
+CShellCommand *ShellParseIf(CShellParser *parser)
+{
+	CShellCommand *cmd = ShellCommandNew(NODE_IF);
+	CShellCommand **else_slot = &cmd->if_cmd.else_part;
+
+	// Already consumed 'if'
+	ShellParserSkipNewlines(parser);
+
+	// Parse condition
+	cmd->if_cmd.condition = ShellParseCompoundList(parser);
+	if (!cmd->if_cmd.condition) {
+		ShellParserError(parser, "expected condition after 'if'");
+		ShellCommandFree(cmd);
+		return NULL;
+	}
+
+	// Expect 'then'
+	ShellParserSkipNewlines(parser);
+	if (!ShellParserExpect(parser, TOK_THEN, "then")) {
+		ShellCommandFree(cmd);
+		return NULL;
+	}
+	ShellParserSkipNewlines(parser);
+
+	// Parse then-part
+	cmd->if_cmd.then_part = ShellParseCompoundList(parser);
+	if (!cmd->if_cmd.then_part) {
+		ShellParserError(parser, "expected commands after 'then'");
+		ShellCommandFree(cmd);
+		return NULL;
+	}
+
+	// Handle elif chain
+	while (ShellParserCurrentToken(parser) == TOK_ELIF) {
+		ShellLexerNext(&parser->lexer);
+		ShellParserSkipNewlines(parser);
+
+		CShellCommand *elif_cmd = ShellCommandNew(NODE_IF);
+
+		// Parse elif condition
+		elif_cmd->if_cmd.condition = ShellParseCompoundList(parser);
+		if (!elif_cmd->if_cmd.condition) {
+			ShellParserError(parser, "expected condition after 'elif'");
+			ShellCommandFree(elif_cmd);
+			ShellCommandFree(cmd);
+			return NULL;
+		}
+
+		// Expect 'then'
+		ShellParserSkipNewlines(parser);
+		if (!ShellParserExpect(parser, TOK_THEN, "then")) {
+			ShellCommandFree(elif_cmd);
+			ShellCommandFree(cmd);
+			return NULL;
+		}
+		ShellParserSkipNewlines(parser);
+
+		// Parse elif then-part
+		elif_cmd->if_cmd.then_part = ShellParseCompoundList(parser);
+		if (!elif_cmd->if_cmd.then_part) {
+			ShellParserError(parser, "expected commands after 'then'");
+			ShellCommandFree(elif_cmd);
+			ShellCommandFree(cmd);
+			return NULL;
+		}
+
+		*else_slot = elif_cmd;
+		else_slot = &elif_cmd->if_cmd.else_part;
+	}
+
+	// Handle optional else
+	if (ShellParserCurrentToken(parser) == TOK_ELSE) {
+		ShellLexerNext(&parser->lexer);
+		ShellParserSkipNewlines(parser);
+
+		*else_slot = ShellParseCompoundList(parser);
+		if (!*else_slot) {
+			ShellParserError(parser, "expected commands after 'else'");
+			ShellCommandFree(cmd);
+			return NULL;
+		}
+	}
+
+	// Expect 'fi'
+	ShellParserSkipNewlines(parser);
+	if (!ShellParserExpect(parser, TOK_FI, "fi")) {
+		ShellCommandFree(cmd);
+		return NULL;
+	}
+
+	return cmd;
+}
+
+// Parse while/until loop
+CShellCommand *ShellParseWhileUntil(CShellParser *parser, Bool is_until)
+{
+	CShellCommand *cmd = ShellCommandNew(is_until ? NODE_UNTIL : NODE_WHILE);
+
+	// Already consumed 'while' or 'until'
+	ShellParserSkipNewlines(parser);
+
+	// Parse condition
+	cmd->loop.condition = ShellParseCompoundList(parser);
+	if (!cmd->loop.condition) {
+		ShellParserError(parser, "expected condition");
+		ShellCommandFree(cmd);
+		return NULL;
+	}
+
+	// Expect 'do'
+	ShellParserSkipNewlines(parser);
+	if (!ShellParserExpect(parser, TOK_DO, "do")) {
+		ShellCommandFree(cmd);
+		return NULL;
+	}
+	ShellParserSkipNewlines(parser);
+
+	// Parse body
+	cmd->loop.body = ShellParseCompoundList(parser);
+	if (!cmd->loop.body) {
+		ShellParserError(parser, "expected loop body");
+		ShellCommandFree(cmd);
+		return NULL;
+	}
+
+	// Expect 'done'
+	ShellParserSkipNewlines(parser);
+	if (!ShellParserExpect(parser, TOK_DONE, "done")) {
+		ShellCommandFree(cmd);
+		return NULL;
+	}
+
+	return cmd;
+}
+
+// Parse for loop
+CShellCommand *ShellParseFor(CShellParser *parser)
+{
+	CShellCommand *cmd = ShellCommandNew(NODE_FOR);
+	CShellWord **word_tail;
+
+	// Already consumed 'for'
+	ShellParserSkipNewlines(parser);
+
+	// Get variable name
+	if (ShellParserCurrentToken(parser) != TOK_WORD) {
+		ShellParserError(parser, "expected variable name after 'for'");
+		ShellCommandFree(cmd);
+		return NULL;
+	}
+	cmd->for_cmd.variable = StrNew(ShellParserCurrentValue(parser));
+	ShellLexerNext(&parser->lexer);
+
+	// Skip newlines
+	ShellParserSkipNewlines(parser);
+
+	// Optional 'in' word-list
+	if (ShellParserCurrentToken(parser) == TOK_IN) {
+		ShellLexerNext(&parser->lexer);
+
+		word_tail = &cmd->for_cmd.words;
+		while (ShellParserCurrentToken(parser) == TOK_WORD) {
+			*word_tail = ShellWordNew(ShellParserCurrentValue(parser));
+			word_tail = &(*word_tail)->next;
+			ShellLexerNext(&parser->lexer);
+		}
+	}
+	// If no 'in', words will be NULL (means use "$@")
+
+	// Skip sequential_sep (newline or ;)
+	if (ShellParserCurrentToken(parser) == TOK_SEMI)
+		ShellLexerNext(&parser->lexer);
+	ShellParserSkipNewlines(parser);
+
+	// Expect 'do'
+	if (!ShellParserExpect(parser, TOK_DO, "do")) {
+		ShellCommandFree(cmd);
+		return NULL;
+	}
+	ShellParserSkipNewlines(parser);
+
+	// Parse body
+	cmd->for_cmd.body = ShellParseCompoundList(parser);
+	if (!cmd->for_cmd.body) {
+		ShellParserError(parser, "expected for loop body");
+		ShellCommandFree(cmd);
+		return NULL;
+	}
+
+	// Expect 'done'
+	ShellParserSkipNewlines(parser);
+	if (!ShellParserExpect(parser, TOK_DONE, "done")) {
+		ShellCommandFree(cmd);
+		return NULL;
+	}
+
+	return cmd;
+}
+
+// Parse case statement
+CShellCommand *ShellParseCase(CShellParser *parser)
+{
+	CShellCommand *cmd = ShellCommandNew(NODE_CASE);
+	CShellCaseItem **item_tail = &cmd->case_cmd.items;
+
+	// Already consumed 'case'
+	ShellParserSkipNewlines(parser);
+
+	// Get word to match
+	if (ShellParserCurrentToken(parser) != TOK_WORD) {
+		ShellParserError(parser, "expected word after 'case'");
+		ShellCommandFree(cmd);
+		return NULL;
+	}
+	cmd->case_cmd.word = ShellWordNew(ShellParserCurrentValue(parser));
+	ShellLexerNext(&parser->lexer);
+
+	// Skip newlines
+	ShellParserSkipNewlines(parser);
+
+	// Expect 'in'
+	if (!ShellParserExpect(parser, TOK_IN, "in")) {
+		ShellCommandFree(cmd);
+		return NULL;
+	}
+	ShellParserSkipNewlines(parser);
+
+	// Parse case items
+	while (ShellParserCurrentToken(parser) != TOK_ESAC &&
+	       ShellParserCurrentToken(parser) != TOK_EOF) {
+		CShellCaseItem *item = MAlloc(sizeof(CShellCaseItem));
+		MemSet(item, 0, sizeof(CShellCaseItem));
+		CShellWord **pattern_tail = &item->patterns;
+
+		// Skip optional '('
+		ShellParserAccept(parser, TOK_LPAREN);
+
+		// Parse patterns separated by '|'
+		while (1) {
+			if (ShellParserCurrentToken(parser) != TOK_WORD) {
+				ShellParserError(parser, "expected pattern in case");
+				Free(item);
+				ShellCommandFree(cmd);
+				return NULL;
+			}
+
+			*pattern_tail = ShellWordNew(ShellParserCurrentValue(parser));
+			pattern_tail = &(*pattern_tail)->next;
+			ShellLexerNext(&parser->lexer);
+
+			if (ShellParserCurrentToken(parser) != TOK_PIPE)
+				break;
+			ShellLexerNext(&parser->lexer);  // Skip '|'
+		}
+
+		// Expect ')'
+		if (!ShellParserExpect(parser, TOK_RPAREN, ")")) {
+			ShellWordFree(item->patterns);
+			Free(item);
+			ShellCommandFree(cmd);
+			return NULL;
+		}
+		ShellParserSkipNewlines(parser);
+
+		// Parse body (optional - could be empty)
+		if (ShellParserCurrentToken(parser) != TOK_DSEMI &&
+		    ShellParserCurrentToken(parser) != TOK_ESAC) {
+			item->body = ShellParseCompoundList(parser);
+		}
+
+		// Expect ';;' or 'esac'
+		ShellParserSkipNewlines(parser);
+		if (ShellParserCurrentToken(parser) == TOK_DSEMI) {
+			ShellLexerNext(&parser->lexer);
+			ShellParserSkipNewlines(parser);
+		}
+
+		*item_tail = item;
+		item_tail = &item->next;
+	}
+
+	// Expect 'esac'
+	if (!ShellParserExpect(parser, TOK_ESAC, "esac")) {
+		ShellCommandFree(cmd);
+		return NULL;
+	}
+
+	return cmd;
+}
+
+// Parse subshell ( ... )
+CShellCommand *ShellParseSubshell(CShellParser *parser)
+{
+	CShellCommand *cmd = ShellCommandNew(NODE_SUBSHELL);
+
+	// Already consumed '('
+	ShellParserSkipNewlines(parser);
+
+	cmd->child = ShellParseCompoundList(parser);
+	if (!cmd->child) {
+		ShellParserError(parser, "expected commands in subshell");
+		ShellCommandFree(cmd);
+		return NULL;
+	}
+
+	// Expect ')'
+	ShellParserSkipNewlines(parser);
+	if (!ShellParserExpect(parser, TOK_RPAREN, ")")) {
+		ShellCommandFree(cmd);
+		return NULL;
+	}
+
+	return cmd;
+}
+
+// Parse brace group { ... }
+CShellCommand *ShellParseBraceGroup(CShellParser *parser)
+{
+	CShellCommand *cmd = ShellCommandNew(NODE_BRACE);
+
+	// Already consumed '{'
+	ShellParserSkipNewlines(parser);
+
+	cmd->child = ShellParseCompoundList(parser);
+	if (!cmd->child) {
+		ShellParserError(parser, "expected commands in brace group");
+		ShellCommandFree(cmd);
+		return NULL;
+	}
+
+	// Expect '}'
+	ShellParserSkipNewlines(parser);
+	if (!ShellParserExpect(parser, TOK_RBRACE, "}")) {
+		ShellCommandFree(cmd);
+		return NULL;
+	}
+
+	return cmd;
+}
+
+// Parse function definition
+CShellCommand *ShellParseFunction(CShellParser *parser, U8 *name)
+{
+	CShellCommand *cmd = ShellCommandNew(NODE_FUNCTION);
+	cmd->function.name = StrNew(name);
+
+	// Already consumed name and '()'
+
+	// Skip newlines
+	ShellParserSkipNewlines(parser);
+
+	// Parse function body (must be compound command)
+	cmd->function.body = ShellParseCompoundCommand(parser);
+	if (!cmd->function.body) {
+		ShellParserError(parser, "expected function body");
+		ShellCommandFree(cmd);
+		return NULL;
+	}
+
+	return cmd;
+}
+
+// Parse compound command
+CShellCommand *ShellParseCompoundCommand(CShellParser *parser)
+{
+	I64 token_type = ShellParserCurrentToken(parser);
+	CShellCommand *cmd = NULL;
+
+	switch (token_type) {
+		case TOK_IF:
+			ShellLexerNext(&parser->lexer);
+			cmd = ShellParseIf(parser);
+			break;
+
+		case TOK_WHILE:
+			ShellLexerNext(&parser->lexer);
+			cmd = ShellParseWhileUntil(parser, FALSE);
+			break;
+
+		case TOK_UNTIL:
+			ShellLexerNext(&parser->lexer);
+			cmd = ShellParseWhileUntil(parser, TRUE);
+			break;
+
+		case TOK_FOR:
+			ShellLexerNext(&parser->lexer);
+			cmd = ShellParseFor(parser);
+			break;
+
+		case TOK_CASE:
+			ShellLexerNext(&parser->lexer);
+			cmd = ShellParseCase(parser);
+			break;
+
+		case TOK_LPAREN:
+			ShellLexerNext(&parser->lexer);
+			cmd = ShellParseSubshell(parser);
+			break;
+
+		case TOK_LBRACE:
+			ShellLexerNext(&parser->lexer);
+			cmd = ShellParseBraceGroup(parser);
+			break;
+
+		case TOK_FUNCTION:
+			ShellLexerNext(&parser->lexer);
+			if (ShellParserCurrentToken(parser) != TOK_WORD) {
+				ShellParserError(parser, "expected function name");
+				return NULL;
+			}
+			U8 *fname = StrNew(ShellParserCurrentValue(parser));
+			ShellLexerNext(&parser->lexer);
+			// Expect '(' ')'
+			if (!ShellParserExpect(parser, TOK_LPAREN, "(") ||
+			    !ShellParserExpect(parser, TOK_RPAREN, ")")) {
+				Free(fname);
+				return NULL;
+			}
+			cmd = ShellParseFunction(parser, fname);
+			Free(fname);
+			break;
+
+		default:
+			return NULL;  // Not a compound command
+	}
+
+	// Parse optional redirections after compound command
+	if (cmd && !parser->error) {
+		CShellRedir **redir_tail = &cmd->redirects;
+		while (ShellIsRedirToken(ShellParserCurrentToken(parser))) {
+			CShellRedir *redir = ShellParseRedir(parser, -1);
+			if (redir) {
+				*redir_tail = redir;
+				redir_tail = &redir->next;
+			}
+		}
+	}
+
+	return cmd;
+}
+
+// ============================================================================
+// COMMAND PARSING
+// ============================================================================
+
+// Parse a command (simple or compound)
+CShellCommand *ShellParseCommand(CShellParser *parser)
+{
+	I64 token_type = ShellParserCurrentToken(parser);
+	CShellCommand *cmd;
+
+	// Check for compound commands first
+	if (token_type == TOK_IF || token_type == TOK_WHILE ||
+	    token_type == TOK_UNTIL || token_type == TOK_FOR ||
+	    token_type == TOK_CASE || token_type == TOK_LPAREN ||
+	    token_type == TOK_LBRACE || token_type == TOK_FUNCTION) {
+		return ShellParseCompoundCommand(parser);
+	}
+
+	// Check for function definition: name () compound-command
+	if (token_type == TOK_WORD) {
+		U8 *name = ShellParserCurrentValue(parser);
+
+		// Save state
+		I64 saved_pos = parser->lexer.pos;
+		CShellToken saved_token = parser->lexer.current;
+
+		ShellLexerNext(&parser->lexer);
+
+		if (ShellParserCurrentToken(parser) == TOK_LPAREN) {
+			ShellLexerNext(&parser->lexer);
+			if (ShellParserCurrentToken(parser) == TOK_RPAREN) {
+				ShellLexerNext(&parser->lexer);
+				return ShellParseFunction(parser, name);
+			}
+		}
+
+		// Not a function, restore state
+		parser->lexer.pos = saved_pos;
+		parser->lexer.current = saved_token;
+	}
+
+	// Must be simple command
+	return ShellParseSimpleCommand(parser);
+}
+
+// ============================================================================
+// PIPELINE AND LIST PARSING
+// ============================================================================
+
+// Parse pipeline: command ( '|' command )*
+CShellCommand *ShellParsePipeline(CShellParser *parser)
+{
+	CShellCommand *first_cmd;
+	CShellCommand **cmds = NULL;
+	I64 cmd_count = 0;
+	Bool negated = FALSE;
+
+	// Check for '!' (pipeline negation)
+	if (ShellParserCurrentToken(parser) == TOK_BANG) {
+		negated = TRUE;
+		ShellLexerNext(&parser->lexer);
+	}
+
+	// Parse first command
+	first_cmd = ShellParseCommand(parser);
+	if (!first_cmd)
+		return NULL;
+
+	// Check for pipeline
+	if (ShellParserCurrentToken(parser) != TOK_PIPE) {
+		if (negated) {
+			// Wrap in NODE_BANG
+			CShellCommand *bang = ShellCommandNew(NODE_BANG);
+			bang->child = first_cmd;
+			return bang;
+		}
+		return first_cmd;
+	}
+
+	// Build pipeline
+	CShellCommand *pipeline_cmd = ShellCommandNew(NODE_PIPELINE);
+	pipeline_cmd->pipeline.negated = negated;
+
+	// Start with initial capacity
+	I64 capacity = 4;
+	cmds = MAlloc(capacity * sizeof(CShellCommand*));
+	cmds[cmd_count++] = first_cmd;
+
+	while (ShellParserCurrentToken(parser) == TOK_PIPE) {
+		ShellLexerNext(&parser->lexer);
+		ShellParserSkipNewlines(parser);
+
+		CShellCommand *next_cmd = ShellParseCommand(parser);
+		if (!next_cmd) {
+			ShellParserError(parser, "expected command after '|'");
+			// Clean up
+			for (I64 i = 0; i < cmd_count; i++)
+				ShellCommandFree(cmds[i]);
+			Free(cmds);
+			Free(pipeline_cmd);
+			return NULL;
+		}
+
+		// Grow array if needed
+		if (cmd_count >= capacity) {
+			capacity *= 2;
+			CShellCommand **new_cmds = MAlloc(capacity * sizeof(CShellCommand*));
+			MemCpy(new_cmds, cmds, cmd_count * sizeof(CShellCommand*));
+			Free(cmds);
+			cmds = new_cmds;
+		}
+		cmds[cmd_count++] = next_cmd;
+	}
+
+	pipeline_cmd->pipeline.commands = cmds;
+	pipeline_cmd->pipeline.command_count = cmd_count;
+
+	return pipeline_cmd;
+}
+
+// Parse and-or: pipeline ( ('&&'|'||') pipeline )*
+CShellCommand *ShellParseAndOr(CShellParser *parser)
+{
+	CShellCommand *left = ShellParsePipeline(parser);
+	if (!left)
+		return NULL;
+
+	while (1) {
+		I64 token_type = ShellParserCurrentToken(parser);
+		I64 node_type;
+
+		if (token_type == TOK_AND) {
+			node_type = NODE_AND;
+		} else if (token_type == TOK_OR) {
+			node_type = NODE_OR;
+		} else {
+			break;
+		}
+
+		ShellLexerNext(&parser->lexer);
+		ShellParserSkipNewlines(parser);
+
+		CShellCommand *right = ShellParsePipeline(parser);
+		if (!right) {
+			ShellParserError(parser, "expected command after '&&' or '||'");
+			ShellCommandFree(left);
+			return NULL;
+		}
+
+		CShellCommand *node = ShellCommandNew(node_type);
+		node->left = left;
+		node->right = right;
+		left = node;
+	}
+
+	return left;
+}
+
+// Parse list: and-or ( (';'|'&') and-or )*
+CShellCommand *ShellParseList(CShellParser *parser)
+{
+	CShellCommand *left = ShellParseAndOr(parser);
+	if (!left)
+		return NULL;
+
+	while (1) {
+		I64 token_type = ShellParserCurrentToken(parser);
+		I64 node_type;
+
+		if (token_type == TOK_SEMI) {
+			node_type = NODE_SEMI;
+			ShellLexerNext(&parser->lexer);
+			ShellParserSkipNewlines(parser);
+
+			// Check if there's another command
+			if (!ShellIsCommandStart(ShellParserCurrentToken(parser)) &&
+			    ShellParserCurrentToken(parser) != TOK_IF &&
+			    ShellParserCurrentToken(parser) != TOK_WHILE &&
+			    ShellParserCurrentToken(parser) != TOK_UNTIL &&
+			    ShellParserCurrentToken(parser) != TOK_FOR &&
+			    ShellParserCurrentToken(parser) != TOK_CASE &&
+			    ShellParserCurrentToken(parser) != TOK_LPAREN &&
+			    ShellParserCurrentToken(parser) != TOK_LBRACE &&
+			    ShellParserCurrentToken(parser) != TOK_BANG) {
+				// Just a trailing semicolon
+				break;
+			}
+		} else if (token_type == TOK_AMP) {
+			node_type = NODE_BACKGROUND;
+			ShellLexerNext(&parser->lexer);
+			ShellParserSkipNewlines(parser);
+
+			// Wrap left in background node
+			CShellCommand *bg = ShellCommandNew(NODE_BACKGROUND);
+			bg->child = left;
+			left = bg;
+
+			// Check if there's another command
+			if (!ShellIsCommandStart(ShellParserCurrentToken(parser)) &&
+			    ShellParserCurrentToken(parser) != TOK_IF &&
+			    ShellParserCurrentToken(parser) != TOK_WHILE &&
+			    ShellParserCurrentToken(parser) != TOK_UNTIL &&
+			    ShellParserCurrentToken(parser) != TOK_FOR &&
+			    ShellParserCurrentToken(parser) != TOK_CASE &&
+			    ShellParserCurrentToken(parser) != TOK_LPAREN &&
+			    ShellParserCurrentToken(parser) != TOK_LBRACE &&
+			    ShellParserCurrentToken(parser) != TOK_BANG) {
+				break;
+			}
+
+			// Parse next command
+			CShellCommand *right = ShellParseAndOr(parser);
+			if (right) {
+				CShellCommand *node = ShellCommandNew(NODE_SEMI);
+				node->left = left;
+				node->right = right;
+				left = node;
+			}
+			continue;
+		} else {
+			break;
+		}
+
+		CShellCommand *right = ShellParseAndOr(parser);
+		if (!right)
+			break;
+
+		CShellCommand *node = ShellCommandNew(node_type);
+		node->left = left;
+		node->right = right;
+		left = node;
+	}
+
+	return left;
+}
+
+// Parse compound list (allows newlines as separators)
+CShellCommand *ShellParseCompoundList(CShellParser *parser)
+{
+	CShellCommand *left;
+
+	ShellParserSkipNewlines(parser);
+
+	left = ShellParseAndOr(parser);
+	if (!left)
+		return NULL;
+
+	while (1) {
+		I64 token_type = ShellParserCurrentToken(parser);
+
+		// Handle separator
+		if (token_type == TOK_SEMI || token_type == TOK_NEWLINE) {
+			ShellLexerNext(&parser->lexer);
+			ShellParserSkipNewlines(parser);
+
+			// Check for end of compound list
+			token_type = ShellParserCurrentToken(parser);
+			if (token_type == TOK_EOF ||
+			    token_type == TOK_THEN ||
+			    token_type == TOK_ELSE ||
+			    token_type == TOK_ELIF ||
+			    token_type == TOK_FI ||
+			    token_type == TOK_DO ||
+			    token_type == TOK_DONE ||
+			    token_type == TOK_ESAC ||
+			    token_type == TOK_RPAREN ||
+			    token_type == TOK_RBRACE ||
+			    token_type == TOK_DSEMI) {
+				break;
+			}
+
+			// Parse next command
+			CShellCommand *right = ShellParseAndOr(parser);
+			if (!right)
+				break;
+
+			CShellCommand *node = ShellCommandNew(NODE_SEMI);
+			node->left = left;
+			node->right = right;
+			left = node;
+			continue;
+		}
+
+		if (token_type == TOK_AMP) {
+			ShellLexerNext(&parser->lexer);
+
+			// Wrap in background
+			CShellCommand *bg = ShellCommandNew(NODE_BACKGROUND);
+			bg->child = left;
+			left = bg;
+
+			ShellParserSkipNewlines(parser);
+
+			// Check for end
+			token_type = ShellParserCurrentToken(parser);
+			if (token_type == TOK_EOF ||
+			    token_type == TOK_THEN ||
+			    token_type == TOK_ELSE ||
+			    token_type == TOK_ELIF ||
+			    token_type == TOK_FI ||
+			    token_type == TOK_DO ||
+			    token_type == TOK_DONE ||
+			    token_type == TOK_ESAC ||
+			    token_type == TOK_RPAREN ||
+			    token_type == TOK_RBRACE ||
+			    token_type == TOK_DSEMI) {
+				break;
+			}
+
+			// Parse next command
+			CShellCommand *right = ShellParseAndOr(parser);
+			if (right) {
+				CShellCommand *node = ShellCommandNew(NODE_SEMI);
+				node->left = left;
+				node->right = right;
+				left = node;
+			}
+			continue;
+		}
+
+		break;
+	}
+
+	return left;
+}
+
+// ============================================================================
+// MAIN PARSER ENTRY POINT
+// ============================================================================
+
+CShellCommand *ShellParse(CShellParser *parser)
+{
+	CShellCommand *result;
+
+	if (parser->error)
+		return NULL;
+
+	// Skip leading newlines
+	ShellParserSkipNewlines(parser);
+
+	// Check for empty input
+	if (ShellParserCurrentToken(parser) == TOK_EOF)
+		return NULL;
+
+	// Parse the command list
+	result = ShellParseList(parser);
+
+	// Skip trailing newlines
+	ShellParserSkipNewlines(parser);
+
+	// Check for trailing junk
+	if (ShellParserCurrentToken(parser) != TOK_EOF && !parser->error) {
+		ShellParserError(parser, "unexpected token");
+		ShellCommandFree(result);
+		return NULL;
+	}
+
+	return result;
+}
+
+// ============================================================================
+// DEBUG/UTILITY FUNCTIONS
+// ============================================================================
+
+// Print AST for debugging (optional)
+U0 ShellCommandPrint(CShellCommand *cmd, I64 indent)
+{
+	I64 i;
+	CShellWord *w;
+	CShellCaseItem *item;
+	U8 spaces[64];
+
+	if (!cmd)
+		return;
+
+	// Create indent string
+	for (i = 0; i < indent && i < 63; i++)
+		spaces[i] = ' ';
+	spaces[i] = 0;
+
+	switch (cmd->type) {
+		case NODE_COMMAND:
+			"%sSimpleCommand:\n", spaces;
+			if (cmd->simple.assignments) {
+				"%s  Assignments: ", spaces;
+				for (w = cmd->simple.assignments; w; w = w->next)
+					"%s ", w->text;
+				"\n";
+			}
+			if (cmd->simple.words) {
+				"%s  Words: ", spaces;
+				for (w = cmd->simple.words; w; w = w->next)
+					"%s ", w->text;
+				"\n";
+			}
+			break;
+
+		case NODE_PIPELINE:
+			"%sPipeline (%s):\n", spaces, cmd->pipeline.negated ? "negated" : "";
+			for (i = 0; i < cmd->pipeline.command_count; i++) {
+				"%s  Stage %d:\n", spaces, i;
+				ShellCommandPrint(cmd->pipeline.commands[i], indent + 4);
+			}
+			break;
+
+		case NODE_AND:
+			"%sAND:\n", spaces;
+			ShellCommandPrint(cmd->left, indent + 2);
+			ShellCommandPrint(cmd->right, indent + 2);
+			break;
+
+		case NODE_OR:
+			"%sOR:\n", spaces;
+			ShellCommandPrint(cmd->left, indent + 2);
+			ShellCommandPrint(cmd->right, indent + 2);
+			break;
+
+		case NODE_SEMI:
+			"%sSEMI:\n", spaces;
+			ShellCommandPrint(cmd->left, indent + 2);
+			ShellCommandPrint(cmd->right, indent + 2);
+			break;
+
+		case NODE_BACKGROUND:
+			"%sBACKGROUND:\n", spaces;
+			ShellCommandPrint(cmd->child, indent + 2);
+			break;
+
+		case NODE_SUBSHELL:
+			"%sSUBSHELL:\n", spaces;
+			ShellCommandPrint(cmd->child, indent + 2);
+			break;
+
+		case NODE_BRACE:
+			"%sBRACE:\n", spaces;
+			ShellCommandPrint(cmd->child, indent + 2);
+			break;
+
+		case NODE_IF:
+			"%sIF:\n", spaces;
+			"%s  Condition:\n", spaces;
+			ShellCommandPrint(cmd->if_cmd.condition, indent + 4);
+			"%s  Then:\n", spaces;
+			ShellCommandPrint(cmd->if_cmd.then_part, indent + 4);
+			if (cmd->if_cmd.else_part) {
+				"%s  Else:\n", spaces;
+				ShellCommandPrint(cmd->if_cmd.else_part, indent + 4);
+			}
+			break;
+
+		case NODE_WHILE:
+			"%sWHILE:\n", spaces;
+			"%s  Condition:\n", spaces;
+			ShellCommandPrint(cmd->loop.condition, indent + 4);
+			"%s  Body:\n", spaces;
+			ShellCommandPrint(cmd->loop.body, indent + 4);
+			break;
+
+		case NODE_UNTIL:
+			"%sUNTIL:\n", spaces;
+			"%s  Condition:\n", spaces;
+			ShellCommandPrint(cmd->loop.condition, indent + 4);
+			"%s  Body:\n", spaces;
+			ShellCommandPrint(cmd->loop.body, indent + 4);
+			break;
+
+		case NODE_FOR:
+			"%sFOR %s in:\n", spaces, cmd->for_cmd.variable;
+			if (cmd->for_cmd.words) {
+				"%s  Words: ", spaces;
+				for (w = cmd->for_cmd.words; w; w = w->next)
+					"%s ", w->text;
+				"\n";
+			} else {
+				"%s  Words: $@\n", spaces;
+			}
+			"%s  Body:\n", spaces;
+			ShellCommandPrint(cmd->for_cmd.body, indent + 4);
+			break;
+
+		case NODE_CASE:
+			"%sCASE ", spaces;
+			if (cmd->case_cmd.word)
+				"%s", cmd->case_cmd.word->text;
+			" in:\n";
+			for (item = cmd->case_cmd.items; item; item = item->next) {
+				"%s  Pattern: ", spaces;
+				for (w = item->patterns; w; w = w->next)
+					"%s|", w->text;
+				"\n";
+				if (item->body)
+					ShellCommandPrint(item->body, indent + 4);
+			}
+			break;
+
+		case NODE_FUNCTION:
+			"%sFUNCTION %s:\n", spaces, cmd->function.name;
+			ShellCommandPrint(cmd->function.body, indent + 2);
+			break;
+
+		case NODE_BANG:
+			"%sNOT:\n", spaces;
+			ShellCommandPrint(cmd->child, indent + 2);
+			break;
+	}
+}

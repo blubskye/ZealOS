@@ -1,0 +1,696 @@
+// tar.ZC - Tape archive utility
+// GNU tar compatible implementation for ZealOS
+// Part of the POSIX compatibility layer
+
+// ============================================================================
+// TAR FILE FORMAT (USTAR)
+// ============================================================================
+// Each file in the archive:
+// - 512-byte header
+// - File data (rounded to 512 bytes)
+//
+// Header fields (USTAR format):
+// 0-99:    filename (100 bytes)
+// 100-107: mode (8 bytes, octal)
+// 108-115: uid (8 bytes, octal)
+// 116-123: gid (8 bytes, octal)
+// 124-135: size (12 bytes, octal)
+// 136-147: mtime (12 bytes, octal)
+// 148-155: checksum (8 bytes)
+// 156:     typeflag (1 byte)
+// 157-256: linkname (100 bytes)
+// 257-262: magic "ustar" (6 bytes)
+// 263-264: version "00" (2 bytes)
+// 265-296: uname (32 bytes)
+// 297-328: gname (32 bytes)
+// 329-336: devmajor (8 bytes)
+// 337-344: devminor (8 bytes)
+// 345-499: prefix (155 bytes)
+// 500-511: padding
+
+#define TAR_BLOCK_SIZE      512
+#define TAR_NAME_SIZE       100
+#define TAR_PREFIX_SIZE     155
+#define TAR_LINKNAME_SIZE   100
+
+// Type flags
+#define TAR_REGTYPE         '0'     // Regular file
+#define TAR_AREGTYPE        '\0'    // Regular file (old)
+#define TAR_LNKTYPE         '1'     // Hard link
+#define TAR_SYMTYPE         '2'     // Symbolic link
+#define TAR_CHRTYPE         '3'     // Character device
+#define TAR_BLKTYPE         '4'     // Block device
+#define TAR_DIRTYPE         '5'     // Directory
+#define TAR_FIFOTYPE        '6'     // FIFO
+#define TAR_CONTTYPE        '7'     // Contiguous file
+
+#define TAR_MAGIC           "ustar"
+#define TAR_VERSION         "00"
+
+// ============================================================================
+// TAR HEADER STRUCTURE
+// ============================================================================
+
+class CTarHeader {
+    U8  name[100];
+    U8  mode[8];
+    U8  uid[8];
+    U8  gid[8];
+    U8  size[12];
+    U8  mtime[12];
+    U8  checksum[8];
+    U8  typeflag;
+    U8  linkname[100];
+    U8  magic[6];
+    U8  version[2];
+    U8  uname[32];
+    U8  gname[32];
+    U8  devmajor[8];
+    U8  devminor[8];
+    U8  prefix[155];
+    U8  padding[12];
+};
+
+// ============================================================================
+// TAR STATE
+// ============================================================================
+
+class CTarState {
+    // Options
+    Bool    create;         // -c
+    Bool    extract;        // -x
+    Bool    list;           // -t
+    Bool    verbose;        // -v
+    Bool    gzip;           // -z
+    Bool    bzip2;          // -j
+    Bool    xz;             // -J
+    Bool    preserve_perms; // -p
+    Bool    keep_old;       // -k
+    Bool    overwrite;      // --overwrite
+    U8      *archive;       // -f
+    U8      *directory;     // -C
+
+    // File list
+    U8      **files;
+    I64     file_count;
+};
+
+// ============================================================================
+// HELPER FUNCTIONS
+// ============================================================================
+
+// Parse octal field from header
+U64 TarParseOctal(U8 *field, I64 len)
+{
+    U64 val = 0;
+    for (I64 i = 0; i < len && field[i]; i++) {
+        if (field[i] >= '0' && field[i] <= '7')
+            val = val * 8 + (field[i] - '0');
+        else if (field[i] != ' ')
+            break;
+    }
+    return val;
+}
+
+// Write octal field to header
+U0 TarWriteOctal(U8 *field, I64 len, U64 val)
+{
+    // Leave last byte for null/space
+    for (I64 i = len - 2; i >= 0; i--) {
+        field[i] = '0' + (val & 7);
+        val >>= 3;
+    }
+    field[len - 1] = ' ';
+}
+
+// Calculate header checksum
+U32 TarChecksum(CTarHeader *hdr)
+{
+    U32 sum = 0;
+    U8 *p = hdr(U8 *);
+
+    // Checksum field treated as spaces
+    for (I64 i = 0; i < 512; i++) {
+        if (i >= 148 && i < 156)
+            sum += ' ';
+        else
+            sum += p[i];
+    }
+    return sum;
+}
+
+// Check if header is all zeros (end of archive)
+Bool TarIsZeroBlock(U8 *block)
+{
+    for (I64 i = 0; i < TAR_BLOCK_SIZE; i++) {
+        if (block[i] != 0)
+            return FALSE;
+    }
+    return TRUE;
+}
+
+// Get full path from header (prefix + name)
+U0 TarGetPath(CTarHeader *hdr, U8 *path)
+{
+    if (hdr->prefix[0]) {
+        I64 plen = strnlen(hdr->prefix, TAR_PREFIX_SIZE);
+        strncpy(path, hdr->prefix, plen);
+        path[plen] = '/';
+        strncpy(path + plen + 1, hdr->name, TAR_NAME_SIZE);
+        path[plen + 1 + TAR_NAME_SIZE] = 0;
+    } else {
+        strncpy(path, hdr->name, TAR_NAME_SIZE);
+        path[TAR_NAME_SIZE] = 0;
+    }
+}
+
+// Set path in header (split into prefix + name if needed)
+U0 TarSetPath(CTarHeader *hdr, U8 *path)
+{
+    I64 len = strlen(path);
+
+    if (len <= TAR_NAME_SIZE) {
+        strncpy(hdr->name, path, TAR_NAME_SIZE);
+    } else if (len <= TAR_NAME_SIZE + TAR_PREFIX_SIZE + 1) {
+        // Find split point (last / that fits)
+        I64 split = len - TAR_NAME_SIZE;
+        while (split < len && path[split] != '/')
+            split++;
+
+        if (split < len && split <= TAR_PREFIX_SIZE) {
+            strncpy(hdr->prefix, path, split);
+            strncpy(hdr->name, path + split + 1, TAR_NAME_SIZE);
+        } else {
+            // Can't split nicely, truncate
+            strncpy(hdr->name, path + len - TAR_NAME_SIZE, TAR_NAME_SIZE);
+        }
+    } else {
+        // Path too long, truncate
+        strncpy(hdr->name, path + len - TAR_NAME_SIZE, TAR_NAME_SIZE);
+    }
+}
+
+// Create parent directories
+U0 TarMkdirP(U8 *path)
+{
+    U8 tmp[512];
+    strcpy(tmp, path);
+
+    for (U8 *p = tmp + 1; *p; p++) {
+        if (*p == '/') {
+            *p = 0;
+            CPosixStat st;
+            if (PosixStat(tmp, &st) < 0)
+                PosixMkdir(tmp, 0755);
+            *p = '/';
+        }
+    }
+}
+
+// ============================================================================
+// TAR CREATE
+// ============================================================================
+
+I64 TarAddFile(FILE *archive, U8 *path, Bool verbose)
+{
+    CPosixStat st;
+    if (PosixStat(path, &st) < 0) {
+        fprintf(stderr, "tar: %s: Cannot stat\n", path);
+        return -1;
+    }
+
+    CTarHeader hdr;
+    MemSet(&hdr, 0, sizeof(CTarHeader));
+
+    // Set path
+    TarSetPath(&hdr, path);
+
+    // Set mode
+    TarWriteOctal(hdr.mode, 8, st.st_mode & 0777);
+
+    // Set uid/gid (use 0 for simplicity)
+    TarWriteOctal(hdr.uid, 8, 0);
+    TarWriteOctal(hdr.gid, 8, 0);
+
+    // Set mtime
+    TarWriteOctal(hdr.mtime, 12, st.st_mtime);
+
+    // Set magic and version
+    strcpy(hdr.magic, TAR_MAGIC);
+    hdr.version[0] = '0';
+    hdr.version[1] = '0';
+
+    // Set uname/gname
+    strcpy(hdr.uname, "root");
+    strcpy(hdr.gname, "root");
+
+    Bool is_dir = ((st.st_mode & S_IFMT) == S_IFDIR);
+
+    if (is_dir) {
+        hdr.typeflag = TAR_DIRTYPE;
+        TarWriteOctal(hdr.size, 12, 0);
+    } else {
+        hdr.typeflag = TAR_REGTYPE;
+        TarWriteOctal(hdr.size, 12, st.st_size);
+    }
+
+    // Calculate and set checksum
+    U32 sum = TarChecksum(&hdr);
+    snprintf(hdr.checksum, 8, "%06o ", sum);
+
+    // Write header
+    fwrite(&hdr, 1, TAR_BLOCK_SIZE, archive);
+
+    if (verbose)
+        printf("%s\n", path);
+
+    // Write file data
+    if (!is_dir && st.st_size > 0) {
+        FILE *fp = fopen(path, "rb");
+        if (!fp) {
+            fprintf(stderr, "tar: %s: Cannot open\n", path);
+            return -1;
+        }
+
+        U8 buf[TAR_BLOCK_SIZE];
+        I64 remaining = st.st_size;
+
+        while (remaining > 0) {
+            MemSet(buf, 0, TAR_BLOCK_SIZE);
+            I64 to_read = (remaining > TAR_BLOCK_SIZE) ? TAR_BLOCK_SIZE : remaining;
+            I64 n = fread(buf, 1, to_read, fp);
+            if (n <= 0)
+                break;
+            fwrite(buf, 1, TAR_BLOCK_SIZE, archive);
+            remaining -= n;
+        }
+
+        fclose(fp);
+    }
+
+    // Recurse for directories
+    if (is_dir) {
+        CPosixDIR *dir = PosixOpenDir(path);
+        if (dir) {
+            CPosixDirent *ent;
+            while ((ent = PosixReadDir(dir))) {
+                if (strcmp(ent->d_name, ".") == 0 || strcmp(ent->d_name, "..") == 0)
+                    continue;
+
+                U8 subpath[512];
+                snprintf(subpath, 512, "%s/%s", path, ent->d_name);
+                TarAddFile(archive, subpath, verbose);
+            }
+            PosixCloseDir(dir);
+        }
+    }
+
+    return 0;
+}
+
+I64 TarCreate(CTarState *state)
+{
+    FILE *archive = fopen(state->archive, "wb");
+    if (!archive) {
+        fprintf(stderr, "tar: %s: Cannot open\n", state->archive);
+        return 2;
+    }
+
+    for (I64 i = 0; i < state->file_count; i++) {
+        if (TarAddFile(archive, state->files[i], state->verbose) < 0) {
+            fclose(archive);
+            return 2;
+        }
+    }
+
+    // Write two zero blocks to end archive
+    U8 zeros[TAR_BLOCK_SIZE];
+    MemSet(zeros, 0, TAR_BLOCK_SIZE);
+    fwrite(zeros, 1, TAR_BLOCK_SIZE, archive);
+    fwrite(zeros, 1, TAR_BLOCK_SIZE, archive);
+
+    fclose(archive);
+    return 0;
+}
+
+// ============================================================================
+// TAR EXTRACT
+// ============================================================================
+
+I64 TarExtract(CTarState *state)
+{
+    FILE *archive = fopen(state->archive, "rb");
+    if (!archive) {
+        fprintf(stderr, "tar: %s: Cannot open\n", state->archive);
+        return 2;
+    }
+
+    // Change to target directory if specified
+    U8 old_dir[512] = "";
+    if (state->directory) {
+        PosixGetcwd(old_dir, 512);
+        if (PosixChdir(state->directory) < 0) {
+            fprintf(stderr, "tar: %s: Cannot chdir\n", state->directory);
+            fclose(archive);
+            return 2;
+        }
+    }
+
+    CTarHeader hdr;
+    I64 zero_blocks = 0;
+
+    while (fread(&hdr, 1, TAR_BLOCK_SIZE, archive) == TAR_BLOCK_SIZE) {
+        // Check for end of archive
+        if (TarIsZeroBlock(&hdr(U8 *))) {
+            zero_blocks++;
+            if (zero_blocks >= 2)
+                break;
+            continue;
+        }
+        zero_blocks = 0;
+
+        // Verify checksum
+        U32 expected = TarParseOctal(hdr.checksum, 8);
+        U32 actual = TarChecksum(&hdr);
+        if (expected != actual) {
+            fprintf(stderr, "tar: checksum error\n");
+            break;
+        }
+
+        // Get path and size
+        U8 path[512];
+        TarGetPath(&hdr, path);
+        U64 size = TarParseOctal(hdr.size, 12);
+        U32 mode = TarParseOctal(hdr.mode, 8);
+
+        // Filter by file list if provided
+        Bool extract = TRUE;
+        if (state->file_count > 0) {
+            extract = FALSE;
+            for (I64 i = 0; i < state->file_count; i++) {
+                if (strncmp(path, state->files[i], strlen(state->files[i])) == 0) {
+                    extract = TRUE;
+                    break;
+                }
+            }
+        }
+
+        if (extract && state->verbose)
+            printf("%s\n", path);
+
+        // Handle by type
+        U8 type = hdr.typeflag;
+        if (type == 0)
+            type = TAR_REGTYPE;
+
+        if (extract) {
+            if (type == TAR_DIRTYPE) {
+                // Create directory
+                TarMkdirP(path);
+                PosixMkdir(path, mode);
+            } else if (type == TAR_REGTYPE || type == TAR_AREGTYPE) {
+                // Extract regular file
+                TarMkdirP(path);
+
+                // Check if exists
+                if (state->keep_old && PosixAccess(path, 0) == 0) {
+                    // Skip, but still need to skip data blocks
+                } else {
+                    FILE *fp = fopen(path, "wb");
+                    if (!fp) {
+                        fprintf(stderr, "tar: %s: Cannot create\n", path);
+                    } else {
+                        U8 buf[TAR_BLOCK_SIZE];
+                        U64 remaining = size;
+
+                        while (remaining > 0) {
+                            if (fread(buf, 1, TAR_BLOCK_SIZE, archive) != TAR_BLOCK_SIZE)
+                                break;
+                            I64 to_write = (remaining > TAR_BLOCK_SIZE) ? TAR_BLOCK_SIZE : remaining;
+                            fwrite(buf, 1, to_write, fp);
+                            remaining -= to_write;
+                        }
+
+                        fclose(fp);
+                        if (state->preserve_perms)
+                            PosixChmod(path, mode);
+
+                        continue;  // Already read data blocks
+                    }
+                }
+            } else if (type == TAR_SYMTYPE) {
+                // Symbolic link
+                TarMkdirP(path);
+                U8 linkname[TAR_LINKNAME_SIZE + 1];
+                strncpy(linkname, hdr.linkname, TAR_LINKNAME_SIZE);
+                linkname[TAR_LINKNAME_SIZE] = 0;
+                PosixSymlink(linkname, path);
+            }
+        }
+
+        // Skip data blocks
+        if (size > 0) {
+            I64 blocks = (size + TAR_BLOCK_SIZE - 1) / TAR_BLOCK_SIZE;
+            fseek(archive, blocks * TAR_BLOCK_SIZE, SEEK_CUR);
+        }
+    }
+
+    // Restore directory
+    if (old_dir[0])
+        PosixChdir(old_dir);
+
+    fclose(archive);
+    return 0;
+}
+
+// ============================================================================
+// TAR LIST
+// ============================================================================
+
+I64 TarList(CTarState *state)
+{
+    FILE *archive = fopen(state->archive, "rb");
+    if (!archive) {
+        fprintf(stderr, "tar: %s: Cannot open\n", state->archive);
+        return 2;
+    }
+
+    CTarHeader hdr;
+    I64 zero_blocks = 0;
+
+    while (fread(&hdr, 1, TAR_BLOCK_SIZE, archive) == TAR_BLOCK_SIZE) {
+        if (TarIsZeroBlock(&hdr(U8 *))) {
+            zero_blocks++;
+            if (zero_blocks >= 2)
+                break;
+            continue;
+        }
+        zero_blocks = 0;
+
+        U8 path[512];
+        TarGetPath(&hdr, path);
+        U64 size = TarParseOctal(hdr.size, 12);
+
+        // Filter by file list if provided
+        Bool show = TRUE;
+        if (state->file_count > 0) {
+            show = FALSE;
+            for (I64 i = 0; i < state->file_count; i++) {
+                if (strncmp(path, state->files[i], strlen(state->files[i])) == 0) {
+                    show = TRUE;
+                    break;
+                }
+            }
+        }
+
+        if (show) {
+            if (state->verbose) {
+                U32 mode = TarParseOctal(hdr.mode, 8);
+                U8 type = hdr.typeflag;
+                if (type == 0) type = '-';
+                else if (type == TAR_DIRTYPE) type = 'd';
+                else if (type == TAR_SYMTYPE) type = 'l';
+                else type = '-';
+
+                printf("%c%c%c%c%c%c%c%c%c%c %s/%s %8lld %s\n",
+                       type,
+                       (mode & 0400) ? 'r' : '-',
+                       (mode & 0200) ? 'w' : '-',
+                       (mode & 0100) ? 'x' : '-',
+                       (mode & 0040) ? 'r' : '-',
+                       (mode & 0020) ? 'w' : '-',
+                       (mode & 0010) ? 'x' : '-',
+                       (mode & 0004) ? 'r' : '-',
+                       (mode & 0002) ? 'w' : '-',
+                       (mode & 0001) ? 'x' : '-',
+                       hdr.uname, hdr.gname,
+                       size, path);
+            } else {
+                printf("%s\n", path);
+            }
+        }
+
+        // Skip data blocks
+        if (size > 0) {
+            I64 blocks = (size + TAR_BLOCK_SIZE - 1) / TAR_BLOCK_SIZE;
+            fseek(archive, blocks * TAR_BLOCK_SIZE, SEEK_CUR);
+        }
+    }
+
+    fclose(archive);
+    return 0;
+}
+
+// ============================================================================
+// MAIN
+// ============================================================================
+
+U0 tar_usage()
+{
+    printf("Usage: tar [OPTION]... [FILE]...\n");
+    printf("GNU tar saves many files together into a single archive.\n\n");
+    printf("Main operation mode:\n");
+    printf("  -c, --create         Create a new archive\n");
+    printf("  -x, --extract        Extract files from archive\n");
+    printf("  -t, --list           List contents of archive\n");
+    printf("\n");
+    printf("Options:\n");
+    printf("  -f, --file=ARCHIVE   Use archive file ARCHIVE\n");
+    printf("  -v, --verbose        Verbosely list files processed\n");
+    printf("  -C, --directory=DIR  Change to DIR before operation\n");
+    printf("  -k, --keep-old-files Don't replace existing files\n");
+    printf("  -p, --preserve-permissions  Preserve file permissions\n");
+    printf("  -z, --gzip           Filter through gzip\n");
+    printf("  -j, --bzip2          Filter through bzip2\n");
+    printf("  --help               Display this help\n");
+    printf("\nNote: Compression filters (-z, -j) are not yet implemented.\n");
+}
+
+I64 tar_main(I64 argc, U8 **argv)
+{
+    CTarState state;
+    MemSet(&state, 0, sizeof(CTarState));
+
+    U8 *files[256];
+    I64 file_count = 0;
+
+    // Parse options - tar allows bundled options like "tar xvf"
+    I64 i = 1;
+    while (i < argc) {
+        U8 *arg = argv[i];
+
+        if (arg[0] == '-' && arg[1] == '-') {
+            // Long options
+            if (strcmp(arg, "--help") == 0) {
+                tar_usage();
+                return 0;
+            } else if (strcmp(arg, "--create") == 0) {
+                state.create = TRUE;
+            } else if (strcmp(arg, "--extract") == 0 || strcmp(arg, "--get") == 0) {
+                state.extract = TRUE;
+            } else if (strcmp(arg, "--list") == 0) {
+                state.list = TRUE;
+            } else if (strcmp(arg, "--verbose") == 0) {
+                state.verbose = TRUE;
+            } else if (strcmp(arg, "--gzip") == 0 || strcmp(arg, "--gunzip") == 0) {
+                state.gzip = TRUE;
+            } else if (strcmp(arg, "--bzip2") == 0) {
+                state.bzip2 = TRUE;
+            } else if (strcmp(arg, "--xz") == 0) {
+                state.xz = TRUE;
+            } else if (strcmp(arg, "--preserve-permissions") == 0) {
+                state.preserve_perms = TRUE;
+            } else if (strcmp(arg, "--keep-old-files") == 0) {
+                state.keep_old = TRUE;
+            } else if (strcmp(arg, "--overwrite") == 0) {
+                state.overwrite = TRUE;
+            } else if (strncmp(arg, "--file=", 7) == 0) {
+                state.archive = arg + 7;
+            } else if (strncmp(arg, "--directory=", 12) == 0) {
+                state.directory = arg + 12;
+            }
+            i++;
+        } else if (arg[0] == '-' || (i == 1 && isalpha(arg[0]))) {
+            // Short options (bundled)
+            U8 *p = (arg[0] == '-') ? arg + 1 : arg;
+            while (*p) {
+                switch (*p) {
+                    case 'c': state.create = TRUE; break;
+                    case 'x': state.extract = TRUE; break;
+                    case 't': state.list = TRUE; break;
+                    case 'v': state.verbose = TRUE; break;
+                    case 'z': state.gzip = TRUE; break;
+                    case 'j': state.bzip2 = TRUE; break;
+                    case 'J': state.xz = TRUE; break;
+                    case 'p': state.preserve_perms = TRUE; break;
+                    case 'k': state.keep_old = TRUE; break;
+                    case 'f':
+                        // -f needs argument
+                        if (p[1]) {
+                            state.archive = p + 1;
+                            p = ""; // End loop
+                            continue;
+                        } else if (i + 1 < argc) {
+                            state.archive = argv[++i];
+                        }
+                        break;
+                    case 'C':
+                        if (p[1]) {
+                            state.directory = p + 1;
+                            p = "";
+                            continue;
+                        } else if (i + 1 < argc) {
+                            state.directory = argv[++i];
+                        }
+                        break;
+                }
+                p++;
+            }
+            i++;
+        } else {
+            // File argument
+            files[file_count++] = arg;
+            i++;
+        }
+    }
+
+    state.files = files;
+    state.file_count = file_count;
+
+    // Validate options
+    I64 modes = state.create + state.extract + state.list;
+    if (modes == 0) {
+        fprintf(stderr, "tar: You must specify one of -c, -x, -t\n");
+        return 2;
+    }
+    if (modes > 1) {
+        fprintf(stderr, "tar: You may not specify more than one -cxt option\n");
+        return 2;
+    }
+
+    if (!state.archive) {
+        fprintf(stderr, "tar: No archive file specified (-f)\n");
+        return 2;
+    }
+
+    // Warn about unimplemented compression
+    if (state.gzip || state.bzip2 || state.xz) {
+        fprintf(stderr, "tar: warning: compression filters not implemented\n");
+        fprintf(stderr, "tar: use gzip/bzip2 separately\n");
+    }
+
+    // Execute operation
+    if (state.create) {
+        if (file_count == 0) {
+            fprintf(stderr, "tar: Cowardly refusing to create an empty archive\n");
+            return 2;
+        }
+        return TarCreate(&state);
+    } else if (state.extract) {
+        return TarExtract(&state);
+    } else if (state.list) {
+        return TarList(&state);
+    }
+
+    return 0;
+}
